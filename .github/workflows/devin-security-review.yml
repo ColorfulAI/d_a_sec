@@ -1,0 +1,257 @@
+name: Devin Security Review
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  security-events: read
+  pull-requests: write
+
+jobs:
+  security-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for CodeQL to complete
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Waiting for CodeQL analysis to complete..."
+          REPO="${{ github.repository }}"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Checking CodeQL status..."
+
+            STATUS=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL" \
+              | jq -r '.check_runs[0].status // "not_found"')
+
+            CONCLUSION=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL" \
+              | jq -r '.check_runs[0].conclusion // "pending"')
+
+            echo "  Status: $STATUS | Conclusion: $CONCLUSION"
+
+            if [ "$STATUS" = "completed" ]; then
+              echo "CodeQL analysis completed with conclusion: $CONCLUSION"
+              break
+            fi
+
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "Timed out waiting for CodeQL. Proceeding anyway..."
+              break
+            fi
+
+            echo "  Sleeping 30s..."
+            sleep 30
+          done
+
+      - name: Fetch CodeQL alerts
+        id: fetch-alerts
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_REF="refs/pull/${{ github.event.pull_request.number }}/merge"
+
+          echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
+
+          ALERTS=$(curl -s -L \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=$PR_REF&state=open&per_page=100")
+
+          COUNT=$(echo "$ALERTS" | jq 'if type == "array" then length else 0 end')
+          echo "Found $COUNT open alert(s)"
+
+          if [ "$COUNT" -eq 0 ] || [ "$COUNT" = "null" ]; then
+            ALERTS=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts?state=open&per_page=100")
+            COUNT=$(echo "$ALERTS" | jq 'if type == "array" then length else 0 end')
+            echo "Fallback: Found $COUNT open alert(s) on repo level"
+          fi
+
+          echo "$ALERTS" | jq -r '.[] | "- [\(.rule.id)] \(.rule.description // .rule.id) at \(.most_recent_instance.location.path // "unknown"):\(.most_recent_instance.location.start_line // "?")"' > /tmp/alert_summary.txt
+          cat /tmp/alert_summary.txt
+
+          ALERT_DETAILS=$(echo "$ALERTS" | jq '[.[] | {
+            rule_id: .rule.id,
+            rule_description: (.rule.description // .rule.id),
+            severity: .rule.security_severity_level,
+            file: .most_recent_instance.location.path,
+            start_line: .most_recent_instance.location.start_line,
+            end_line: .most_recent_instance.location.end_line,
+            message: .most_recent_instance.message.text
+          }]')
+
+          echo "$ALERT_DETAILS" > /tmp/alert_details.json
+          cat /tmp/alert_details.json
+
+          echo "alert_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Create Devin session for fixes
+        if: steps.fetch-alerts.outputs.alert_count != '0'
+        id: devin-session
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          ALERT_SUMMARY=$(cat /tmp/alert_summary.txt)
+          ALERT_DETAILS=$(cat /tmp/alert_details.json)
+
+          PROMPT="You are reviewing PR #${PR_NUMBER} (\"${PR_TITLE}\") in the repository ${REPO}.
+
+          CodeQL has found the following security issues:
+
+          ${ALERT_SUMMARY}
+
+          Detailed alert information:
+          ${ALERT_DETAILS}
+
+          Please:
+          1. Analyze each CodeQL alert
+          2. Propose a specific code fix for each issue
+          3. Explain why the fix resolves the security concern
+          4. Keep fixes minimal and focused
+
+          Do NOT create a PR. Just propose the fixes as text in your response."
+
+          PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          RESPONSE=$(curl -s \
+            -X POST "https://api.devin.ai/v1/sessions" \
+            -H "Authorization: Bearer $DEVIN_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"prompt\": $PROMPT_JSON}")
+
+          echo "Devin API response:"
+          echo "$RESPONSE" | jq .
+
+          SESSION_ID=$(echo "$RESPONSE" | jq -r '.session_id // empty')
+          SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
+
+          if [ -z "$SESSION_ID" ]; then
+            echo "ERROR: Failed to create Devin session"
+            echo "$RESPONSE"
+            echo "session_created=false" >> $GITHUB_OUTPUT
+          else
+            echo "Devin session created: $SESSION_URL"
+            echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+            echo "session_url=$SESSION_URL" >> $GITHUB_OUTPUT
+            echo "session_created=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Wait for Devin response
+        if: steps.devin-session.outputs.session_created == 'true'
+        id: devin-response
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          SESSION_ID="${{ steps.devin-session.outputs.session_id }}"
+          echo "Polling Devin session $SESSION_ID for response..."
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+          LAST_STATUS=""
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            SESSION_DATA=$(curl -s \
+              -H "Authorization: Bearer $DEVIN_API_KEY" \
+              "https://api.devin.ai/v1/session/${SESSION_ID}")
+
+            STATUS=$(echo "$SESSION_DATA" | jq -r '.status_enum // .status // "unknown"')
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $STATUS"
+
+            if [ "$STATUS" = "finished" ] || [ "$STATUS" = "stopped" ] || [ "$STATUS" = "exit" ]; then
+              echo "Session completed with status: $STATUS"
+              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
+              echo "status=$STATUS" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            if [ "$STATUS" = "blocked" ] && [ "$LAST_STATUS" = "blocked" ]; then
+              echo "Session is blocked (likely waiting for input). Capturing current state."
+              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
+              echo "status=$STATUS" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            LAST_STATUS="$STATUS"
+
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "Timed out polling Devin session. Session still running."
+              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
+              echo "status=timeout" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            sleep 30
+          done
+
+      - name: Post PR comment with results
+        if: steps.fetch-alerts.outputs.alert_count != '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          ALERT_COUNT="${{ steps.fetch-alerts.outputs.alert_count }}"
+          SESSION_CREATED="${{ steps.devin-session.outputs.session_created }}"
+          SESSION_URL="${{ steps.devin-session.outputs.session_url }}"
+          SESSION_ID="${{ steps.devin-session.outputs.session_id }}"
+          DEVIN_STATUS="${{ steps.devin-response.outputs.status }}"
+          ALERT_SUMMARY=$(cat /tmp/alert_summary.txt)
+
+          BODY="## 🔍 Devin Security Review\n\n"
+          BODY+="### CodeQL Alerts Found: ${ALERT_COUNT}\n\n"
+          BODY+="\`\`\`\n${ALERT_SUMMARY}\n\`\`\`\n\n"
+
+          if [ "$SESSION_CREATED" = "true" ]; then
+            BODY+="### Devin Session\n"
+            BODY+="- **Session URL**: [View Devin's analysis](${SESSION_URL})\n"
+            BODY+="- **Session ID**: \`${SESSION_ID}\`\n"
+            BODY+="- **Status**: ${DEVIN_STATUS}\n\n"
+            BODY+="Click the session URL above to see Devin's proposed fixes.\n"
+          else
+            BODY+="### Devin Session\n"
+            BODY+="Failed to create Devin session. Check workflow logs for details.\n"
+          fi
+
+          BODY+="\n---\n*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*"
+
+          COMMENT_JSON=$(echo -e "$BODY" | python3 -c "import sys,json; print(json.dumps({'body': sys.stdin.read()}))")
+
+          curl -s -L \
+            -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d "$COMMENT_JSON" | jq '{id: .id, html_url: .html_url}'
+
+          echo "PR comment posted."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Devin Security Review Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alerts found**: ${{ steps.fetch-alerts.outputs.alert_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Devin session created**: ${{ steps.devin-session.outputs.session_created }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Devin session URL**: ${{ steps.devin-session.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Devin status**: ${{ steps.devin-response.outputs.status }}" >> $GITHUB_STEP_SUMMARY
