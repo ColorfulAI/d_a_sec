@@ -15,41 +15,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Wait for CodeQL to complete
+      - name: Wait for all CodeQL analyses to complete
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          echo "Waiting for CodeQL analysis to complete..."
+          echo "Waiting for all CodeQL analyses to complete..."
           REPO="${{ github.repository }}"
           SHA="${{ github.event.pull_request.head.sha }}"
-          MAX_ATTEMPTS=30
+          MAX_ATTEMPTS=40
           ATTEMPT=0
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Checking CodeQL status..."
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Checking CodeQL check runs..."
 
-            STATUS=$(curl -s -L \
+            CHECK_RUNS=$(curl -s -L \
               -H "Authorization: token $GH_PAT" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL" \
-              | jq -r '.check_runs[0].status // "not_found"')
+              "https://api.github.com/repos/$REPO/commits/$SHA/check-runs")
 
-            CONCLUSION=$(curl -s -L \
-              -H "Authorization: token $GH_PAT" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL" \
-              | jq -r '.check_runs[0].conclusion // "pending"')
+            CODEQL_RUNS=$(echo "$CHECK_RUNS" | jq '[.check_runs[] | select(.name == "CodeQL" or (.name | startswith("Analyze")))]')
+            TOTAL=$(echo "$CODEQL_RUNS" | jq 'length')
+            COMPLETED=$(echo "$CODEQL_RUNS" | jq '[.[] | select(.status == "completed")] | length')
 
-            echo "  Status: $STATUS | Conclusion: $CONCLUSION"
+            echo "  CodeQL-related check runs: $COMPLETED/$TOTAL completed"
+            echo "$CODEQL_RUNS" | jq -r '.[] | "    - \(.name): status=\(.status), conclusion=\(.conclusion // "pending")"'
 
-            if [ "$STATUS" = "completed" ]; then
-              echo "CodeQL analysis completed with conclusion: $CONCLUSION"
+            if [ "$TOTAL" -gt 0 ] && [ "$COMPLETED" -eq "$TOTAL" ]; then
+              echo "All CodeQL analyses completed."
               break
             fi
 
             if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-              echo "Timed out waiting for CodeQL. Proceeding anyway..."
+              echo "Timed out waiting for CodeQL. Proceeding with available results..."
               break
             fi
 
