@@ -1119,8 +1119,6 @@ jobs:
                   att = history["attempts"].get(key, 0)
                   if key in unfixable_set:
                       status = "Needs Manual Fix"
-                  elif att >= 2:
-                      status = "Needs Manual Fix"
                   elif att > 0:
                       status = "In Progress"
                   else:
@@ -1134,7 +1132,7 @@ jobs:
                       fpath = ":".join(parts[1:-1])
                       fline = parts[-1]
                       att = history["attempts"].get(fk, 1)
-                      lines.append(f"| - | `{rule}` | `{fpath}:{fline}` | **Fixed** | {att}/2 |")
+                      lines.append(f"| :white_check_mark: | `{rule}` | `{fpath}:{fline}` | **Fixed** | {att}/2 |")
               lines.append("")
 
           # Pre-existing section
@@ -1161,8 +1159,6 @@ jobs:
                   key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
                   att = history["attempts"].get(key, 0)
                   if key in unfixable_set:
-                      status = "Needs Manual Fix"
-                  elif att >= 2:
                       status = "Needs Manual Fix"
                   elif att > 0:
                       status = "In Progress"
