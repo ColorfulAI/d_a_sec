@@ -55,79 +55,176 @@ jobs:
             sleep 30
           done
 
-      - name: Fetch CodeQL alerts
-        id: fetch-alerts
+      - name: Fetch and classify CodeQL alerts
+        id: classify-alerts
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
-          PR_REF="refs/pull/${{ github.event.pull_request.number }}/merge"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_REF="refs/pull/${PR_NUMBER}/merge"
 
           echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
 
-          ALERTS=$(curl -s -L \
+          PR_ALERTS=$(curl -s -L \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=$PR_REF&state=open&per_page=100")
 
-          COUNT=$(echo "$ALERTS" | jq 'if type == "array" then length else 0 end')
-          echo "Found $COUNT open alert(s)"
+          PR_ALERT_COUNT=$(echo "$PR_ALERTS" | jq 'if type == "array" then length else 0 end')
+          echo "Found $PR_ALERT_COUNT alert(s) on PR merge ref"
 
-          if [ "$COUNT" -eq 0 ] || [ "$COUNT" = "null" ]; then
-            ALERTS=$(curl -s -L \
-              -H "Authorization: token $GH_PAT" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/code-scanning/alerts?state=open&per_page=100")
-            COUNT=$(echo "$ALERTS" | jq 'if type == "array" then length else 0 end')
-            echo "Fallback: Found $COUNT open alert(s) on repo level"
+          if [ "$PR_ALERT_COUNT" -eq 0 ] || [ "$PR_ALERT_COUNT" = "null" ]; then
+            echo "No alerts found."
+            echo "total_count=0" >> $GITHUB_OUTPUT
+            echo "new_in_pr_count=0" >> $GITHUB_OUTPUT
+            echo "preexisting_count=0" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          echo "$ALERTS" | jq -r '.[] | "- [\(.rule.id)] \(.rule.description // .rule.id) at \(.most_recent_instance.location.path // "unknown"):\(.most_recent_instance.location.start_line // "?")"' > /tmp/alert_summary.txt
-          cat /tmp/alert_summary.txt
+          echo "Fetching alerts on main branch for comparison..."
+          MAIN_ALERTS=$(curl -s -L \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100")
 
-          ALERT_DETAILS=$(echo "$ALERTS" | jq '[.[] | {
-            rule_id: .rule.id,
-            rule_description: (.rule.description // .rule.id),
-            severity: .rule.security_severity_level,
-            file: .most_recent_instance.location.path,
-            start_line: .most_recent_instance.location.start_line,
-            end_line: .most_recent_instance.location.end_line,
-            message: .most_recent_instance.message.text
-          }]')
+          MAIN_ALERT_COUNT=$(echo "$MAIN_ALERTS" | jq 'if type == "array" then length else 0 end')
+          echo "Found $MAIN_ALERT_COUNT alert(s) on main"
 
-          echo "$ALERT_DETAILS" > /tmp/alert_details.json
-          cat /tmp/alert_details.json
+          echo "$PR_ALERTS" > /tmp/pr_alerts_raw.json
+          echo "$MAIN_ALERTS" > /tmp/main_alerts_raw.json
 
-          echo "alert_count=$COUNT" >> $GITHUB_OUTPUT
+          python3 << 'CLASSIFY_EOF'
+          import json, os
 
-      - name: Create Devin session for fixes
-        if: steps.fetch-alerts.outputs.alert_count != '0'
-        id: devin-session
+          with open("/tmp/pr_alerts_raw.json") as f:
+              pr_alerts_raw = f.read()
+          with open("/tmp/main_alerts_raw.json") as f:
+              main_alerts_raw = f.read()
+
+          try:
+              pr_alerts = json.loads(pr_alerts_raw)
+              if not isinstance(pr_alerts, list):
+                  pr_alerts = []
+          except:
+              pr_alerts = []
+
+          try:
+              main_alerts = json.loads(main_alerts_raw)
+              if not isinstance(main_alerts, list):
+                  main_alerts = []
+          except:
+              main_alerts = []
+
+          main_rule_file_set = set()
+          for a in main_alerts:
+              rule_id = a.get("rule", {}).get("id", "")
+              loc = a.get("most_recent_instance", {}).get("location", {})
+              path = loc.get("path", "")
+              line = loc.get("start_line", 0)
+              main_rule_file_set.add(f"{rule_id}:{path}:{line}")
+
+          new_in_pr = []
+          preexisting = []
+
+          for a in pr_alerts:
+              rule_id = a.get("rule", {}).get("id", "")
+              loc = a.get("most_recent_instance", {}).get("location", {})
+              path = loc.get("path", "")
+              line = loc.get("start_line", 0)
+              key = f"{rule_id}:{path}:{line}"
+
+              alert_info = {
+                  "number": a.get("number"),
+                  "rule_id": rule_id,
+                  "rule_description": a.get("rule", {}).get("description", rule_id),
+                  "severity": a.get("rule", {}).get("security_severity_level", "unknown"),
+                  "file": path,
+                  "start_line": line,
+                  "end_line": loc.get("end_line", line),
+                  "message": a.get("most_recent_instance", {}).get("message", {}).get("text", "")
+              }
+
+              if key in main_rule_file_set:
+                  preexisting.append(alert_info)
+              else:
+                  new_in_pr.append(alert_info)
+
+          severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
+          new_in_pr.sort(key=lambda a: severity_order.get(a["severity"], 4))
+          preexisting.sort(key=lambda a: severity_order.get(a["severity"], 4))
+
+          with open("/tmp/new_in_pr_alerts.json", "w") as f:
+              json.dump(new_in_pr, f, indent=2)
+          with open("/tmp/preexisting_alerts.json", "w") as f:
+              json.dump(preexisting, f, indent=2)
+
+          new_summary = []
+          for a in new_in_pr:
+              new_summary.append(f"- [{a['rule_id']}] {a['rule_description']} at {a['file']}:{a['start_line']} (severity: {a['severity']})")
+          with open("/tmp/new_in_pr_summary.txt", "w") as f:
+              f.write("\n".join(new_summary) if new_summary else "None")
+
+          pre_summary = []
+          for a in preexisting:
+              pre_summary.append(f"- [{a['rule_id']}] {a['rule_description']} at {a['file']}:{a['start_line']} (severity: {a['severity']})")
+          with open("/tmp/preexisting_summary.txt", "w") as f:
+              f.write("\n".join(pre_summary) if pre_summary else "None")
+
+          total = len(new_in_pr) + len(preexisting)
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"total_count={total}\n")
+              f.write(f"new_in_pr_count={len(new_in_pr)}\n")
+              f.write(f"preexisting_count={len(preexisting)}\n")
+
+          print(f"\nClassification results:")
+          print(f"  New in PR: {len(new_in_pr)}")
+          for a in new_in_pr:
+              print(f"    - [{a['rule_id']}] {a['file']}:{a['start_line']} ({a['severity']})")
+          print(f"  Pre-existing: {len(preexisting)}")
+          for a in preexisting:
+              print(f"    - [{a['rule_id']}] {a['file']}:{a['start_line']} ({a['severity']})")
+          CLASSIFY_EOF
+
+      - name: Create Devin session for new-in-PR alerts
+        if: steps.classify-alerts.outputs.new_in_pr_count != '0'
+        id: devin-new-pr
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
         run: |
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          ALERT_SUMMARY=$(cat /tmp/alert_summary.txt)
-          ALERT_DETAILS=$(cat /tmp/alert_details.json)
+          PR_BRANCH="${{ github.head_ref }}"
+          ALERT_SUMMARY=$(cat /tmp/new_in_pr_summary.txt)
+          ALERT_DETAILS=$(cat /tmp/new_in_pr_alerts.json)
 
-          PROMPT="You are reviewing PR #${PR_NUMBER} (\"${PR_TITLE}\") in the repository ${REPO}.
+          PROMPT="You are a security engineer fixing vulnerabilities found by CodeQL in PR #${PR_NUMBER} of repository ${REPO}.
 
-          CodeQL has found the following security issues:
+          These alerts were INTRODUCED by this PR on branch '${PR_BRANCH}':
 
           ${ALERT_SUMMARY}
 
           Detailed alert information:
           ${ALERT_DETAILS}
 
-          Please:
-          1. Analyze each CodeQL alert
-          2. Propose a specific code fix for each issue
-          3. Explain why the fix resolves the security concern
-          4. Keep fixes minimal and focused
+          Instructions:
+          1. Clone the repository: https://github.com/${REPO}.git
+          2. Checkout branch '${PR_BRANCH}'
+          3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
+          4. Apply a minimal, focused fix for each alert. Follow the codebase's existing conventions:
+             - If the project uses an ORM, use parameterized queries via the ORM
+             - If there are existing sanitization utilities, reuse them
+             - Do not introduce new dependencies unless absolutely necessary
+          5. After applying fixes, verify each fix is correct by reviewing the code
+          6. If the repository has tests, run them to ensure no regressions
+          7. Commit your fixes with a clear message referencing the CodeQL rule IDs
+          8. Push the commit(s) to branch '${PR_BRANCH}'
 
-          Do NOT create a PR. Just propose the fixes as text in your response."
+          IMPORTANT:
+          - Do NOT just suppress or ignore alerts — fix the root cause
+          - Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
+          - Keep fixes minimal and surgical — do not refactor unrelated code"
 
           PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
 
@@ -144,8 +241,7 @@ jobs:
           SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
 
           if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: Failed to create Devin session"
-            echo "$RESPONSE"
+            echo "ERROR: Failed to create Devin session for new-in-PR alerts"
             echo "session_created=false" >> $GITHUB_OUTPUT
           else
             echo "Devin session created: $SESSION_URL"
@@ -154,84 +250,199 @@ jobs:
             echo "session_created=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Wait for Devin response
-        if: steps.devin-session.outputs.session_created == 'true'
-        id: devin-response
+      - name: Create Devin sessions for pre-existing alerts (batched by file, sorted by severity)
+        if: steps.classify-alerts.outputs.preexisting_count != '0'
+        id: devin-preexisting
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
         run: |
-          SESSION_ID="${{ steps.devin-session.outputs.session_id }}"
-          echo "Polling Devin session $SESSION_ID for response..."
-          MAX_ATTEMPTS=20
-          ATTEMPT=0
-          LAST_STATUS=""
+          export REPO="${{ github.repository }}"
+          export PR_NUMBER="${{ github.event.pull_request.number }}"
+          TIMESTAMP=$(date +%s)
+          export FIX_BRANCH="devin/security-fixes-${TIMESTAMP}"
 
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
+          echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
 
-            SESSION_DATA=$(curl -s \
-              -H "Authorization: Bearer $DEVIN_API_KEY" \
-              "https://api.devin.ai/v1/session/${SESSION_ID}")
+          python3 << 'BATCH_EOF'
+          import json, os, time, urllib.request
 
-            STATUS=$(echo "$SESSION_DATA" | jq -r '.status_enum // .status // "unknown"')
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $STATUS"
+          alerts = json.load(open("/tmp/preexisting_alerts.json"))
+          repo = os.environ["REPO"]
+          fix_branch = os.environ["FIX_BRANCH"]
+          pr_number = os.environ["PR_NUMBER"]
+          api_key = os.environ["DEVIN_API_KEY"]
+          max_per_batch = 15
+          max_concurrent = 3
+          max_total_sessions = 20
 
-            if [ "$STATUS" = "finished" ] || [ "$STATUS" = "stopped" ] || [ "$STATUS" = "exit" ]; then
-              echo "Session completed with status: $STATUS"
-              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
-              echo "status=$STATUS" >> $GITHUB_OUTPUT
-              break
-            fi
+          file_groups = {}
+          for a in alerts:
+              f = a["file"]
+              file_groups.setdefault(f, []).append(a)
 
-            if [ "$STATUS" = "blocked" ] && [ "$LAST_STATUS" = "blocked" ]; then
-              echo "Session is blocked (likely waiting for input). Capturing current state."
-              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
-              echo "status=$STATUS" >> $GITHUB_OUTPUT
-              break
-            fi
+          severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
-            LAST_STATUS="$STATUS"
+          batches = []
+          for file_path, file_alerts in file_groups.items():
+              file_alerts.sort(key=lambda a: severity_order.get(a["severity"], 4))
+              for i in range(0, len(file_alerts), max_per_batch):
+                  batches.append(file_alerts[i:i + max_per_batch])
 
-            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-              echo "Timed out polling Devin session. Session still running."
-              echo "$SESSION_DATA" | jq . > /tmp/session_result.json
-              echo "status=timeout" >> $GITHUB_OUTPUT
-              break
-            fi
+          batches.sort(key=lambda b: min(severity_order.get(a["severity"], 4) for a in b))
 
-            sleep 30
-          done
+          session_ids = []
+          session_urls = []
+
+          for i, batch in enumerate(batches[:max_total_sessions]):
+              summary_lines = []
+              for a in batch:
+                  summary_lines.append(
+                      f"- [{a['rule_id']}] {a['rule_description']} at {a['file']}:{a['start_line']} (severity: {a['severity']})"
+                  )
+              summary = "\n".join(summary_lines)
+              details = json.dumps(batch, indent=2)
+
+              prompt = f"""You are a security engineer fixing pre-existing vulnerabilities found by CodeQL in repository {repo}.
+
+          These alerts exist on the main branch and were detected during review of PR #{pr_number}:
+
+          {summary}
+
+          Detailed alert information:
+          {details}
+
+          Instructions:
+          1. Clone the repository: https://github.com/{repo}.git
+          2. Create and checkout branch '{fix_branch}' from main (or pull and checkout if it already exists)
+          3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
+          4. Apply a minimal, focused fix for each alert. Follow the codebase's existing conventions:
+             - If the project uses an ORM, use parameterized queries via the ORM
+             - If there are existing sanitization utilities, reuse them
+             - Do not introduce new dependencies unless absolutely necessary
+          5. After applying fixes, verify each fix is correct by reviewing the code
+          6. If the repository has tests, run them to ensure no regressions
+          7. Commit your fixes with a clear message referencing the CodeQL rule IDs
+          8. Push the commit(s) to branch '{fix_branch}'
+
+          IMPORTANT:
+          - Do NOT just suppress or ignore alerts — fix the root cause
+          - Do NOT create a new PR — just push to branch '{fix_branch}'
+          - Keep fixes minimal and surgical — do not refactor unrelated code
+          - If the branch already has commits from another session, pull first to avoid conflicts"""
+
+              req = urllib.request.Request(
+                  "https://api.devin.ai/v1/sessions",
+                  data=json.dumps({"prompt": prompt}).encode(),
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+              try:
+                  resp = urllib.request.urlopen(req)
+                  result = json.loads(resp.read())
+                  sid = result.get("session_id", "")
+                  if sid:
+                      session_ids.append(sid)
+                      session_urls.append(f"https://app.devin.ai/sessions/{sid}")
+                      print(f"Batch {i+1}/{min(len(batches), max_total_sessions)}: Session {sid} created")
+                  else:
+                      print(f"Batch {i+1}: Failed - {result}")
+              except Exception as e:
+                  print(f"Batch {i+1}: Error - {e}")
+
+              if (i + 1) % max_concurrent == 0 and i + 1 < len(batches):
+                  print(f"Rate limit pause (30s)...")
+                  time.sleep(30)
+
+          with open("/tmp/preexisting_session_ids.txt", "w") as f:
+              f.write("\n".join(session_ids))
+          with open("/tmp/preexisting_session_urls.txt", "w") as f:
+              f.write("\n".join(session_urls))
+
+          print(f"\nCreated {len(session_ids)} session(s) for {len(alerts)} pre-existing alert(s)")
+          BATCH_EOF
+
+          SESSION_COUNT=$(wc -l < /tmp/preexisting_session_ids.txt 2>/dev/null || echo "0")
+          FIRST_URL=$(head -1 /tmp/preexisting_session_urls.txt 2>/dev/null || echo "")
+          echo "session_count=$SESSION_COUNT" >> $GITHUB_OUTPUT
+          echo "first_session_url=$FIRST_URL" >> $GITHUB_OUTPUT
+          echo "sessions_created=true" >> $GITHUB_OUTPUT
+
+      - name: Wait briefly for new-in-PR Devin session to start
+        if: steps.devin-new-pr.outputs.session_created == 'true'
+        id: wait-new-pr
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          SESSION_ID="${{ steps.devin-new-pr.outputs.session_id }}"
+          echo "Checking Devin session $SESSION_ID status (non-blocking)..."
+
+          SESSION_DATA=$(curl -s \
+            -H "Authorization: Bearer $DEVIN_API_KEY" \
+            "https://api.devin.ai/v1/session/${SESSION_ID}")
+
+          STATUS=$(echo "$SESSION_DATA" | jq -r '.status_enum // .status // "unknown"')
+          echo "Session status: $STATUS"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
 
       - name: Post PR comment with results
-        if: steps.fetch-alerts.outputs.alert_count != '0'
+        if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          ALERT_COUNT="${{ steps.fetch-alerts.outputs.alert_count }}"
-          SESSION_CREATED="${{ steps.devin-session.outputs.session_created }}"
-          SESSION_URL="${{ steps.devin-session.outputs.session_url }}"
-          SESSION_ID="${{ steps.devin-session.outputs.session_id }}"
-          DEVIN_STATUS="${{ steps.devin-response.outputs.status }}"
-          ALERT_SUMMARY=$(cat /tmp/alert_summary.txt)
+          NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
+          PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
+          TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
+          NEW_SESSION_URL="${{ steps.devin-new-pr.outputs.session_url }}"
+          NEW_SESSION_ID="${{ steps.devin-new-pr.outputs.session_id }}"
+          NEW_SESSION_CREATED="${{ steps.devin-new-pr.outputs.session_created }}"
+          NEW_SESSION_STATUS="${{ steps.wait-new-pr.outputs.status }}"
+          PRE_SESSIONS_CREATED="${{ steps.devin-preexisting.outputs.sessions_created }}"
+          PRE_FIRST_URL="${{ steps.devin-preexisting.outputs.first_session_url }}"
+          PRE_SESSION_COUNT="${{ steps.devin-preexisting.outputs.session_count }}"
+          FIX_BRANCH="${{ steps.devin-preexisting.outputs.fix_branch }}"
+          NEW_SUMMARY=$(cat /tmp/new_in_pr_summary.txt 2>/dev/null || echo "None")
+          PRE_SUMMARY=$(cat /tmp/preexisting_summary.txt 2>/dev/null || echo "None")
 
-          BODY="## 🔍 Devin Security Review\n\n"
-          BODY+="### CodeQL Alerts Found: ${ALERT_COUNT}\n\n"
-          BODY+="\`\`\`\n${ALERT_SUMMARY}\n\`\`\`\n\n"
+          BODY="## Devin Security Review\n\n"
+          BODY+="**Total CodeQL Alerts: ${TOTAL_COUNT}**\n\n"
 
-          if [ "$SESSION_CREATED" = "true" ]; then
-            BODY+="### Devin Session\n"
-            BODY+="- **Session URL**: [View Devin's analysis](${SESSION_URL})\n"
-            BODY+="- **Session ID**: \`${SESSION_ID}\`\n"
-            BODY+="- **Status**: ${DEVIN_STATUS}\n\n"
-            BODY+="Click the session URL above to see Devin's proposed fixes.\n"
-          else
-            BODY+="### Devin Session\n"
-            BODY+="Failed to create Devin session. Check workflow logs for details.\n"
+          if [ "$NEW_COUNT" != "0" ] && [ -n "$NEW_COUNT" ]; then
+            BODY+="### New Alerts (introduced in this PR): ${NEW_COUNT}\n\n"
+            BODY+="Devin is pushing fixes directly to this PR branch.\n\n"
+            BODY+="\`\`\`\n${NEW_SUMMARY}\n\`\`\`\n\n"
+            if [ "$NEW_SESSION_CREATED" = "true" ]; then
+              BODY+="**Devin Session**: [View fix progress](${NEW_SESSION_URL}) | Status: \`${NEW_SESSION_STATUS}\`\n\n"
+            fi
           fi
 
-          BODY+="\n---\n*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*"
+          if [ "$PRE_COUNT" != "0" ] && [ -n "$PRE_COUNT" ]; then
+            BODY+="### Pre-existing Alerts (already on main): ${PRE_COUNT}\n\n"
+            BODY+="These exist on main and are not introduced by this PR. "
+            if [ "$PRE_SESSIONS_CREATED" = "true" ]; then
+              BODY+="Devin is fixing them on branch \`${FIX_BRANCH}\` (separate PR will follow).\n\n"
+              BODY+="**Devin Sessions** (${PRE_SESSION_COUNT}):\n"
+
+              if [ -f /tmp/preexisting_session_urls.txt ]; then
+                i=1
+                while IFS= read -r url; do
+                  if [ -n "$url" ]; then
+                    BODY+="- [Session ${i}](${url})\n"
+                    i=$((i + 1))
+                  fi
+                done < /tmp/preexisting_session_urls.txt
+              fi
+              BODY+="\n"
+            fi
+            BODY+="\`\`\`\n${PRE_SUMMARY}\n\`\`\`\n\n"
+          fi
+
+          BODY+="---\n"
+          BODY+="*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*"
 
           COMMENT_JSON=$(echo -e "$BODY" | python3 -c "import sys,json; print(json.dumps({'body': sys.stdin.read()}))")
 
@@ -249,7 +460,16 @@ jobs:
         run: |
           echo "## Devin Security Review Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Alerts found**: ${{ steps.fetch-alerts.outputs.alert_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Devin session created**: ${{ steps.devin-session.outputs.session_created }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Devin session URL**: ${{ steps.devin-session.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Devin status**: ${{ steps.devin-response.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total alerts**: ${{ steps.classify-alerts.outputs.total_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **New in PR**: ${{ steps.classify-alerts.outputs.new_in_pr_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pre-existing**: ${{ steps.classify-alerts.outputs.preexisting_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### New-in-PR Session" >> $GITHUB_STEP_SUMMARY
+          echo "- **Created**: ${{ steps.devin-new-pr.outputs.session_created }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ steps.devin-new-pr.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.wait-new-pr.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pre-existing Sessions" >> $GITHUB_STEP_SUMMARY
+          echo "- **Created**: ${{ steps.devin-preexisting.outputs.sessions_created }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Count**: ${{ steps.devin-preexisting.outputs.session_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fix branch**: ${{ steps.devin-preexisting.outputs.fix_branch }}" >> $GITHUB_STEP_SUMMARY
