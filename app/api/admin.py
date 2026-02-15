@@ -13,6 +13,6 @@ def admin_search_users():
     username = request.args.get("username", "")
     db = get_admin_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM admin_users WHERE username = '" + username + "'")
+    cursor.execute("SELECT * FROM admin_users WHERE username = ?", (username,))
     results = cursor.fetchall()
     return jsonify(results)
