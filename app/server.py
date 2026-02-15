@@ -1,5 +1,6 @@
 import sqlite3
 import subprocess
+from urllib.parse import urlparse
 from flask import Flask, request, redirect
 
 app = Flask(__name__)
@@ -36,7 +37,11 @@ def run_command():
 @app.route("/redirect")
 def open_redirect():
     url = request.args.get("url", "/")
-    return redirect(url)
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        return {"error": "External redirects not allowed"}, 400
+    target = parsed.path.replace("\\", "") or "/"
+    return redirect("/" + target.lstrip("/"))
 
 if __name__ == "__main__":
     app.run(debug=True)
