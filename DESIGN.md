@@ -317,14 +317,27 @@ This loop is the core differentiator. No other automated security fix tool perfo
 
 A mature codebase may have hundreds or thousands of pre-existing CodeQL alerts. We can't dump all of them into one Devin session (prompt/context limits), and we can't create thousands of sessions simultaneously.
 
-### Approach: Group by File, Cap per Session
+### Approach: Prefer Same-File, Backfill to Fill Batch
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Grouping | By file path | Devin sees full file context; related alerts in the same file likely need coordinated fixes |
-| Max alerts per session | 15 | Keeps the prompt focused; Devin can handle 15 alerts in one file effectively |
+| Primary grouping | By file path | Devin sees full file context; related alerts in the same file likely need coordinated fixes |
+| Backfill | From other files | If a file has fewer alerts than the batch cap, fill remaining space with alerts from other files |
+| Max alerts per session | 15 | Keeps the prompt focused; Devin can handle 15 alerts in one session effectively |
 | Max concurrent sessions | 3 | Respects API rate limits; prevents resource contention |
-| Processing | Waves | Start N sessions, wait for completion, start next N |
+| Max total sessions | 20 | Caps resource usage per workflow run |
+| Commit granularity | 1 commit per alert | Each security issue is a separate commit for clean review and easy revert |
+
+### Batching Algorithm
+
+The goal is to minimize the number of PRs/sessions while keeping batches reviewable:
+
+1. **Sort files by severity** — files containing the most critical alerts are processed first
+2. **Fill batches from one file first** — if a file has ≥15 alerts, it gets its own batch(es)
+3. **Backfill with other files** — if a file has <15 alerts, remaining batch space is filled with alerts from the next most severe files
+4. **Each alert = 1 commit** — within a batch, every security fix is a separate commit referencing the CodeQL rule ID
+
+**Tradeoff**: Prefer single-file batches (easier to review per-file PRs) but avoid wasting batch capacity on tiny groups (too many PRs for single issues). Backfilling balances review ergonomics with session efficiency.
 
 ### Batching Flow
 
@@ -332,23 +345,23 @@ A mature codebase may have hundreds or thousands of pre-existing CodeQL alerts. 
 100 pre-existing alerts
     |
     v
-Group by file:
-  - server.py: 5 alerts
-  - auth.py: 12 alerts
-  - utils.py: 3 alerts
-  - data_pipeline.py: 22 alerts --> split into 2 batches (15 + 7)
-  - ...
+Group by file, sort by severity:
+  - server.py: 5 alerts (critical, high, high, medium, medium)
+  - auth.py: 12 alerts (high, medium, ...)
+  - utils.py: 3 alerts (medium, low, low)
+  - data_pipeline.py: 22 alerts --> split: batch of 15 + batch of 7
     |
     v
-Create sessions in waves of 5:
-  Wave 1: [server.py, auth.py, utils.py, data_pipeline_batch1, ...]
-  Wave 2: [data_pipeline_batch2, ...]
+Build batches (cap = 15):
+  Batch 1: data_pipeline.py (15 alerts) — full file batch
+  Batch 2: data_pipeline.py (7) + server.py (5) + utils.py (3) = 15 — backfilled
+  Batch 3: auth.py (12) — single file, under cap but no more alerts to backfill
+    |
+    v
+Each batch → 1 Devin session → 1 branch with N commits (1 per alert)
     |
     v
 All sessions push to shared branch: devin/security-fixes-{timestamp}
-    |
-    v
-Open one batch fix PR with all fixes
 ```
 
 ### Prioritization
@@ -420,7 +433,7 @@ Devin Sessions: [Session 1](https://...)
 | 3 | Threat models | `remote` only vs `remote` + `local` | Both | Catches more attack vectors (file-based, env var, CLI injection) |
 | 4 | Fix delivery for new-in-PR | Same PR branch, sub-PR, comment-only | Same PR branch | Simplest; can't create separate PR for code that only exists on an unmerged branch |
 | 5 | Fix delivery for pre-existing | Same PR, separate PR, hybrid | Separate batch PR | Clean separation; doesn't pollute original PR; code exists on main so branching works |
-| 6 | Batching strategy | By file, by severity, by rule, fixed size | By file (capped at 15) | Related alerts in same file need coordinated fixes; cap prevents prompt overload |
+| 6 | Batching strategy | By file, by severity, by rule, fixed size | Prefer same-file, backfill to fill batch (cap 15) | Single-file batches are easier to review; backfilling avoids tiny batches; 1 commit per alert for clean revert |
 | 7 | Devin API version | v1, v2, v3 | v1 | v2/v3 require Enterprise tier; v1 works with service API key on all plans |
 | 8 | Session concurrency | Unlimited, fixed cap | 3 concurrent, max 20 total | Respects API limits; prevents resource contention |
 | 9 | Verification approach | Trust the fix, re-run CodeQL, run tests | Re-run CodeQL + run tests | Closed loop ensures fix actually resolves the alert and doesn't break anything |
