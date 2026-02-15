@@ -1,36 +1,32 @@
-import sqlite3
-import subprocess
 import os
-from flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, redirect, render_template_string, jsonify
 
 app = Flask(__name__)
 
 def get_db():
+    import sqlite3
     conn = sqlite3.connect("app.db")
     return conn
-
-# Adding a comment block to shift all line numbers down
-# This tests that fuzzy matching carries forward attempt counts
-# even when code edits move vulnerable lines to new positions.
 
 @app.route("/search")
 def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
+    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return str(results)
+    return jsonify(results)
 
-@app.route("/run")
-def run_command():
-    cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return output.decode()
+ALLOWED_REDIRECTS = {
+    "home": "/",
+    "login": "/login",
+    "dashboard": "/dashboard",
+}
 
 @app.route("/redirect")
 def open_redirect():
-    url = request.args.get("url", "/")
+    target = request.args.get("url", "home")
+    url = ALLOWED_REDIRECTS.get(target, "/")
     return redirect(url)
 
 @app.route("/eval")
@@ -52,4 +48,4 @@ def render_page():
     return render_template_string(template)
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0")
+    app.run(host="0.0.0.0")
