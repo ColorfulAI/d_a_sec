@@ -17,9 +17,16 @@ def search():
     results = cursor.fetchall()
     return jsonify(results)
 
+ALLOWED_REDIRECTS = {
+    "home": "/home",
+    "login": "/login",
+    "dashboard": "/dashboard",
+}
+
 @app.route("/redirect")
 def open_redirect():
-    url = request.args.get("url", "/")
+    target = request.args.get("url", "home")
+    url = ALLOWED_REDIRECTS.get(target, "/")
     return redirect(url)
 
 @app.route("/eval")
