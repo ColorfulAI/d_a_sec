@@ -45,9 +45,9 @@ def open_redirect():
 def profile():
     data = request.cookies.get("session_data", "")
     if data:
-        user = pickle.loads(base64.b64decode(data))
-        return {"username": user.get("name", "anonymous")}
-    return {"username": "anonymous"}
+        user = json.loads(base64.b64decode(data))
+        return jsonify({"username": user.get("name", "anonymous")})
+    return jsonify({"username": "anonymous"})
 
 @app.route("/page")
 def render_page():
