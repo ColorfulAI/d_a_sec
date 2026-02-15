@@ -31,12 +31,14 @@ def run_command():
     return jsonify({"output": output.decode()})
 
 @app.route("/redirect")
-def open_redirect():
+def safe_redirect():
     url = request.args.get("url", "/")
     parsed = urlparse(url)
     if parsed.scheme or parsed.netloc:
         abort(400, description="External redirects are not allowed")
-    return redirect(url)
+    if not url.startswith("/") or url.startswith("//") or "\\" in url:
+        abort(400, description="Only local redirects are allowed")
+    return redirect(parsed.path)
 
 if __name__ == "__main__":
     app.run(debug=False)
