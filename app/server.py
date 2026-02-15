@@ -26,9 +26,16 @@ def run_command():
     output = subprocess.check_output(shlex.split(cmd))
     return {"output": output.decode()}
 
+ALLOWED_REDIRECTS = {
+    "home": "/",
+    "dashboard": "/dashboard",
+    "settings": "/settings",
+}
+
 @app.route("/redirect")
 def open_redirect():
-    url = request.args.get("url", "/")
+    target = request.args.get("url", "home")
+    url = ALLOWED_REDIRECTS.get(target, "/")
     return redirect(url)
 
 @app.route("/profile")
