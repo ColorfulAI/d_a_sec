@@ -1,5 +1,4 @@
 import sqlite3
-import os
 import ast
 import operator
 from flask import Flask, request, redirect, jsonify, render_template_string
