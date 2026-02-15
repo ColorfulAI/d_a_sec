@@ -588,15 +588,33 @@ jobs:
           with open("/tmp/preexisting_alerts.json") as f:
               pre_alerts = json.load(f)
 
+          # Build rule_id:file -> max_attempts mapping for fuzzy matching.
+          # This ensures attempt counts survive line-number changes from code edits.
+          rf_max = {}
+          for k, v in attempts.items():
+              parts = k.rsplit(':', 1)
+              if len(parts) == 2:
+                  rf_key = parts[0]  # rule_id:file (without line)
+              else:
+                  rf_key = k
+              rf_max[rf_key] = max(rf_max.get(rf_key, 0), v)
+
+          rf_unfixable = set()
+          for u in unfixable:
+              parts = u.rsplit(':', 1)
+              rf_unfixable.add(parts[0] if len(parts) == 2 else u)
+
           def filter_alerts(alerts, label):
               actionable = []
               skipped_unfixable = []
               newly_unfixable = []
               for a in alerts:
                   key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
-                  attempt_count = attempts.get(key, 0)
+                  rf_key = f"{a['rule_id']}:{a['file']}"
+                  # Fuzzy lookup: exact key first, then rule_id:file prefix
+                  attempt_count = attempts.get(key, rf_max.get(rf_key, 0))
 
-                  if key in unfixable:
+                  if key in unfixable or rf_key in rf_unfixable:
                       skipped_unfixable.append(a)
                       print(f"  [SKIP-UNFIXABLE] {key} — already marked unfixable")
                       continue
@@ -604,16 +622,15 @@ jobs:
                   if attempt_count >= MAX_ATTEMPTS:
                       newly_unfixable.append(a)
                       unfixable.add(key)
-                      print(f"  [NOW-UNFIXABLE] {key} — {attempt_count} attempts exhausted")
+                      print(f"  [NOW-UNFIXABLE] {key} — {attempt_count} attempts exhausted (carried from line change)")
                       continue
 
-                  # If this is a Devin fix re-trigger and the alert was already
-                  # attempted once, give it one more chance (attempt 2).
-                  # But if it already had 1+ attempts, we still process it —
-                  # the max check above handles the cutoff.
                   actionable.append(a)
                   attempts[key] = attempt_count + 1
-                  print(f"  [PROCESS] {key} — attempt {attempt_count + 1}/{MAX_ATTEMPTS}")
+                  if attempt_count > 0:
+                      print(f"  [PROCESS] {key} — attempt {attempt_count + 1}/{MAX_ATTEMPTS} (carried from prior line)")
+                  else:
+                      print(f"  [PROCESS] {key} — attempt {attempt_count + 1}/{MAX_ATTEMPTS}")
 
               return actionable, skipped_unfixable, newly_unfixable
 
@@ -623,14 +640,21 @@ jobs:
           print(f"\nFiltering pre-existing alerts:")
           pre_actionable, pre_skipped, pre_newly_unfixable = filter_alerts(pre_alerts, "pre")
 
-          current_alert_keys = set()
+          # Use rule_id:file matching for fixed-alert detection.
+          # An alert is only "fixed" if NO instance of that rule_id:file remains.
+          # This prevents false "fixed" reports when code edits move line numbers.
+          current_rf_keys = set()
           for a in new_alerts + pre_alerts:
-              current_alert_keys.add(a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}"))
+              current_rf_keys.add(f"{a['rule_id']}:{a['file']}")
 
           fixed_keys = []
           stale_unfixable = []
+          seen_rf_fixed = set()
           for prev_key in list(history.get("attempts", {}).keys()):
-              if prev_key not in current_alert_keys:
+              parts = prev_key.rsplit(':', 1)
+              prev_rf = parts[0] if len(parts) == 2 else prev_key
+              if prev_rf not in current_rf_keys and prev_rf not in seen_rf_fixed:
+                  seen_rf_fixed.add(prev_rf)
                   fixed_keys.append(prev_key)
                   if prev_key in unfixable:
                       stale_unfixable.append(prev_key)
@@ -1066,6 +1090,13 @@ jobs:
           except Exception:
               history = {"attempts": {}, "unfixable": []}
 
+          # Build rule_id:file -> max_attempts for fuzzy status table lookups
+          rf_max_display = {}
+          for k, v in history.get("attempts", {}).items():
+              parts = k.rsplit(':', 1)
+              rf = parts[0] if len(parts) == 2 else k
+              rf_max_display[rf] = max(rf_max_display.get(rf, 0), v)
+
           # Load unfixable alert details for display
           try:
               with open("/tmp/unfixable_alerts.json") as f:
@@ -1142,8 +1173,9 @@ jobs:
               lines.append("|----------|------|------|--------|----------|")
               for a in all_new_alerts:
                   key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
-                  att = history["attempts"].get(key, 0)
-                  if key in unfixable_set:
+                  rf_key = f"{a['rule_id']}:{a['file']}"
+                  att = history["attempts"].get(key, rf_max_display.get(rf_key, 0))
+                  if key in unfixable_set or rf_key in {u.rsplit(':', 1)[0] for u in unfixable_set}:
                       status = "Needs Manual Fix"
                   elif att > 0:
                       status = "In Progress"
@@ -1183,8 +1215,9 @@ jobs:
               lines.append("|----------|------|------|--------|----------|")
               for a in all_pre_alerts:
                   key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
-                  att = history["attempts"].get(key, 0)
-                  if key in unfixable_set:
+                  rf_key = f"{a['rule_id']}:{a['file']}"
+                  att = history["attempts"].get(key, rf_max_display.get(rf_key, 0))
+                  if key in unfixable_set or rf_key in {u.rsplit(':', 1)[0] for u in unfixable_set}:
                       status = "Needs Manual Fix"
                   elif att > 0:
                       status = "In Progress"
