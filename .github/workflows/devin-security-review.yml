@@ -61,7 +61,7 @@ permissions:
   pull-requests: write
 
 env:
-  DEBUG: ${{ github.event.inputs.debug != 'false' || vars.DEVIN_SECURITY_DEBUG == 'true' }}
+  DEBUG: ${{ github.event.inputs.debug == 'false' && 'false' || 'true' }}
 
 jobs:
   security-review:
@@ -221,8 +221,8 @@ jobs:
       - name: Detect Devin fix commit
         id: detect-devin
         run: |
-          LATEST_MSG=$(git log -1 --pretty=%s HEAD)
-          echo "Latest commit message: $LATEST_MSG"
+          LATEST_MSG=$(git log -1 --pretty=%s --no-merges HEAD)
+          echo "Latest commit message (skipping merges): $LATEST_MSG"
 
           if echo "$LATEST_MSG" | grep -qE '^fix: \['; then
             echo "is_devin_fix=true" >> $GITHUB_OUTPUT
@@ -464,18 +464,22 @@ jobs:
               body = c.get('body', '')
               if marker in body:
                   comment_id = str(c.get('id', ''))
+                  attempts = {}
+                  unfixable = set()
                   m = re.search(r'<!-- attempts:(.*?) -->', body)
                   if m:
                       for pair in m.group(1).split(','):
                           if '=' in pair:
                               k, v = pair.rsplit('=', 1)
-                              attempts[k.strip()] = int(v.strip())
+                              try:
+                                  attempts[k.strip()] = int(v.strip())
+                              except ValueError:
+                                  pass
                   m = re.search(r'<!-- unfixable:(.*?) -->', body)
                   if m:
                       for k in m.group(1).split(','):
                           if k.strip():
                               unfixable.add(k.strip())
-                  break
 
           gh_out = os.environ.get('GITHUB_OUTPUT', '/dev/null')
           with open(gh_out, 'a') as f:
@@ -654,7 +658,7 @@ jobs:
           Instructions:
           1. Clone the repository: https://github.com/${REPO}.git
           2. Checkout branch '${PR_BRANCH}'
-          3. Pull latest changes: git pull --rebase origin '${PR_BRANCH}'
+          3. Pull latest changes: git pull --rebase origin '${PR_BRANCH}' (ALWAYS rebase, never merge — keeps git history clean)
           4. For each alert, read the surrounding code and understand the full context
           5. Fix each alert ONE AT A TIME. For each alert:
              a. Apply a minimal, focused fix following the codebase's existing conventions
@@ -671,8 +675,8 @@ jobs:
              - If there are existing sanitization utilities, reuse them
              - Do not introduce new dependencies unless absolutely necessary
           7. If the repository has tests, run them to ensure no regressions
-          8. Before pushing, run: git pull --rebase origin '${PR_BRANCH}'
-          9. Push all commit(s) to branch '${PR_BRANCH}'
+          8. Before pushing, run: git pull --rebase origin '${PR_BRANCH}' (ALWAYS rebase, never merge)
+          9. Push all commit(s) to branch '${PR_BRANCH}' (use --force-with-lease if rebase changed history)
 
           IMPORTANT:
           - Each security issue MUST be a separate commit
@@ -721,8 +725,9 @@ jobs:
           fi
 
           if [ -z "$SESSION_ID" ]; then
-            echo "ERROR: Failed to create Devin session for new-in-PR alerts"
+            echo "::error::Failed to create Devin session for new-in-PR alerts (HTTP $HTTP_CODE)"
             echo "session_created=false" >> $GITHUB_OUTPUT
+            echo "session_failed=true" >> $GITHUB_OUTPUT
           else
             echo "Devin session created: $SESSION_URL"
             echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
@@ -1032,6 +1037,9 @@ jobs:
           # New-in-PR section
           if new_count != "0" and new_count:
               lines.append(f"### New Alerts (introduced in this PR): {new_count}\n")
+              lines.append("```")
+              lines.append(new_summary)
+              lines.append("```\n")
               if new_session_created == "true" and new_session_url:
                   lines.append("**Devin is fixing these issues.** Each fix will appear as a separate commit on this PR.\n")
                   lines.append("| What | Link |")
@@ -1040,8 +1048,12 @@ jobs:
                   lines.append(f"| See fix commits | [Commits tab]({pr_url}/commits) |")
                   lines.append(f"| Review all changes | [Files changed]({pr_url}/files) |")
                   lines.append("")
+              elif devin_available != "true":
+                  lines.append("**Devin API is unavailable.** Alerts listed above require manual fixing or wait for Devin to come back online.\n")
               elif new_actionable == "0":
                   lines.append("All new alerts have been attempted (max retries reached). See unfixable section below.\n")
+              elif new_session_created == "false":
+                  lines.append("**Session creation failed.** Alerts listed above require manual attention. This workflow run has been marked as failed.\n")
 
               # Per-alert status table
               lines.append("| Severity | Rule | File | Status | Attempts |")
@@ -1296,7 +1308,7 @@ jobs:
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
             > /tmp/pr_comments_resolve.json
 
-          COMMENT_ID=$(jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))][0].id // empty' /tmp/pr_comments_resolve.json)
+          COMMENT_ID=$(jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))] | last | .id // empty' /tmp/pr_comments_resolve.json)
 
           if [ -n "$COMMENT_ID" ]; then
             echo "Updating existing comment to show all-clear..."
@@ -1323,6 +1335,26 @@ jobs:
       # ------------------------------------------------------------------
       # STEP 11: Summary for GitHub Actions UI.
       # ------------------------------------------------------------------
+      - name: Fail workflow if session creation failed (honest exit code)
+        if: always()
+        run: |
+          NEW_FAILED="${{ steps.devin-new-pr.outputs.session_failed }}"
+          DEVIN_AVAILABLE="${{ steps.health-check.outputs.devin_available }}"
+          NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
+          PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
+
+          if [ "$NEW_FAILED" = "true" ]; then
+            echo "::error::Devin session creation failed for new-in-PR alerts. Marking workflow as failed (EC11: honest exit code)."
+            exit 1
+          fi
+
+          if [ "$DEVIN_AVAILABLE" = "false" ] && { [ "$NEW_ACTIONABLE" != "0" ] && [ -n "$NEW_ACTIONABLE" ]; }; then
+            echo "::error::Devin API unavailable but actionable alerts exist. Marking workflow as failed (EC11: honest exit code)."
+            exit 1
+          fi
+
+          echo "Session creation status: OK"
+
       - name: Summary
         if: always()
         run: |
