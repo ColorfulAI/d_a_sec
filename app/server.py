@@ -44,4 +44,4 @@ def open_redirect():
     return redirect("/" + target.lstrip("/"))
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
