@@ -3,7 +3,7 @@ import subprocess
 import json
 import base64
 from markupsafe import escape
-from flask import Flask, request, redirect, make_response
+from flask import Flask, request, redirect, make_response, jsonify
 
 app = Flask(__name__)
 
@@ -18,7 +18,7 @@ def search():
     cursor = db.cursor()
     cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return {"results": results}
+    return jsonify({"results": results})
 
 @app.route("/run")
 def run_command():
