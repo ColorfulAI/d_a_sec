@@ -2,7 +2,8 @@ import sqlite3
 import subprocess
 import json
 import base64
-from flask import Flask, request, redirect, make_response
+from markupsafe import escape
+from flask import Flask, request, redirect, jsonify, make_response
 
 app = Flask(__name__)
 
@@ -50,14 +51,14 @@ def profile():
     data = request.cookies.get("session_data", "")
     if data:
         user = json.loads(base64.b64decode(data))
-        return {"username": user.get("name", "anonymous")}
+        return jsonify({"username": user.get("name", "anonymous")})
     return {"username": "anonymous"}
 
 @app.route("/page")
 def render_page():
     title = request.args.get("title", "Home")
     content = request.args.get("content", "")
-    html = f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    html = f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
     resp = make_response(html)
     resp.headers["Content-Type"] = "text/html"
     return resp
