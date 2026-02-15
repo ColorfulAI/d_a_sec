@@ -212,16 +212,19 @@ jobs:
           1. Clone the repository: https://github.com/${REPO}.git
           2. Checkout branch '${PR_BRANCH}'
           3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
-          4. Apply a minimal, focused fix for each alert. Follow the codebase's existing conventions:
+          4. Fix each alert ONE AT A TIME. For each alert:
+             a. Apply a minimal, focused fix following the codebase's existing conventions
+             b. Make a SEPARATE commit for that single fix with a message like: fix: [rule_id] description (file:line)
+          5. Conventions to follow:
              - If the project uses an ORM, use parameterized queries via the ORM
              - If there are existing sanitization utilities, reuse them
              - Do not introduce new dependencies unless absolutely necessary
-          5. After applying fixes, verify each fix is correct by reviewing the code
-          6. If the repository has tests, run them to ensure no regressions
-          7. Commit your fixes with a clear message referencing the CodeQL rule IDs
-          8. Push the commit(s) to branch '${PR_BRANCH}'
+          6. After all fixes, verify each fix is correct by reviewing the code
+          7. If the repository has tests, run them to ensure no regressions
+          8. Push all commit(s) to branch '${PR_BRANCH}'
 
           IMPORTANT:
+          - Each security issue MUST be a separate commit — do not combine fixes for different alerts
           - Do NOT just suppress or ignore alerts — fix the root cause
           - Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
           - Keep fixes minimal and surgical — do not refactor unrelated code"
@@ -275,20 +278,41 @@ jobs:
           max_concurrent = 3
           max_total_sessions = 20
 
-          file_groups = {}
-          for a in alerts:
-              f = a["file"]
-              file_groups.setdefault(f, []).append(a)
-
           severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
-          batches = []
-          for file_path, file_alerts in file_groups.items():
-              file_alerts.sort(key=lambda a: severity_order.get(a["severity"], 4))
-              for i in range(0, len(file_alerts), max_per_batch):
-                  batches.append(file_alerts[i:i + max_per_batch])
+          file_groups = {}
+          for a in alerts:
+              file_groups.setdefault(a["file"], []).append(a)
+          for fg in file_groups.values():
+              fg.sort(key=lambda a: severity_order.get(a["severity"], 4))
 
-          batches.sort(key=lambda b: min(severity_order.get(a["severity"], 4) for a in b))
+          sorted_files = sorted(
+              file_groups.items(),
+              key=lambda kv: min(severity_order.get(a["severity"], 4) for a in kv[1])
+          )
+
+          batches = []
+          remaining = {}
+          for fp, fa in sorted_files:
+              remaining[fp] = list(fa)
+
+          for fp, fa in sorted_files:
+              if not remaining[fp]:
+                  continue
+              while remaining[fp]:
+                  batch = remaining[fp][:max_per_batch]
+                  remaining[fp] = remaining[fp][len(batch):]
+                  if len(batch) < max_per_batch:
+                      for other_fp, other_fa in sorted_files:
+                          if other_fp == fp or not remaining.get(other_fp):
+                              continue
+                          space = max_per_batch - len(batch)
+                          taken = remaining[other_fp][:space]
+                          remaining[other_fp] = remaining[other_fp][len(taken):]
+                          batch.extend(taken)
+                          if len(batch) >= max_per_batch:
+                              break
+                  batches.append(batch)
 
           session_ids = []
           session_urls = []
@@ -315,16 +339,19 @@ jobs:
           1. Clone the repository: https://github.com/{repo}.git
           2. Create and checkout branch '{fix_branch}' from main (or pull and checkout if it already exists)
           3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
-          4. Apply a minimal, focused fix for each alert. Follow the codebase's existing conventions:
+          4. Fix each alert ONE AT A TIME. For each alert:
+             a. Apply a minimal, focused fix following the codebase's existing conventions
+             b. Make a SEPARATE commit for that single fix with a message like: "fix: [rule_id] description (file:line)"
+          5. Conventions to follow:
              - If the project uses an ORM, use parameterized queries via the ORM
              - If there are existing sanitization utilities, reuse them
              - Do not introduce new dependencies unless absolutely necessary
-          5. After applying fixes, verify each fix is correct by reviewing the code
-          6. If the repository has tests, run them to ensure no regressions
-          7. Commit your fixes with a clear message referencing the CodeQL rule IDs
-          8. Push the commit(s) to branch '{fix_branch}'
+          6. After all fixes, verify each fix is correct by reviewing the code
+          7. If the repository has tests, run them to ensure no regressions
+          8. Push all commit(s) to branch '{fix_branch}'
 
           IMPORTANT:
+          - Each security issue MUST be a separate commit — do not combine fixes for different alerts
           - Do NOT just suppress or ignore alerts — fix the root cause
           - Do NOT create a new PR — just push to branch '{fix_branch}'
           - Keep fixes minimal and surgical — do not refactor unrelated code
