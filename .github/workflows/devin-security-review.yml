@@ -746,9 +746,10 @@ jobs:
         id: devin-preexisting
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          export PR_NUMBER="$PR_NUMBER"
           export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
 
           echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
