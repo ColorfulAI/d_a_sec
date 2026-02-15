@@ -424,6 +424,85 @@ Devin Sessions: [Session 1](https://...)
 
 ---
 
+## Circuit Breaker and Internal Retry Design
+
+### Problem: The Idempotent Session Trap (BUG #2)
+
+The original design used `idempotent: true` on Devin API session creation calls. This flag uses the prompt text as a deduplication key — if you send the exact same prompt twice, the API returns the existing session instead of creating a new one. The intent was to prevent duplicate sessions on workflow re-runs.
+
+**The bug manifests in the circuit breaker flow:**
+
+```
+Run A — Push vulnerable code.
+  CodeQL finds py/command-line-injection at task_runner.py:9.
+  Workflow builds prompt with this alert, calls POST /v1/sessions
+    with idempotent: true.
+  Devin API creates Session X (new). Attempt counter → 1/2.
+
+Session X executes — Devin clones repo, fixes vuln, pushes commit c5459f9.
+  This push triggers a new workflow run.
+
+Run B — CodeQL re-analyzes. Two scenarios:
+
+  Scenario 1: Alert is FIXED.
+    Alert disappears from open alerts. Workflow marks it fixed. ✓
+
+  Scenario 2: Alert STILL EXISTS (fix didn't satisfy CodeQL).
+    Workflow builds prompt again for this alert.
+    The prompt is IDENTICAL to Run A's prompt (same alert details,
+      same file, same line).
+    Calls POST /v1/sessions with idempotent: true.
+    Devin API sees same prompt → returns Session X (already completed).
+    is_new_session: false. No new Devin work happens.
+    Attempt counter → 2/2.
+
+Run C — Workflow sees attempt count = 2/2 → marks alert unfixable.
+  But Devin never got a SECOND CHANCE to try a different fix approach.
+  The counter says 2/2 but only 1 real session ever ran.
+```
+
+**Root cause:** With `idempotent: true` and an identical prompt, the 2nd "attempt" is a no-op. The circuit breaker counter increments, but no real second attempt occurs.
+
+### Solution: Internal CodeQL Verification Loop
+
+Instead of relying on multiple workflow runs to retry, all retry logic happens **inside a single Devin session**:
+
+```
+Workflow Run — Creates 1 Devin session for the batch of alerts.
+
+Inside the session, for each alert:
+  1. Apply fix
+  2. Run CodeQL CLI locally (same config as repo)
+  3. Check if alert still appears in SARIF output
+     → If resolved: commit the fix, move to next alert
+     → If still present: revise fix, re-run CodeQL (attempt 2 of 2)
+       → If resolved: commit, move on
+       → If still present: SKIP this alert (do NOT commit broken fix)
+  4. Report which alerts were fixed and which were skipped
+
+Workflow marks skipped alerts as unfixable on the next run
+  (alert still present in CodeQL → attempt counter at max → unfixable).
+```
+
+**Key properties:**
+- Only 1 Devin session per batch of alerts (no excessive session creation)
+- Devin gets 2 real fix attempts per alert with local CodeQL verification
+- Broken fixes are never committed (skipped if CodeQL still flags them)
+- The `idempotent` flag is removed — no longer needed since retries are internal
+- The workflow-level circuit breaker still works: if an alert persists after the session completes, the next workflow run increments the attempt counter and eventually marks it unfixable
+
+### Why Not Multiple Sessions?
+
+| Approach | Sessions Created | Real Attempts | Latency | Cost |
+|----------|-----------------|---------------|---------|------|
+| `idempotent: true` (old) | 1 (reused) | 1 | 2+ workflow runs | Low but broken |
+| Unique key per attempt | 2 separate | 2 | 2+ workflow runs | 2x session cost |
+| **Internal retry (current)** | **1** | **2** | **1 workflow run** | **1x session cost** |
+
+The internal retry approach is strictly better: fewer sessions, faster feedback, lower cost, and the verification happens immediately rather than waiting for another full CodeQL workflow cycle.
+
+---
+
 ## Design Decisions Log
 
 | # | Decision | Options Considered | Chosen | Rationale |

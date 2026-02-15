@@ -759,11 +759,18 @@ jobs:
       # STEP 6: Create Devin session for new-in-PR alerts.
       # Enhanced prompt includes:
       # - CodeQL CLI local verification (same config as project)
-      # - Max 2 local fix attempts per alert before marking unfixable
+      # - Max 2 internal fix attempts per alert before skipping
       # - git pull --rebase before push (prevents merge commits)
       # - Skip unfixable alerts and continue with remaining batch
-      # - idempotent=true to prevent duplicate sessions
       # - max_acu_limit to cap resource usage
+      #
+      # DESIGN NOTE: All retry logic happens INSIDE the single Devin
+      # session. Devin runs CodeQL locally after each fix attempt and
+      # retries once if the alert persists (2 attempts total per alert).
+      # If it still fails, Devin skips that alert (does NOT commit a
+      # broken fix). The workflow then marks it unfixable on the next
+      # run when the alert is still present. This avoids creating
+      # multiple sessions for the same batch of alerts.
       # ------------------------------------------------------------------
       - name: Create Devin session for new-in-PR alerts
         if: steps.filter-alerts.outputs.new_actionable_count != '0' && steps.health-check.outputs.devin_available == 'true'
@@ -824,12 +831,12 @@ jobs:
 
           PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
 
-          # Create session with idempotent flag and ACU limit
+          # Create session (no idempotent flag — retries happen inside the session via local CodeQL)
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST "https://api.devin.ai/v1/sessions" \
             -H "Authorization: Bearer $DEVIN_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"prompt\": $PROMPT_JSON, \"idempotent\": true, \"max_acu_limit\": 10}")
+            -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
@@ -845,7 +852,7 @@ jobs:
               -X POST "https://api.devin.ai/v1/sessions" \
               -H "Authorization: Bearer $DEVIN_API_KEY" \
               -H "Content-Type: application/json" \
-              -d "{\"prompt\": $PROMPT_JSON, \"idempotent\": true, \"max_acu_limit\": 10}")
+              -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
             BODY=$(echo "$RESPONSE" | head -n -1)
             echo "Retry response (HTTP $HTTP_CODE):"
@@ -872,13 +879,13 @@ jobs:
       # ------------------------------------------------------------------
       # STEP 7: Create Devin sessions for pre-existing alerts (batched).
       # Same enhancements as new-in-PR: CodeQL verification, rebase,
-      # skip unfixable, rate limit handling, idempotent, ACU cap.
+      # skip unfixable, rate limit handling, ACU cap.
       # Batching: prefer same-file, backfill to fill batch (cap 15).
       #
       # IMPORTANT: Branch name is DETERMINISTIC (based on PR number, not
       # timestamp) so that re-runs reuse the same branch and don't create
-      # infinite new branches/PRs. The idempotent flag on sessions also
-      # prevents duplicate sessions for the same prompt.
+      # infinite new branches/PRs. Retry logic happens inside each
+      # session (local CodeQL verification, 2 attempts per alert).
       # ------------------------------------------------------------------
       - name: Create Devin sessions for pre-existing alerts (batched)
         if: steps.filter-alerts.outputs.pre_actionable_count != '0' && steps.health-check.outputs.devin_available == 'true'
@@ -993,7 +1000,6 @@ jobs:
 
               body_bytes = json.dumps({
                   "prompt": prompt,
-                  "idempotent": True,
                   "max_acu_limit": 10
               }).encode()
 
@@ -1432,14 +1438,23 @@ jobs:
 
           if [ "$UNFIXABLE_COUNT" != "0" ] && [ -n "$UNFIXABLE_COUNT" ]; then
             echo "Adding label '$LABEL' to PR #$PR_NUMBER (unfixable alerts exist)..."
-            # Create the label if it doesn't exist
-            curl -s -L \
-              -X POST \
+            # Create the label only if it doesn't already exist (avoids 422 on every run)
+            LABEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GH_PAT" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/labels" \
-              -d "{\"name\": \"$LABEL\", \"color\": \"d93f0b\", \"description\": \"Security alerts that Devin could not auto-fix — requires manual developer review\"}" \
-              2>/dev/null || true
+              "https://api.github.com/repos/$REPO/labels/$(echo "$LABEL" | sed 's/:/%3A/g')")
+            if [ "$LABEL_HTTP" = "404" ]; then
+              echo "Label '$LABEL' does not exist. Creating..."
+              curl -s -L \
+                -X POST \
+                -H "Authorization: token $GH_PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/labels" \
+                -d "{\"name\": \"$LABEL\", \"color\": \"d93f0b\", \"description\": \"Security alerts that Devin could not auto-fix — requires manual developer review\"}" \
+                2>/dev/null || true
+            else
+              echo "Label '$LABEL' already exists (HTTP $LABEL_HTTP). Skipping creation."
+            fi
 
             # Add label to PR
             curl -s -L \

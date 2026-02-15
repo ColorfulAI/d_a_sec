@@ -290,6 +290,71 @@ Developer doesn't know when all fixes are applied and verified.
 **Expected**: Workflow handles API error gracefully, posts comment noting failure.
 **Validates**: Error handling, graceful degradation.
 
+### TC-G: Internal Retry — Devin Fixes Alert on First CodeQL Attempt
+**Setup**: Push a simple, clearly fixable vulnerability (e.g., `py/sql-injection` with string concatenation).
+**Expected**:
+1. Workflow creates exactly 1 Devin session (not 2+)
+2. Devin fixes the alert, runs CodeQL locally, confirms it's resolved on attempt 1
+3. Devin commits the fix and pushes
+4. Next workflow run sees the alert as fixed — no new session created
+5. No `idempotent` flag in the API call (verify in workflow logs)
+**Validates**: Single-session design works for the happy path. No wasted sessions.
+
+### TC-H: Internal Retry — Devin Needs 2nd Attempt Inside Session
+**Setup**: Push a vulnerability where the "obvious" fix doesn't satisfy CodeQL (e.g., `py/url-redirection` where `urlparse().path` is still tainted, or `py/reflective-xss` where escaping alone isn't sufficient).
+**Expected**:
+1. Workflow creates exactly 1 Devin session
+2. Inside the session, Devin applies fix attempt 1 → runs CodeQL → alert still present
+3. Devin revises the fix (attempt 2) → runs CodeQL → alert resolved (or skipped)
+4. Only 1 session created across the entire flow (verify via Devin API / workflow logs)
+5. If attempt 2 also fails, Devin skips the alert (does NOT commit a broken fix)
+**Validates**: Internal retry loop works. Devin gets 2 real attempts per alert within 1 session.
+**Key check**: Confirm the Devin session log shows 2 CodeQL runs for the stubborn alert.
+
+### TC-I: Internal Retry — Alert Unfixable After 2 Internal Attempts
+**Setup**: Push a vulnerability that CodeQL cannot be satisfied on (e.g., a taint flow through `urlparse()` that CodeQL always flags regardless of validation).
+**Expected**:
+1. Workflow creates 1 Devin session
+2. Devin tries fix attempt 1 → CodeQL still flags → attempt 2 → still flags → Devin skips
+3. Devin does NOT commit a broken fix for this alert
+4. Devin pushes fixes for any other alerts in the batch that were resolved
+5. Next workflow run: the skipped alert is still open in CodeQL → attempt counter increments → marked unfixable
+6. PR comment shows "Needs Manual Fix" for the unfixable alert
+7. Subsequent workflow runs do NOT create new sessions for this alert
+**Validates**: Full circuit breaker lifecycle with internal retry. Broken fixes are never committed.
+
+### TC-J: No Duplicate Sessions on Re-trigger (Idempotent Removal Regression)
+**Setup**: Push vulnerable code → workflow runs → Devin session created → Devin pushes fix → fix triggers new workflow run.
+**Expected**:
+1. Run A: Creates 1 session, Devin fixes alert
+2. Run B (triggered by Devin's push): If alert is fixed, no session created (0 actionable alerts). If alert persists, creates a NEW session (not a reuse of the old one) since `idempotent` is removed
+3. No `is_new_session: false` responses from the Devin API
+4. The workflow's own circuit breaker (attempt counter) prevents infinite loops, NOT the API's idempotent dedup
+**Validates**: Removing `idempotent: true` doesn't cause runaway session creation. The workflow-level circuit breaker is the safety net.
+**Regression risk**: Without `idempotent`, each workflow run with actionable alerts WILL create a new session. The circuit breaker (max 2 attempts) must reliably prevent more than 2 sessions for the same alert.
+
+### TC-K: Batch Alert — Mixed Fix Results Inside Single Session
+**Setup**: Push 3 vulnerabilities: 1 easily fixable, 1 that needs 2 attempts, 1 that's unfixable.
+**Expected**:
+1. Workflow creates 1 Devin session for all 3 alerts
+2. Inside the session:
+   - Alert 1: fixed on attempt 1 → committed
+   - Alert 2: attempt 1 fails CodeQL → attempt 2 succeeds → committed
+   - Alert 3: attempt 1 fails → attempt 2 fails → SKIPPED (not committed)
+3. Only 2 fix commits pushed (alerts 1 and 2)
+4. Next workflow run: alert 3 still open → marked unfixable
+5. PR comment shows mixed state: 2 fixed, 1 needs manual review
+**Validates**: Batch handling with mixed outcomes inside a single session.
+
+### TC-L: Label Creation Idempotency
+**Setup**: Run the workflow twice with unfixable alerts present.
+**Expected**:
+1. First run: Label `devin:manual-review-needed` created (HTTP 201) and added to PR
+2. Second run: Label existence check returns 200 → creation skipped → label still on PR
+3. No 422 errors in workflow logs on the second run
+4. When all alerts are fixed: label removed from PR
+**Validates**: Label creation check-before-create logic. No wasted API calls.
+
 ---
 
 ## Known Issues
