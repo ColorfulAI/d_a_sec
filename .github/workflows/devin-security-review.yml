@@ -288,9 +288,10 @@ jobs:
         id: classify-alerts
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
           PR_REF="refs/pull/${PR_NUMBER}/merge"
 
           echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
