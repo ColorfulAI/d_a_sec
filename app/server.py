@@ -1,9 +1,16 @@
+import shlex
 import sqlite3
 import subprocess
-import os
-from flask import Flask, request, redirect, make_response
+from markupsafe import escape
+from flask import Flask, request, redirect, jsonify
 
 app = Flask(__name__)
+
+ALLOWED_REDIRECTS = {
+    "home": "/",
+    "dashboard": "/dashboard",
+    "settings": "/settings",
+}
 
 def get_db():
     conn = sqlite3.connect("app.db")
@@ -14,39 +21,31 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
+    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return str(results)
+    return jsonify({"results": results})
 
 @app.route("/run")
 def run_command():
+    ALLOWED_COMMANDS = {"echo", "date", "whoami", "uname"}
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return output.decode()
+    args = shlex.split(cmd)
+    if not args or args[0] not in ALLOWED_COMMANDS:
+        return jsonify({"error": "Command not allowed"}), 400
+    output = subprocess.check_output(args, shell=False)
+    return jsonify({"output": output.decode()})
 
 @app.route("/redirect")
 def open_redirect():
-    url = request.args.get("url", "/")
+    target = request.args.get("url", "home")
+    url = ALLOWED_REDIRECTS.get(target, "/")
     return redirect(url)
-
-@app.route("/eval")
-def evaluate():
-    expr = request.args.get("expr", "1+1")
-    result = eval(expr)
-    return str(result)
-
-@app.route("/read")
-def read_file():
-    filename = request.args.get("file", "README.md")
-    path = os.path.join("/data", filename)
-    with open(path) as f:
-        return f.read()
 
 @app.route("/page")
 def render_page():
     title = request.args.get("title", "Home")
     content = request.args.get("content", "Welcome")
-    return f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    return f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
