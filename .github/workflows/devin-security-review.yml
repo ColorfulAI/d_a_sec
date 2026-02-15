@@ -554,9 +554,9 @@ jobs:
       - name: Filter alerts (skip already-attempted, mark unfixable)
         id: filter-alerts
         if: steps.classify-alerts.outputs.total_count != '0'
+        env:
+          IS_DEVIN_FIX: ${{ steps.detect-devin.outputs.is_devin_fix }}
         run: |
-          IS_DEVIN_FIX="${{ steps.detect-devin.outputs.is_devin_fix }}"
-
           python3 << 'FILTER_EOF'
           import json, os
 
@@ -608,18 +608,26 @@ jobs:
           print(f"\nFiltering pre-existing alerts:")
           pre_actionable, pre_skipped, pre_newly_unfixable = filter_alerts(pre_alerts, "pre")
 
-          all_unfixable = list(unfixable)
-          all_unfixable_alerts = new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable
-
           current_alert_keys = set()
           for a in new_alerts + pre_alerts:
               current_alert_keys.add(a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}"))
 
           fixed_keys = []
-          for prev_key in history.get("attempts", {}):
-              if prev_key not in current_alert_keys and prev_key not in unfixable:
+          stale_unfixable = []
+          for prev_key in list(history.get("attempts", {}).keys()):
+              if prev_key not in current_alert_keys:
                   fixed_keys.append(prev_key)
-                  print(f"  [FIXED] {prev_key} — no longer in CodeQL alerts")
+                  if prev_key in unfixable:
+                      stale_unfixable.append(prev_key)
+                      print(f"  [FIXED-WAS-UNFIXABLE] {prev_key} — was marked unfixable but now resolved")
+                  else:
+                      print(f"  [FIXED] {prev_key} — no longer in CodeQL alerts")
+          for k in stale_unfixable:
+              unfixable.discard(k)
+
+          all_unfixable = list(unfixable)
+          all_unfixable_alerts = [a for a in (new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable)
+                                  if a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}") in unfixable]
 
           with open("/tmp/new_in_pr_actionable.json", "w") as f:
               json.dump(new_actionable, f, indent=2)
