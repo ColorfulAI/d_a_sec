@@ -33,10 +33,17 @@ def run_command():
     output = subprocess.check_output(ALLOWED_COMMANDS[cmd])
     return {"output": output.decode()}
 
+ALLOWED_REDIRECTS = {
+    "home": "/",
+    "search": "/search",
+    "profile": "/profile",
+    "page": "/page",
+}
+
 @app.route("/redirect")
 def open_redirect():
-    url = request.args.get("url", "/")
-    return redirect(url)
+    target = request.args.get("url", "home")
+    return redirect(ALLOWED_REDIRECTS.get(target, "/"))
 
 @app.route("/profile")
 def profile():
