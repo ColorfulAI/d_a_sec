@@ -539,6 +539,11 @@ IMPORTANT:
       # Same enhancements as new-in-PR: CodeQL verification, rebase,
       # skip unfixable, rate limit handling, idempotent, ACU cap.
       # Batching: prefer same-file, backfill to fill batch (cap 15).
+      #
+      # IMPORTANT: Branch name is DETERMINISTIC (based on PR number, not
+      # timestamp) so that re-runs reuse the same branch and don't create
+      # infinite new branches/PRs. The idempotent flag on sessions also
+      # prevents duplicate sessions for the same prompt.
       # ------------------------------------------------------------------
       - name: Create Devin sessions for pre-existing alerts (batched)
         if: steps.filter-alerts.outputs.pre_actionable_count != '0'
@@ -548,8 +553,7 @@ IMPORTANT:
         run: |
           export REPO="${{ github.repository }}"
           export PR_NUMBER="${{ github.event.pull_request.number }}"
-          TIMESTAMP=$(date +%s)
-          export FIX_BRANCH="devin/security-fixes-${TIMESTAMP}"
+          export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
 
           echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
 
