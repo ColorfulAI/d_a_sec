@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, abort
+from flask import Flask, Response, request, abort
 app = Flask(__name__)
 @app.route("/stress39")
 def handler_39():
@@ -8,4 +8,4 @@ def handler_39():
     if not safe_path.startswith("/data/"):
         abort(403)
     with open(safe_path) as fh:
-        return fh.read()
+        return Response(fh.read(), mimetype="text/plain")
