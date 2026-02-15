@@ -241,10 +241,20 @@ The prompt given to each Devin session is carefully structured:
 
 ### Concurrency and Rate Limiting
 
-- **New-in-PR**: 1 session (PRs typically have few new alerts)
-- **Pre-existing batches**: 3-5 concurrent sessions, processed in waves
-- Each session polls for completion before starting the next wave
+- **New-in-PR**: 1 session (PRs typically have few new alerts); if >20 alerts, split by file
+- **Pre-existing batches**: 3 concurrent sessions, processed in waves with 30s pauses
+- Max 20 sessions per workflow run to cap resource usage
 - Prevents overwhelming the Devin API or GitHub Actions quotas
+
+### Non-Blocking Design
+
+The workflow does NOT block the PR while Devin fixes issues:
+1. Workflow posts PR comment with alert classification + Devin session links
+2. Workflow exits immediately (success)
+3. Devin sessions run asynchronously — developer can continue working on the PR
+4. Fixes appear as new commits on the PR branch when Devin finishes
+
+This means the security review never delays PR merging — it runs in parallel.
 
 ---
 
@@ -313,7 +323,7 @@ A mature codebase may have hundreds or thousands of pre-existing CodeQL alerts. 
 |-----------|-------|-----------|
 | Grouping | By file path | Devin sees full file context; related alerts in the same file likely need coordinated fixes |
 | Max alerts per session | 15 | Keeps the prompt focused; Devin can handle 15 alerts in one file effectively |
-| Max concurrent sessions | 3-5 | Respects API rate limits; prevents resource contention |
+| Max concurrent sessions | 3 | Respects API rate limits; prevents resource contention |
 | Processing | Waves | Start N sessions, wait for completion, start next N |
 
 ### Batching Flow
@@ -412,7 +422,7 @@ Devin Sessions: [Session 1](https://...)
 | 5 | Fix delivery for pre-existing | Same PR, separate PR, hybrid | Separate batch PR | Clean separation; doesn't pollute original PR; code exists on main so branching works |
 | 6 | Batching strategy | By file, by severity, by rule, fixed size | By file (capped at 15) | Related alerts in same file need coordinated fixes; cap prevents prompt overload |
 | 7 | Devin API version | v1, v2, v3 | v1 | v2/v3 require Enterprise tier; v1 works with service API key on all plans |
-| 8 | Session concurrency | Unlimited, fixed cap | 3-5 concurrent | Respects API limits; prevents resource contention |
+| 8 | Session concurrency | Unlimited, fixed cap | 3 concurrent, max 20 total | Respects API limits; prevents resource contention |
 | 9 | Verification approach | Trust the fix, re-run CodeQL, run tests | Re-run CodeQL + run tests | Closed loop ensures fix actually resolves the alert and doesn't break anything |
 | 10 | CodeQL wait strategy | `workflow_run` trigger, polling check runs | Polling check runs | More reliable; `workflow_run` only fires after the entire workflow completes and has edge cases with multiple workflows |
 
@@ -437,7 +447,7 @@ Devin Sessions: [Session 1](https://...)
 
 - **Language coverage**: Currently configured for Python and Actions. Adding more languages requires updating the matrix in `codeql.yml`.
 - **CodeQL only**: The pipeline is specific to CodeQL. Other SAST tools (Semgrep, Snyk Code) would require adapter logic.
-- **Session polling timeout**: The workflow polls Devin for up to 10 minutes. Long-running sessions may time out, requiring async follow-up.
+- **Async only**: The workflow does not wait for Devin to finish — it fires sessions and exits. Monitoring session completion requires checking session URLs manually or building a callback webhook.
 - **Single repo**: Designed for a single repository. Multi-repo orchestration would need a separate dispatcher.
 
 ### Planned Improvements
