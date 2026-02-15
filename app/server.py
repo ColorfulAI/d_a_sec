@@ -57,10 +57,14 @@ def evaluate():
         return "Invalid expression", 400
     return str(result)
 
+ALLOWED_FILES = {"README.md": "/data/README.md", "info.txt": "/data/info.txt", "help.txt": "/data/help.txt"}
+
 @app.route("/read")
 def read_file():
     filename = request.args.get("file", "README.md")
-    path = os.path.join("/data", filename)
+    path = ALLOWED_FILES.get(filename)
+    if path is None:
+        return "File not allowed", 403
     with open(path) as f:
         return f.read()
 
