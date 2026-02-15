@@ -1090,6 +1090,233 @@ For each CodeQL alert:
 3. **Phase 3**: Pre-dispatch session cleanup
 4. **Phase 4**: Deferred cleanup job (separate workflow)
 
+### Edge Case 13: Stuck PR — Failed Dispatch with No Re-Trigger Mechanism
+
+**Problem**: A PR contains vulnerable code. CodeQL detects it (red check). Our workflow runs but fails to create a Devin session (e.g., HTTP 429 rate limit). The workflow exits green (EC11's false-green problem). Now the PR is stuck in a dead state: CodeQL is red (correct), our workflow is green (misleading), and **nothing will cause our workflow to run again** because there's no new push to trigger CodeQL, which means no new `workflow_run` event for us.
+
+**Observed in production**: PR #3 on 2026-02-15. Screenshot shows CodeQL failing with "8 new alerts including 8 critical severity security vulner..." while "Devin Security Review / security-review" shows green. The developer sees this and either (a) thinks Devin is handling it, or (b) is confused about why the green check didn't fix anything.
+
+**Why this is different from EC11 and EC12**:
+
+| Edge Case | Problem | Assumes |
+|-----------|---------|---------|
+| EC11 | Workflow exits green when it should exit red | A future run will eventually retry |
+| EC12 | Alerts are deferred but state is preserved | A future run will pick them up |
+| EC13 | **No future run will ever happen** | Nothing triggers a retry without external action |
+
+EC11 and EC12 both assume there will be a "next run." EC13 is about the case where there is NO next run — the trigger chain is broken.
+
+**The trigger chain and where it breaks**:
+
+```
+Developer pushes code
+       │
+       ▼
+CodeQL runs (on push/PR event)
+       │
+       ▼
+CodeQL completes
+       │
+       ▼
+workflow_run fires (our workflow)
+       │
+       ▼
+Our workflow tries to create Devin session
+       │
+       ▼ FAILS (429/500/timeout)
+       │
+       ▼
+Workflow exits (green or red)
+       │
+       ▼
+       ╳ DEAD END — no new push = no new CodeQL = no new workflow_run
+```
+
+The chain only restarts if:
+1. **Developer pushes new code** → triggers CodeQL → triggers us (but developer may not push for days/weeks)
+2. **Someone manually re-runs the workflow** → but if it showed green, nobody thinks to re-run it
+3. **A cron schedule triggers a run** → but cron runs on default branch context, not PR context
+4. **Someone manually triggers workflow_dispatch** → requires someone to know this is needed
+
+**Sub-cases and developer experience**:
+
+#### EC13a: Developer sees green check, trusts it, waits forever
+
+| Aspect | Detail |
+|--------|--------|
+| **Scenario** | Developer pushes vulnerable code. CodeQL red, our workflow green (false positive from EC11). Developer thinks "Devin is on it." |
+| **What happens** | Nothing. No session was created. No fix will come. CodeQL blocks the merge, so the PR sits. |
+| **Developer action** | Waits days. Eventually asks "why hasn't Devin fixed this?" |
+| **Enterprise impact** | HIGH — developer productivity lost, trust in automation eroded |
+| **Root cause** | No retry mechanism after workflow completes |
+
+#### EC13b: Developer pushes unrelated change, accidentally triggers retry
+
+| Aspect | Detail |
+|--------|--------|
+| **Scenario** | Days later, developer pushes an unrelated code change to the same PR branch. |
+| **What happens** | CodeQL re-runs, finds the same alerts (plus possibly new ones). Our workflow triggers again. If Devin now has capacity, it dispatches sessions and fixes the alerts. |
+| **Developer action** | Unintentional fix — developer doesn't realize the security fix was triggered by their unrelated push. |
+| **Enterprise impact** | LOW — it works, but only by accident. Unreliable for critical security fixes. |
+
+#### EC13c: PR abandoned due to stuck state
+
+| Aspect | Detail |
+|--------|--------|
+| **Scenario** | Developer can't merge (CodeQL blocks), doesn't understand why Devin isn't fixing, gives up on the PR. |
+| **What happens** | PR sits open indefinitely. Vulnerable code stays in the branch. If someone else merges a different PR touching the same files, conflicts arise. |
+| **Developer action** | Opens a new PR, manually fixes the vulnerability, or abandons the feature. |
+| **Enterprise impact** | MEDIUM — feature velocity lost, developer frustration. If developer manually fixes, the automation provided zero value. |
+
+#### EC13d: CodeQL alerts on PR are not the same as alerts on main
+
+| Aspect | Detail |
+|--------|--------|
+| **Scenario** | User asks: "Would the CodeQL issues list show that issue we didn't fix?" |
+| **Answer** | YES — CodeQL alerts from PR scans are scoped to the PR's merge ref. They persist in the GitHub Code Scanning API (`GET /code-scanning/alerts?ref=refs/pull/{N}/merge`) as long as the PR is open and the code hasn't changed. They do NOT automatically transfer to main's alert list until the PR is merged. |
+| **Implication** | Our workflow CAN always re-read these alerts on a future run — the data is there. The problem is not data loss, it's **trigger loss**. |
+
+#### EC13e: Can we pick up from failed PRs vs only from main?
+
+| Aspect | Detail |
+|--------|--------|
+| **Scenario** | User asks: "Is our capacity to pick up where we left off only for issues already in a merged commit (on main), or can we pick up from failed PRs?" |
+| **Answer** | We CAN pick up from failed PRs — CodeQL alerts on the PR merge ref remain available via API. The issue is triggering a re-run. If we add a cron-based sweep (Solution 3 below), it can query all open PRs with CodeQL alerts and retry failed dispatches. This works for both PR-scoped and main-scoped alerts. |
+
+**Proposed solutions**:
+
+**Solution 1: Fix EC11 first (honest exit code)**
+
+The most critical fix: if our workflow fails to create a session, exit 1 (red check). This means:
+- Developer sees TWO red checks (CodeQL + ours) instead of misleading green
+- Developer knows something is wrong and can take action (re-run, investigate, fix manually)
+- This doesn't solve the "no automatic retry" problem, but at least it doesn't LIE about the state
+
+**Solution 2: Self-scheduling retry via `workflow_dispatch`**
+
+When the workflow detects a dispatch failure, it schedules a retry by triggering itself:
+
+```yaml
+- name: Schedule retry on dispatch failure
+  if: env.DISPATCH_FAILED == 'true'
+  run: |
+    sleep $((RANDOM % 300 + 300))  # 5-10 min jittered delay
+    curl -X POST \
+      -H "Authorization: token ${{ secrets.GH_PAT }}" \
+      "https://api.github.com/repos/${{ github.repository }}/actions/workflows/devin-security-review.yml/dispatches" \
+      -d '{"ref": "${{ github.ref }}", "inputs": {"pr_number": "${{ env.PR_NUMBER }}", "retry": "true"}}'
+```
+
+The workflow already supports `workflow_dispatch` with a `pr_number` input. This creates a self-healing loop:
+- Dispatch fails → workflow schedules a retry in 5-10 min
+- Retry runs → if Devin has capacity, dispatches session → done
+- Retry fails again → schedules another retry (with backoff)
+- Max retries cap prevents infinite self-scheduling (e.g., 6 retries = 30 min window)
+
+**Pros**: Fully automatic, no cron needed, PR-specific.
+**Cons**: Requires PAT with `workflow` scope (already have it). Could create runaway retries without a cap.
+
+**Solution 3: Cron-based sweep of open PRs with unresolved alerts**
+
+Add a scheduled workflow that runs every 15-30 minutes:
+
+```yaml
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 min
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find stuck PRs
+        run: |
+          # List open PRs
+          PRS=$(curl -s -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/pulls?state=open" | jq '.[].number')
+          
+          for PR in $PRS; do
+            # Check if PR has our comment with deferred/failed state
+            COMMENT=$(curl -s -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/$REPO/issues/$PR/comments" \
+              | jq -r '.[] | select(.body | contains("devin-security-state")) | .body')
+            
+            if echo "$COMMENT" | grep -q "deferred:"; then
+              # Found a stuck PR — trigger workflow_dispatch for it
+              curl -X POST "...dispatches" -d '{"inputs": {"pr_number": "'$PR'"}}'
+            fi
+          done
+```
+
+**Pros**: Catches ALL stuck PRs, not just the current one. Works even if the original workflow never ran (e.g., Devin was down during the original CodeQL run).
+**Cons**: Another workflow to maintain. Runs even when not needed (wasted minutes). May re-dispatch for PRs that are intentionally paused.
+
+**Solution 4: GitHub Check Run annotation as trigger**
+
+Instead of relying on `workflow_run`, register a GitHub Check Run in our workflow. If the check fails (dispatch failure), the developer sees a "Re-run" button in the GitHub UI. This turns the retry into a 1-click action instead of requiring a manual `workflow_dispatch`.
+
+Additionally, the check annotation can include a message: "Devin session could not be created. Click 'Re-run' to retry."
+
+**Pros**: Developer-initiated, visible, no automation overhead.
+**Cons**: Requires manual action. Developer must know to look for the re-run button.
+
+**Solution 5: Comment-based retry trigger (most creative)**
+
+Add a `/devin retry` command in PR comments. A separate lightweight workflow watches for this comment pattern and triggers the security review workflow:
+
+```yaml
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  retry:
+    if: contains(github.event.comment.body, '/devin retry')
+    steps:
+      - name: Trigger security review
+        run: |
+          PR=${{ github.event.issue.number }}
+          curl -X POST "...dispatches" -d '{"inputs": {"pr_number": "'$PR'"}}'
+```
+
+**Pros**: Developer can retry at will. No cron. Visible in PR conversation. Team members can trigger it.
+**Cons**: Another workflow. Developer must know the command exists. Susceptible to abuse (rate limit: max 1 trigger per 5 min via marker check).
+
+**Recommended implementation order**:
+
+| Priority | Solution | Why |
+|----------|----------|-----|
+| P0 | Solution 1 (honest exit code) | Zero-cost fix. Stop lying about state. |
+| P1 | Solution 2 (self-scheduling retry) | Automatic, PR-specific, self-healing. Solves the stuck PR problem entirely. |
+| P2 | Solution 5 (`/devin retry` command) | Great DX. Developer has escape hatch. Low maintenance. |
+| P3 | Solution 3 (cron sweep) | Catches edge cases that Solutions 1-2 miss (e.g., workflow never ran at all). |
+| P4 | Solution 4 (Check Run re-run) | Nice to have but GitHub already has workflow re-run button. |
+
+**The complete "stuck PR" recovery path** (with all solutions implemented):
+
+```
+1. Developer pushes vulnerable code
+2. CodeQL detects alerts (red check)
+3. Our workflow runs, hits rate limit → exits RED (Solution 1)
+4. Workflow self-schedules a retry in 5-10 min (Solution 2)
+5. Retry #1 runs → still at capacity → schedules retry #2
+6. Retry #2 runs → Devin has capacity → session created → alert claimed
+7. Devin fixes the issue → pushes commit → CodeQL re-runs → alerts resolved
+8. If all retries exhausted: PR comment says "Automatic retry exhausted. 
+   Use /devin retry to trigger manually or fix the issues by hand."
+   (Solution 5 provides the escape hatch)
+9. If developer does nothing for 30+ min: cron sweep detects stuck PR,
+   triggers retry (Solution 3)
+```
+
+**What needs to happen for the issue on this PR to be fixed without manual nudging** (answering the user's direct question):
+
+With current implementation: **Nothing will happen automatically.** The PR is stuck. Someone must either push new code (accidental retry) or manually re-run the workflow.
+
+With proposed solutions: **Solution 2 (self-scheduling retry) fixes this entirely.** The workflow detects its own failure and schedules a retry. The retry runs in 5-10 minutes. If Devin is still busy, it retries again with backoff. After 6 retries (30 min), it gives up and the PR comment clearly states what happened and how to retry.
+
+**Implementation status**: DESIGNED, not yet implemented. P0 (honest exit code from EC11) is a prerequisite. P1 (self-scheduling retry) is the key fix for this edge case.
+
 ---
 
 ## Secrets and Authentication

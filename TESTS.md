@@ -281,6 +281,254 @@ This document tracks all test scenarios, results, and regression checks for the 
 
 ---
 
+### T15: Alert Claiming Prevents Duplicate Sessions (EC10)
+
+**Purpose**: Verify that when two workflow runs see the same unfixed alert, only one dispatches a Devin session. The second run should see the claim marker and skip.
+
+**Relates to**: Edge Case 10 (Alert Claiming with TTL)
+
+**Setup**:
+1. Configure workflow to run on a schedule (cron every 5 min) or trigger two `workflow_dispatch` runs in quick succession
+2. Ensure at least 1 CodeQL alert is open and unfixed on the PR
+
+**Steps**:
+1. Trigger workflow run A — it creates a Devin session and writes a `claimed:` marker to the PR comment
+2. Within 30 seconds, trigger workflow run B (before Devin has fixed the alert)
+3. Run B reads the PR comment, finds the `claimed:` marker with a valid TTL
+4. Run B skips the alert (does NOT create a duplicate session)
+
+**Expected**:
+- Run A: Creates session, writes `<!-- claimed:ALERT_KEY=RUN_A:TIMESTAMP:SESSION_ID -->`
+- Run B: Reads claimed marker, logs "Alert ALERT_KEY already claimed by run RUN_A (TTL valid)", skips
+- Only 1 Devin session exists for the alert, not 2
+- PR comment shows the claim metadata in DEBUG mode
+
+**Worry**: Two runs read the comment at the exact same moment (before either writes the claim). Both think it's unclaimed and both dispatch. Mitigation: `idempotent=true` on Devin sessions means identical prompts reuse the same session. Verify this fallback works.
+
+**TTL expiry sub-test**:
+1. After 30+ minutes (or by faking the timestamp), trigger run C
+2. Run C should see the claim as expired (zombie), reclaim the alert, and dispatch a new session
+3. Verify the old claim is replaced with a new one
+
+---
+
+### T16: Session Creation Failure Produces Honest State (EC11)
+
+**Purpose**: Verify the workflow exits with the correct status code and posts an honest PR comment when Devin session creation fails.
+
+**Relates to**: Edge Case 11 (Session Creation Failure / False-Green Check)
+
+**Setup**:
+1. Ensure all 5 Devin session slots are occupied (create 5 sessions manually or from previous runs)
+2. Push vulnerable code to a PR to trigger CodeQL alerts
+
+**Steps**:
+1. Wait for CodeQL to complete and our workflow to trigger
+2. Workflow attempts to create a Devin session, gets HTTP 429
+3. Workflow retries once after backoff, gets 429 again
+4. Check workflow exit code
+5. Check PR comment content
+
+**Expected**:
+- Workflow exits with code 1 (red check), NOT code 0 (green)
+- PR comment states: "**FAILED**: Devin could not create any sessions (HTTP 429 — concurrent session limit). All N alerts require manual attention. Will retry on next run."
+- PR comment does NOT say "Devin is fixing these issues" (that would be a lie)
+- CodeQL check is also red (independent of our workflow)
+- Developer sees TWO red checks, understands both what's wrong (CodeQL) and why it's not being fixed (our workflow)
+
+**Worry (EC11a)**: Workflow exits green despite total failure. Developer trusts the green check, waits forever, nothing gets fixed. This is the highest-priority bug to fix.
+
+**Partial failure sub-test (EC11b)**:
+1. Have 3 alerts. Occupy 4/5 Devin slots.
+2. Workflow creates session for alert 1 (success, slot 5 used)
+3. Workflow tries alert 2, gets 429 (no slots left)
+4. Verify: exit code 1, PR comment shows "1/3 alerts dispatched, 2 could not be dispatched"
+5. Verify: `dispatched:` marker for alert 1, `failed_dispatch:` marker for alerts 2-3
+
+**Worry (EC11b)**: Partial success is reported as full success. Alerts 2-3 are silently dropped and never retried.
+
+**Degraded mode sub-test**:
+1. Make Devin API completely unreachable (bad API key or network block)
+2. Verify: health check detects Devin unavailability
+3. Verify: workflow exits 0 (green — this is correct in degraded mode, CodeQL still protects)
+4. Verify: PR comment says "Devin is currently unavailable. N alerts listed below require manual review."
+
+**Worry**: Degraded mode (Devin fully down) should NOT exit red — that would block CI for something outside the developer's control. Only partial/rate-limit failures should exit red.
+
+---
+
+### T17: Deferred Alerts Are Preserved and Picked Up (EC12)
+
+**Purpose**: Verify that when Devin is at capacity, alerts are marked as DEFERRED (not silently dropped), and a subsequent workflow run picks them up when capacity is available.
+
+**Relates to**: Edge Case 12 (Busy Devin / State Preservation / Zombie Detection)
+
+**Setup**:
+1. Occupy all 5 Devin session slots
+2. Push vulnerable code to a PR with 3 CodeQL alerts
+
+**Steps**:
+1. Workflow run A triggers, detects 3 alerts, tries to dispatch
+2. All dispatch attempts fail (429) — alerts transition to DEFERRED state
+3. Verify PR comment contains `deferred:` markers for all 3 alerts with timestamp and reason code
+4. Free up 2 Devin session slots (stop 2 existing sessions)
+5. Trigger workflow run B (via `workflow_dispatch` or new push)
+6. Run B reads deferred markers, finds 3 alerts queued for retry
+7. Run B dispatches sessions for all 3 (capacity now available)
+8. Verify deferred markers are replaced with claimed markers
+
+**Expected**:
+- Run A: Writes `<!-- deferred:ALERT_KEY=RUN_A:TIMESTAMP:429:retry_0 -->` for each alert
+- Run A: PR comment says "3 alerts deferred — Devin at capacity. Will retry on next run."
+- Run B: Reads deferred markers, dispatches sessions, transitions to CLAIMED
+- No alerts are lost between runs
+
+**Worry (state loss)**: If run A crashes after detecting alerts but before writing deferred markers, the state is lost. Mitigation: write deferred markers BEFORE attempting dispatch (optimistic deferral), then upgrade to claimed on success.
+
+**Zombie detection sub-test**:
+1. Run A claims an alert (creates session). Session ID is recorded.
+2. Wait 35 minutes (past CLAIM_TTL of 30 min) — or fake the timestamp
+3. Alert is still in CodeQL results (not fixed)
+4. No fix commits matching the rule_id exist since claim timestamp
+5. Run C triggers, detects the stale claim, marks it as ZOMBIE
+6. Run C reclaims the alert and dispatches a new session
+7. Verify: attempt count incremented, old session ID replaced
+
+**Worry (zombie vs slow fix)**: A Devin session that takes 40 minutes is legitimate, not zombie. Mitigation: check for recent fix commits before declaring zombie. If a `fix: [rule_id]` commit exists since claim, the alert is likely fixed — wait for CodeQL rescan.
+
+**Worry (EC10/EC12 collision)**: A deferred alert gets confused with a claimed alert, or vice versa. Mitigation: distinct marker prefixes (`claimed:` vs `deferred:`). Verify by checking that run B treats deferred alerts as "please retry" and claimed alerts as "hands off."
+
+---
+
+### T18: Stuck PR Recovery — Self-Scheduling Retry (EC13)
+
+**Purpose**: Verify that when our workflow fails to dispatch (rate limit, API error), the PR does not get stuck forever. The workflow should self-schedule a retry so the PR eventually gets fixed without manual intervention.
+
+**Relates to**: Edge Case 13 (Stuck PR — Failed Dispatch with No Re-Trigger)
+
+**Setup**:
+1. Occupy all 5 Devin session slots
+2. Push vulnerable code to a PR with CodeQL alerts
+
+**Steps**:
+1. CodeQL runs, detects alerts (red check)
+2. Our workflow triggers, tries to create session, gets 429
+3. Verify: workflow exits red (not green — EC11 fix prerequisite)
+4. Verify: workflow schedules a `workflow_dispatch` retry for this PR (5-10 min delay with jitter)
+5. Wait for retry to fire
+6. If still at capacity: verify retry schedules another retry (with increased backoff)
+7. Free up Devin slots before next retry
+8. Verify: retry run creates session successfully, transitions alerts from DEFERRED to CLAIMED
+9. Verify: total retries capped at MAX_RETRIES (e.g., 6)
+
+**Expected**:
+- Original run: exits red, writes deferred markers, schedules retry
+- Retry 1 (5 min later): reads deferred markers, tries dispatch, fails, schedules retry 2
+- Retry 2 (10 min later): reads deferred markers, tries dispatch, succeeds
+- PR comment updated: "Alert dispatched on retry attempt 2"
+- No manual intervention required
+
+**Worry (infinite self-scheduling)**: Without a retry cap, the workflow schedules retries forever, burning CI minutes. Mitigation: `MAX_RETRIES=6` with exponential backoff. After exhaustion, PR comment says "Automatic retry exhausted. Use `/devin retry` to trigger manually."
+
+**Worry (PR stuck forever with no retry mechanism — current state)**:
+1. Using the CURRENT workflow (no self-scheduling), push vulnerable code
+2. Ensure our workflow fails (rate limit)
+3. Do NOT push any new code to the PR
+4. Wait 30 minutes
+5. Verify: NO new workflow runs triggered. PR is stuck. CodeQL red, our workflow green (or red with EC11 fix).
+6. This confirms the stuck PR problem exists and motivates Solution 2.
+
+**`/devin retry` command sub-test (EC13 Solution 5)**:
+1. After automatic retries are exhausted (or with no self-scheduling implemented)
+2. Developer posts a comment on the PR: `/devin retry`
+3. Verify: `issue_comment` workflow detects the command and triggers `workflow_dispatch`
+4. Verify: security review workflow runs for this PR, creates session
+5. Verify: rate limit on `/devin retry` — posting it twice within 5 min should only trigger once
+
+**Worry (developer doesn't know about `/devin retry`)**: The PR comment after exhausted retries must clearly state this command as an option. Verify the comment text includes the exact command.
+
+---
+
+### T19: CodeQL Alerts Persist on Open PRs (EC13d)
+
+**Purpose**: Verify that CodeQL alerts from a PR scan remain available via the GitHub API even when our workflow failed to act on them. This confirms we CAN pick up from failed PRs, not just from main.
+
+**Relates to**: Edge Case 13d (CodeQL alerts on PR are not the same as alerts on main)
+
+**Steps**:
+1. Push vulnerable code to a PR branch
+2. Wait for CodeQL to detect alerts
+3. Verify alerts exist via API: `GET /code-scanning/alerts?ref=refs/pull/{N}/merge`
+4. Let our workflow run and FAIL to create a Devin session
+5. Wait 1 hour (simulate abandoned PR)
+6. Query the same API endpoint again
+7. Verify alerts are STILL present (they don't expire or get cleaned up)
+
+**Expected**:
+- Alerts persist as long as the PR is open and the code hasn't changed
+- Alerts are queryable by PR merge ref
+- A future workflow run can read these alerts and dispatch sessions for them
+- Alerts do NOT transfer to main's alert list until the PR is merged
+
+**Worry**: CodeQL alerts from PR scans have a TTL or get garbage-collected after the associated check run ages out. Verify they persist indefinitely on open PRs.
+
+---
+
+### T20: Cron Sweep Detects Stuck PRs (EC13 Solution 3)
+
+**Purpose**: Verify the cron-based sweep workflow can find open PRs with unresolved deferred alerts and trigger retries.
+
+**Relates to**: Edge Case 13 Solution 3 (Cron-based sweep)
+
+**Setup**:
+1. Have 2 open PRs: PR-A (has deferred alerts), PR-B (all alerts resolved)
+2. Configure sweep workflow to run on schedule
+
+**Steps**:
+1. Sweep workflow runs (manually triggered or on cron)
+2. Sweep lists all open PRs
+3. For each PR, checks for `devin-security-state` comment with `deferred:` entries
+4. Finds PR-A has deferred alerts, triggers `workflow_dispatch` for PR-A
+5. Does NOT trigger for PR-B (no deferred alerts)
+6. Verify: security review workflow runs for PR-A
+
+**Expected**:
+- Sweep correctly identifies stuck PRs by scanning comment markers
+- Only stuck PRs get retried (no unnecessary runs)
+- Sweep is idempotent: running it twice doesn't trigger duplicate dispatches (checks if a run is already in progress)
+
+**Worry**: Sweep triggers retries for PRs where the developer intentionally paused work (e.g., draft PRs). Mitigation: skip draft PRs, respect a `<!-- devin-paused -->` marker that developers can add manually.
+
+---
+
+### T21: Session Accumulation and Cleanup (EC12 Root Cause)
+
+**Purpose**: Verify that the workflow cleans up stale Devin sessions to prevent slot exhaustion, addressing the root cause of the 5-session pileup observed in production.
+
+**Relates to**: Edge Case 12 (session lifecycle is unbounded)
+
+**Setup**:
+1. Create 5 Devin sessions via previous workflow runs
+2. Let at least 3 reach "blocked" state (Devin finished work, waiting for human input)
+3. Wait 1+ hour so blocked sessions are older than SESSION_CLEANUP_AGE
+
+**Steps**:
+1. Trigger a new workflow run
+2. Pre-dispatch cleanup step runs: queries Devin API for active sessions
+3. Identifies 3 sessions in "blocked" state older than 1 hour
+4. Stops those 3 sessions (freeing 3 slots)
+5. Proceeds to dispatch new session for current PR's alerts
+
+**Expected**:
+- Pre-dispatch: 5/5 slots occupied
+- After cleanup: 2/5 slots occupied (3 stale sessions stopped)
+- New session created successfully
+- Workflow log shows: "Cleaned up 3 stale sessions (blocked > 1h)"
+
+**Worry**: Cleanup stops a session the developer is actively reviewing. Mitigation: only stop "blocked" sessions older than SESSION_CLEANUP_AGE (1 hour). Sessions in "running" state are never stopped (Devin is still working). The cleanup age is conservative enough that any legitimate review would have concluded.
+
+---
+
 ## Historical Test Runs
 
 ### Run 1 (2026-02-14 23:13 UTC) — Initial Pipeline
@@ -331,3 +579,10 @@ Before each release, verify:
 - [ ] T12: CodeQL config matches between CI and Devin prompt
 - [ ] T13: Batch processing continues past unfixable alerts
 - [ ] T14: Pre-existing alert sessions don't create infinite PRs
+- [ ] T15: Alert claiming prevents duplicate sessions (EC10)
+- [ ] T16: Session creation failure produces honest state (EC11)
+- [ ] T17: Deferred alerts are preserved and picked up (EC12)
+- [ ] T18: Stuck PR recovery via self-scheduling retry (EC13)
+- [ ] T19: CodeQL alerts persist on open PRs (EC13d)
+- [ ] T20: Cron sweep detects stuck PRs (EC13 Solution 3)
+- [ ] T21: Session accumulation and cleanup (EC12 root cause)
