@@ -1,9 +1,8 @@
-import shlex
 import sqlite3
 import subprocess
-from urllib.parse import urlparse
-
-from flask import Flask, abort, jsonify, request, redirect
+import pickle
+import base64
+from flask import Flask, request, redirect, make_response
 
 app = Flask(__name__)
 
@@ -16,28 +15,37 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
+    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
     results = cursor.fetchall()
-    return jsonify({"results": results})
+    return {"results": results}
 
 @app.route("/run")
 def run_command():
-    ALLOWED_COMMANDS = {"echo", "date", "whoami", "uname"}
     cmd = request.args.get("cmd", "echo hello")
-    args = shlex.split(cmd)
-    if not args or args[0] not in ALLOWED_COMMANDS:
-        abort(400, description="Command not allowed")
-    output = subprocess.check_output(args, shell=False)
-    return jsonify({"output": output.decode()})
+    output = subprocess.check_output(cmd, shell=True)
+    return {"output": output.decode()}
 
 @app.route("/redirect")
-def safe_redirect():
+def open_redirect():
     url = request.args.get("url", "/")
-    parsed = urlparse(url)
-    if parsed.scheme or parsed.netloc:
-        abort(400, description="External redirects are not allowed")
-    target = parsed.path.replace("\\", "") or "/"
-    return redirect("/" + target.lstrip("/"))
+    return redirect(url)
+
+@app.route("/profile")
+def profile():
+    data = request.cookies.get("session_data", "")
+    if data:
+        user = pickle.loads(base64.b64decode(data))
+        return {"username": user.get("name", "anonymous")}
+    return {"username": "anonymous"}
+
+@app.route("/page")
+def render_page():
+    title = request.args.get("title", "Home")
+    content = request.args.get("content", "")
+    html = f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    resp = make_response(html)
+    resp.headers["Content-Type"] = "text/html"
+    return resp
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=True)

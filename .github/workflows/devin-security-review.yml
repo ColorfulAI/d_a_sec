@@ -40,11 +40,21 @@ name: Devin Security Review
 on:
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose debug output in PR comment"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   security-events: write
   pull-requests: write
+
+env:
+  DEBUG: ${{ github.event.inputs.debug == 'true' || vars.DEVIN_SECURITY_DEBUG == 'true' }}
 
 jobs:
   security-review:
@@ -116,6 +126,9 @@ jobs:
           else
             echo "Health check passed — all systems operational."
           fi
+
+          # Save debug data for PR comment
+          echo "{\"gh_pat_valid\": $([ \"$HEALTHY\" = \"true\" ] && echo true || echo false), \"devin_available\": $([ \"$DEVIN_AVAILABLE\" = \"true\" ] && echo true || echo false)}" > /tmp/debug_health.json
 
       # ------------------------------------------------------------------
       # STEP 1: Detect if this run was triggered by a Devin fix commit.
@@ -486,6 +499,23 @@ jobs:
               f.write(f"pre_actionable_count={len(pre_actionable)}\n")
               f.write(f"unfixable_count={len(all_unfixable)}\n")
 
+          debug_filter = {
+              "is_devin_fix": is_devin_fix,
+              "new_total": len(new_alerts),
+              "pre_total": len(pre_alerts),
+              "new_actionable": len(new_actionable),
+              "pre_actionable": len(pre_actionable),
+              "new_skipped_unfixable": len(new_skipped),
+              "new_newly_unfixable": len(new_newly_unfixable),
+              "pre_skipped_unfixable": len(pre_skipped),
+              "pre_newly_unfixable": len(pre_newly_unfixable),
+              "total_unfixable": len(all_unfixable),
+              "attempt_history": attempts,
+              "unfixable_keys": all_unfixable,
+          }
+          with open("/tmp/debug_filter.json", "w") as f:
+              json.dump(debug_filter, f, indent=2)
+
           print(f"\nSummary:")
           print(f"  New-in-PR actionable: {len(new_actionable)}")
           print(f"  Pre-existing actionable: {len(pre_actionable)}")
@@ -816,13 +846,15 @@ jobs:
           export DEVIN_AVAILABLE="${{ steps.health-check.outputs.devin_available }}"
           export GITHUB_RUN_ID="${{ github.run_id }}"
           export GITHUB_SERVER_URL="${{ github.server_url }}"
+          export DEBUG_MODE="${{ env.DEBUG }}"
+          export IS_DEVIN_FIX="${{ steps.detect-devin.outputs.is_devin_fix }}"
 
           export NEW_SUMMARY=$(cat /tmp/new_in_pr_summary.txt 2>/dev/null || echo "None")
           export PRE_SUMMARY=$(cat /tmp/preexisting_summary.txt 2>/dev/null || echo "None")
 
           # Build the comment body using Python for cleaner string handling
           python3 << 'COMMENT_EOF'
-          import json, os
+          import json, os, datetime
 
           repo = os.environ["REPO"]
           pr_number = os.environ["PR_NUMBER"]
@@ -844,6 +876,8 @@ jobs:
           devin_available = os.environ.get("DEVIN_AVAILABLE", "true")
           server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
           run_id = os.environ.get("GITHUB_RUN_ID", "")
+          debug_mode = os.environ.get("DEBUG_MODE", "false") == "true"
+          is_devin_fix = os.environ.get("IS_DEVIN_FIX", "false")
           pr_url = f"{server_url}/{repo}/pull/{pr_number}"
 
           # Load attempt history for hidden markers
@@ -921,6 +955,70 @@ jobs:
                   key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
                   att = history["attempts"].get(key, 2)
                   lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | {att} |")
+              lines.append("")
+
+          # DEBUG section (verbose internal workflow details)
+          if debug_mode:
+              lines.append("")
+              lines.append("<details>")
+              lines.append("<summary><strong>Debug Log</strong> (workflow internals)</summary>")
+              lines.append("")
+              lines.append(f"**Timestamp**: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+              lines.append(f"**Workflow Run**: [{run_id}]({server_url}/{repo}/actions/runs/{run_id})")
+              lines.append(f"**Devin-commit detected**: `{is_devin_fix}`")
+              lines.append(f"**Devin API available**: `{devin_available}`")
+              lines.append("")
+
+              lines.append("#### Health Check")
+              try:
+                  with open("/tmp/debug_health.json") as f:
+                      hc = json.load(f)
+                  lines.append(f"- GH_PAT valid: `{hc.get('gh_pat_valid', 'unknown')}`")
+                  lines.append(f"- Devin API reachable: `{hc.get('devin_available', 'unknown')}`")
+              except Exception:
+                  lines.append("- Health check data not available")
+              lines.append("")
+
+              lines.append("#### Alert Filtering")
+              try:
+                  with open("/tmp/debug_filter.json") as f:
+                      df = json.load(f)
+                  lines.append(f"- New alerts (total/actionable): `{df.get('new_total', '?')}/{df.get('new_actionable', '?')}`")
+                  lines.append(f"- Pre-existing alerts (total/actionable): `{df.get('pre_total', '?')}/{df.get('pre_actionable', '?')}`")
+                  lines.append(f"- Newly marked unfixable: `{df.get('new_newly_unfixable', 0) + df.get('pre_newly_unfixable', 0)}`")
+                  lines.append(f"- Previously unfixable (skipped): `{df.get('new_skipped_unfixable', 0) + df.get('pre_skipped_unfixable', 0)}`")
+                  ah = df.get("attempt_history", {})
+                  if ah:
+                      lines.append("")
+                      lines.append("#### Attempt History")
+                      lines.append("| Alert Key | Attempts | Status |")
+                      lines.append("|-----------|----------|--------|")
+                      uf_keys = set(df.get("unfixable_keys", []))
+                      for k, v in ah.items():
+                          status = "unfixable" if k in uf_keys else ("retry pending" if v < 2 else "max reached")
+                          lines.append(f"| `{k}` | {v}/2 | {status} |")
+              except Exception:
+                  lines.append("- Filter data not available")
+              lines.append("")
+
+              lines.append("#### Devin Sessions")
+              if new_session_created == "true" and new_session_url:
+                  lines.append(f"- New-in-PR session: [{new_session_url}]({new_session_url})")
+              elif devin_available == "true" and new_actionable != "0":
+                  lines.append("- New-in-PR session: **failed to create** (check workflow logs)")
+              else:
+                  lines.append(f"- New-in-PR session: not needed (actionable={new_actionable}, devin_available={devin_available})")
+
+              if pre_sessions_created == "true" and pre_first_url:
+                  lines.append(f"- Pre-existing sessions: {pre_session_count} created, first: [{pre_first_url}]({pre_first_url})")
+              else:
+                  lines.append(f"- Pre-existing sessions: not needed (actionable={pre_actionable})")
+
+              lines.append("")
+              lines.append(f"#### Comment Update")
+              lines.append(f"- Method: `{'PATCH (update existing #' + existing_comment_id + ')' if existing_comment_id else 'POST (new comment)'}`")
+              lines.append("")
+              lines.append("</details>")
               lines.append("")
 
           # Footer
