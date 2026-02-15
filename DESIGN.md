@@ -1192,7 +1192,7 @@ The most critical fix: if our workflow fails to create a session, exit 1 (red ch
 - Developer knows something is wrong and can take action (re-run, investigate, fix manually)
 - This doesn't solve the "no automatic retry" problem, but at least it doesn't LIE about the state
 
-**Solution 2: Self-scheduling retry via `workflow_dispatch`**
+**Solution 2: Self-scheduling retry via `workflow_dispatch`** (REJECTED — see design considerations)
 
 When the workflow detects a dispatch failure, it schedules a retry by triggering itself:
 
@@ -1207,49 +1207,107 @@ When the workflow detects a dispatch failure, it schedules a retry by triggering
       -d '{"ref": "${{ github.ref }}", "inputs": {"pr_number": "${{ env.PR_NUMBER }}", "retry": "true"}}'
 ```
 
-The workflow already supports `workflow_dispatch` with a `pr_number` input. This creates a self-healing loop:
-- Dispatch fails → workflow schedules a retry in 5-10 min
-- Retry runs → if Devin has capacity, dispatches session → done
-- Retry fails again → schedules another retry (with backoff)
-- Max retries cap prevents infinite self-scheduling (e.g., 6 retries = 30 min window)
-
 **Pros**: Fully automatic, no cron needed, PR-specific.
-**Cons**: Requires PAT with `workflow` scope (already have it). Could create runaway retries without a cap.
 
-**Solution 3: Cron-based sweep of open PRs with unresolved alerts**
+**Why this was rejected for production**:
 
-Add a scheduled workflow that runs every 15-30 minutes:
+Self-scheduling retry is dangerous at scale. If Devin is down for 2 hours across 50 repos, that's hundreds of queued `workflow_dispatch` retries piling up — each PR scheduling its own chain of retries independently. When Devin comes back online, they all fire at once (thundering herd), immediately overwhelming Devin again and creating another cascade of retries. Additionally, each retry is a visible workflow run cluttering the Actions tab. For an enterprise with hundreds of repos and strict CI hygiene, this is unacceptable noise.
+
+Specific failure modes:
+- **Retry storm**: 50 repos × 6 retries each = 300 queued workflow runs during a 2-hour Devin outage
+- **Thundering herd on recovery**: All 300 retries fire within minutes of Devin becoming available → immediate 429 again → another 300 retries
+- **Actions tab pollution**: Each retry appears as a separate workflow run, making it hard to find real CI runs
+- **Cost**: Each retry consumes GitHub Actions minutes even if it does nothing useful
+- **No global coordination**: Each repo retries independently, no awareness of global Devin capacity
+
+This approach is acceptable for a single-repo hobby project but is NOT enterprise-grade. The cron sweep (Solution 3) is strictly better because it provides centralized, rate-limited, coordinated retries.
+
+**Solution 3: Cron-based sweep of open PRs with unresolved alerts** (RECOMMENDED — primary retry mechanism)
+
+A single centralized scheduled workflow that scans all open PRs and retries failed dispatches. This is the enterprise-grade solution because:
+- **One workflow controls all retries** — no per-PR accumulation
+- **Naturally rate-limited** — runs at most once per interval (e.g., every 15 min)
+- **Global Devin capacity awareness** — can check session budget ONCE before dispatching any retries
+- **No thundering herd** — dispatches PRs sequentially with small delays between each
+- **Clean Actions tab** — one sweep run per interval, not hundreds of retries
 
 ```yaml
+name: "Devin Security Sweep"
 on:
   schedule:
     - cron: '*/15 * * * *'  # every 15 min
+  workflow_dispatch: {}       # manual trigger for testing
 
 jobs:
   sweep:
     runs-on: ubuntu-latest
     steps:
-      - name: Find stuck PRs
+      - name: Check Devin capacity first
+        id: capacity
         run: |
+          # Check how many session slots are available BEFORE scanning PRs
+          ACTIVE=$(curl -s -H "Authorization: Bearer ${{ secrets.DEVIN_API_KEY }}" \
+            "https://api.devin.ai/v1/sessions?status=running&limit=1" \
+            | jq '.pagination.total_count // 0')
+          LIMIT=5  # from plan tier — make configurable
+          AVAILABLE=$((LIMIT - ACTIVE))
+          echo "available=$AVAILABLE" >> "$GITHUB_OUTPUT"
+          if [ "$AVAILABLE" -le 0 ]; then
+            echo "No Devin capacity — skipping sweep"
+            exit 0
+          fi
+
+      - name: Find and retry stuck PRs
+        if: steps.capacity.outputs.available > 0
+        run: |
+          DISPATCHED=0
+          MAX_DISPATCH=${{ steps.capacity.outputs.available }}
+          
           # List open PRs
-          PRS=$(curl -s -H "Authorization: token $GH_PAT" \
-            "https://api.github.com/repos/$REPO/pulls?state=open" | jq '.[].number')
+          PRS=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open" \
+            | jq -r '.[].number')
           
           for PR in $PRS; do
-            # Check if PR has our comment with deferred/failed state
-            COMMENT=$(curl -s -H "Authorization: token $GH_PAT" \
-              "https://api.github.com/repos/$REPO/issues/$PR/comments" \
-              | jq -r '.[] | select(.body | contains("devin-security-state")) | .body')
+            [ "$DISPATCHED" -ge "$MAX_DISPATCH" ] && break
             
-            if echo "$COMMENT" | grep -q "deferred:"; then
-              # Found a stuck PR — trigger workflow_dispatch for it
-              curl -X POST "...dispatches" -d '{"inputs": {"pr_number": "'$PR'"}}'
+            # Check for deferred/failed state in our comment
+            HAS_DEFERRED=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$PR/comments?per_page=100" \
+              | jq -r '[.[] | select(.body | contains("devin-security-state"))] | 
+                       first | .body // ""' \
+              | grep -c "deferred:" || true)
+            
+            if [ "$HAS_DEFERRED" -gt 0 ]; then
+              echo "Found stuck PR #$PR with $HAS_DEFERRED deferred alerts — triggering retry"
+              curl -s -X POST \
+                -H "Authorization: token ${{ secrets.GH_PAT }}" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/devin-security-review.yml/dispatches" \
+                -d "{\"ref\": \"main\", \"inputs\": {\"pr_number\": \"$PR\", \"retry\": \"true\"}}"
+              DISPATCHED=$((DISPATCHED + 1))
+              sleep 10  # small delay between dispatches to avoid rate limiting
             fi
           done
+          
+          echo "Sweep complete: dispatched $DISPATCHED retries (capacity: $MAX_DISPATCH)"
 ```
 
-**Pros**: Catches ALL stuck PRs, not just the current one. Works even if the original workflow never ran (e.g., Devin was down during the original CodeQL run).
-**Cons**: Another workflow to maintain. Runs even when not needed (wasted minutes). May re-dispatch for PRs that are intentionally paused.
+**Key design properties**:
+- **Capacity-first**: Checks Devin session budget before scanning ANY PRs. If Devin is still down, the sweep exits immediately (costs <1 sec of Actions time).
+- **Budget-aware dispatching**: Only dispatches as many retries as Devin has capacity for. If 2 slots are free and 5 PRs are stuck, it retries the 2 oldest first.
+- **Sequential with delay**: 10-second gap between dispatches prevents rate limiting.
+- **No accumulation during outages**: If Devin is down, the sweep simply exits. No retries pile up. When Devin comes back, the NEXT scheduled sweep (15 min later) picks up the work cleanly.
+- **Idempotent**: Re-running the sweep when no PRs are stuck is a no-op (fast exit).
+
+**Sweep interval considerations**:
+
+| Interval | Pros | Cons |
+|----------|------|------|
+| 5 min | Fast recovery | Wastes Actions minutes on quiet repos |
+| 15 min | Good balance | 15 min max wait for stuck PRs |
+| 30 min | Minimal cost | 30 min max wait — may frustrate developers |
+
+**Recommendation**: 15 minutes. Fast enough that developers don't notice the delay, slow enough that it doesn't waste CI resources on quiet repos. Configurable via cron expression.
 
 **Solution 4: GitHub Check Run annotation as trigger**
 
@@ -1260,7 +1318,7 @@ Additionally, the check annotation can include a message: "Devin session could n
 **Pros**: Developer-initiated, visible, no automation overhead.
 **Cons**: Requires manual action. Developer must know to look for the re-run button.
 
-**Solution 5: Comment-based retry trigger (most creative)**
+**Solution 5: Comment-based retry trigger** (DEMOTED — power-user escape hatch only)
 
 Add a `/devin retry` command in PR comments. A separate lightweight workflow watches for this comment pattern and triggers the security review workflow:
 
@@ -1279,43 +1337,112 @@ jobs:
           curl -X POST "...dispatches" -d '{"inputs": {"pr_number": "'$PR'"}}'
 ```
 
-**Pros**: Developer can retry at will. No cron. Visible in PR conversation. Team members can trigger it.
-**Cons**: Another workflow. Developer must know the command exists. Susceptible to abuse (rate limit: max 1 trigger per 5 min via marker check).
+**Why this was demoted from primary to escape hatch**:
 
-**Recommended implementation order**:
+Asking enterprise customers to type magic incantations in PR comments is a developer tool, not a product. Enterprise buyers want invisible reliability, not escape hatches they need to learn about and remember. A CISO evaluating our tool would see `/devin retry` and think "this thing breaks and I have to manually fix it?" — that's a trust killer.
 
-| Priority | Solution | Why |
-|----------|----------|-----|
-| P0 | Solution 1 (honest exit code) | Zero-cost fix. Stop lying about state. |
-| P1 | Solution 2 (self-scheduling retry) | Automatic, PR-specific, self-healing. Solves the stuck PR problem entirely. |
-| P2 | Solution 5 (`/devin retry` command) | Great DX. Developer has escape hatch. Low maintenance. |
-| P3 | Solution 3 (cron sweep) | Catches edge cases that Solutions 1-2 miss (e.g., workflow never ran at all). |
-| P4 | Solution 4 (Check Run re-run) | Nice to have but GitHub already has workflow re-run button. |
+The `/devin retry` command should exist but only as a hidden power-user feature for edge cases where:
+- The cron sweep is disabled (customer chose not to install it)
+- Someone needs an immediate retry and can't wait 15 minutes
+- Debugging/testing during setup
 
-**The complete "stuck PR" recovery path** (with all solutions implemented):
+It should NOT be the primary or recommended recovery path. The primary path must be fully automatic (cron sweep).
+
+**How to communicate failures professionally (enterprise-grade UX)**:
+
+The developer should never need to take manual action for our failures. The PR comment on dispatch failure should read:
+
+> **Devin Security Review** — Temporarily Delayed
+>
+> Devin detected {N} security alerts on this PR but is currently at capacity.
+> Automatic retry is scheduled — fixes will begin within 15 minutes.
+>
+> CodeQL is still protecting this PR from merging with unresolved vulnerabilities.
+>
+> | Alert | Severity | Status |
+> |-------|----------|--------|
+> | py/sql-injection at app/server.py:18 | high | Queued for retry |
+> | py/xss at app/server.py:46 | medium | Queued for retry |
+
+Key messaging principles:
+- **"Temporarily Delayed"** not "FAILED" — implies the system will self-heal
+- **"Automatic retry is scheduled"** — developer knows it will be handled without their action
+- **"within 15 minutes"** — sets a concrete expectation
+- **"CodeQL is still protecting"** — reassures that safety is not compromised
+- No mention of `/devin retry` or any manual action — the developer's job is to write code, not babysit our tool
+
+If the cron sweep retries successfully, the comment updates seamlessly:
+
+> **Devin Security Review** — Fixing in Progress
+>
+> Devin is now working on {N} security alerts. Each fix will appear as a separate commit.
+
+The developer sees "Delayed" → "Fixing in Progress" → "All Resolved" without ever needing to intervene. That's the enterprise experience.
+
+**Escalation path (when automatic retry also fails)**:
+
+If the cron sweep retries 4 times (1 hour) and still can't dispatch:
+
+> **Devin Security Review** — Requires Attention
+>
+> Devin has been unable to create fix sessions for 1+ hour (capacity limit).
+> {N} security alerts remain unresolved on this PR.
+>
+> **For the security team**: Check Devin dashboard for session capacity.
+> **For this developer**: You may fix these manually or wait for capacity to free up.
+
+At this stage, escalation goes to the **security team** (via Slack webhook, email, or GitHub team mention), not to the individual developer. The developer is informed but not asked to debug our infrastructure.
+
+**Recommended implementation order (revised)**:
+
+| Priority | Solution | Role | Why |
+|----------|----------|------|-----|
+| P0 | Solution 1 (honest exit code) | Foundation | Stop lying about state. Prerequisite for everything else. |
+| P1 | Solution 3 (cron sweep) | Primary retry | Centralized, rate-limited, no accumulation, enterprise-grade. |
+| P2 | Professional PR comment UX | Developer experience | "Temporarily Delayed" → "Fixing" → "Resolved" lifecycle. |
+| P3 | Escalation webhook (Slack/email) | Security team notification | Alert security team after 1 hour of failed retries. |
+| P4 | Solution 5 (`/devin retry`) | Hidden power-user escape hatch | For debugging/testing only. Not documented in user-facing materials. |
+| REJECTED | Solution 2 (self-scheduling retry) | — | Thundering herd risk, Actions tab pollution, no global coordination. |
+
+**The complete "stuck PR" recovery path** (enterprise-grade):
 
 ```
 1. Developer pushes vulnerable code
 2. CodeQL detects alerts (red check)
-3. Our workflow runs, hits rate limit → exits RED (Solution 1)
-4. Workflow self-schedules a retry in 5-10 min (Solution 2)
-5. Retry #1 runs → still at capacity → schedules retry #2
-6. Retry #2 runs → Devin has capacity → session created → alert claimed
-7. Devin fixes the issue → pushes commit → CodeQL re-runs → alerts resolved
-8. If all retries exhausted: PR comment says "Automatic retry exhausted. 
-   Use /devin retry to trigger manually or fix the issues by hand."
-   (Solution 5 provides the escape hatch)
-9. If developer does nothing for 30+ min: cron sweep detects stuck PR,
-   triggers retry (Solution 3)
+3. Our workflow runs, hits rate limit
+4. Workflow exits RED (Solution 1 — honest exit code)
+5. PR comment: "Temporarily Delayed — automatic retry within 15 minutes"
+6. Deferred markers written to PR comment state block
+7. — Developer does nothing. Continues working on other things. —
+8. 15 min later: Cron sweep runs, finds this PR has deferred alerts
+9. Sweep checks Devin capacity: slots available
+10. Sweep triggers workflow_dispatch for this PR
+11. Workflow runs, creates session, transitions alerts DEFERRED → CLAIMED
+12. PR comment updates: "Fixing in Progress"
+13. Devin fixes issues, pushes commits
+14. CodeQL re-runs, alerts resolved
+15. PR comment updates: "All Resolved"
+16. Developer sees green checks, merges PR
+```
+
+If Devin is still down at step 9:
+```
+9b. Sweep finds no capacity → exits (no retries dispatched)
+10b. 15 min later: another sweep runs → same result
+...
+After 1 hour (4 failed sweeps):
+11b. PR comment escalates: "Requires Attention — Devin unavailable for 1+ hour"
+12b. Slack/email notification sent to security team
+13b. Security team investigates Devin capacity / contacts Devin support
 ```
 
 **What needs to happen for the issue on this PR to be fixed without manual nudging** (answering the user's direct question):
 
-With current implementation: **Nothing will happen automatically.** The PR is stuck. Someone must either push new code (accidental retry) or manually re-run the workflow.
+With current implementation: **Nothing will happen automatically.** The PR is stuck.
 
-With proposed solutions: **Solution 2 (self-scheduling retry) fixes this entirely.** The workflow detects its own failure and schedules a retry. The retry runs in 5-10 minutes. If Devin is still busy, it retries again with backoff. After 6 retries (30 min), it gives up and the PR comment clearly states what happened and how to retry.
+With proposed solutions: **The cron sweep (Solution 3) fixes this entirely.** Every 15 minutes, a centralized sweep checks for stuck PRs and retries them. The developer sees "Temporarily Delayed" and then "Fixing in Progress" without ever needing to intervene. If Devin is down for extended periods, the security team is notified via escalation webhook — still no developer action required.
 
-**Implementation status**: DESIGNED, not yet implemented. P0 (honest exit code from EC11) is a prerequisite. P1 (self-scheduling retry) is the key fix for this edge case.
+**Implementation status**: DESIGNED, not yet implemented. Implementation order: P0 (honest exit code) → P1 (cron sweep) → P2 (professional comment UX) → P3 (escalation webhook).
 
 ---
 
