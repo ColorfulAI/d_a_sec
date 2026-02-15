@@ -542,6 +542,51 @@ PR #3 has pre-existing alerts
 
 **Residual risk**: Devin may ignore the "do not create a PR" instruction, as AI agents don't always follow negative constraints perfectly. Monitoring is recommended for the first few production runs. A future improvement could add a branch name pattern filter to the workflow trigger (e.g., skip runs on branches matching `devin/security-fixes-*`).
 
+### Edge Case 8: Devin API Downtime — Graceful Degradation
+
+**Problem**: If the Devin API is unreachable (outage, invalid key, rate limits), the workflow must not silently fail, and critically, must not block code from being pushed to main. Companies relying on this tool should never have their development pipeline blocked by an external AI service being down.
+
+**Design principle**: **CodeQL is the gate, our workflow is the fixer.**
+
+| Layer | Role | Blocks PR? | If down? |
+|-------|------|-----------|----------|
+| **CodeQL** | The gate — detects vulnerabilities, blocks merging | **Yes** (required status check) | PR can't be analyzed — branch protection requires it |
+| **Devin Security Review** | The fixer — auto-fixes what CodeQL finds | **No** (advisory only) | Alerts still reported, developer fixes manually |
+
+**Can we rely on CodeQL to block PRs with unfixed vulnerabilities?** Yes — CodeQL's "code scanning" creates check runs that can be configured as **required status checks** on the branch protection rule for `main`. If CodeQL finds alerts matching a severity threshold (configurable), it marks the check as failed, which blocks the PR from merging. This is GitHub's built-in mechanism and is the industry-standard trust model.
+
+**Trust inheritance**: Our workflow inherits its security guarantee from CodeQL. We never need to block a PR ourselves because CodeQL already does. This means our workflow is purely additive — it can only help (auto-fix), never hurt (block). The worst case when Devin is down is that the developer has to fix manually, which is exactly where they'd be without our tool.
+
+**Implementation — Health Check + Graceful Degradation**:
+
+1. **Step 0 (Health Check)**: At workflow start, before any processing:
+   - Validate `GH_PAT` is set and can reach GitHub API (HTTP 200)
+   - Validate `DEVIN_API_KEY` is set and Devin API is reachable
+   - If GH_PAT fails: workflow exits with error (can't do anything without GitHub access)
+   - If Devin API fails: set `devin_available=false`, continue in degraded mode
+
+2. **Degraded mode behavior**:
+   - Alert detection and classification: **still runs** (uses GitHub API only)
+   - Attempt tracking and history: **still runs** (uses GitHub API only)
+   - Devin session creation: **skipped** (conditional on `devin_available=true`)
+   - PR comment posting: **still runs** with degraded mode banner:
+     > **DEGRADED MODE** — Devin API is currently unavailable. Alerts are listed below but cannot be auto-fixed.
+     > **Your code is still protected.** CodeQL's required status check blocks merging of PRs with unresolved security alerts.
+
+3. **Recovery**: When Devin comes back online, the next PR push triggers the workflow again. The attempt tracker picks up where it left off — no duplicate sessions, no lost state.
+
+**Key guarantee**: The workflow **never blocks the PR**. It exits with success in both normal and degraded modes. Only CodeQL (as a required status check) can block merging.
+
+**Failure modes**:
+
+| Scenario | What happens | Developer impact |
+|----------|-------------|------------------|
+| Devin API down | Degraded mode: alerts reported, no auto-fix | Must fix manually; CodeQL still blocks vulnerable merges |
+| Devin API slow (429) | Exponential backoff, retry once | Delayed fix, but still works |
+| GitHub API down | Workflow can't run at all | No alerts, no fixes — but also no merges (GitHub is down) |
+| Invalid DEVIN_API_KEY | Degraded mode (same as down) | Reconfigure secret, re-run |
+| Both APIs healthy | Full automation | Review Devin's fix commits |
+
 ---
 
 ## Secrets and Authentication
@@ -580,6 +625,7 @@ PR #3 has pre-existing alerts
 | Unfixable alerts silently ignored | SOLVED | Prominent "REQUIRES MANUAL REVIEW" section + `devin:manual-review-needed` label |
 | Merge commits cluttering history | SOLVED | `git pull --rebase` instruction in Devin prompt |
 | Infinite PR creation from pre-existing alerts | MITIGATED | Deterministic branch names + explicit "do not create PR" prompt + idempotent sessions + attempt tracking |
+| Devin API downtime blocking development | SOLVED | Health check + graceful degradation: workflow enters degraded mode, still reports alerts, CodeQL blocks merges independently |
 
 ### Planned Improvements
 
