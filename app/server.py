@@ -1,4 +1,5 @@
 import sqlite3
+import shlex
 import subprocess
 import pickle
 import base64
@@ -22,7 +23,7 @@ def search():
 @app.route("/run")
 def run_command():
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
+    output = subprocess.check_output(shlex.split(cmd))
     return {"output": output.decode()}
 
 @app.route("/redirect")
