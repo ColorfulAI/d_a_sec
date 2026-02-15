@@ -1,8 +1,10 @@
 import sqlite3
+import shlex
 import subprocess
-import pickle
+import json
 import base64
 from flask import Flask, request, redirect, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -19,11 +21,16 @@ def search():
     results = cursor.fetchall()
     return jsonify({"results": results})
 
+ALLOWED_COMMANDS = {"echo", "date", "whoami", "uname", "hostname"}
+
 @app.route("/run")
 def run_command():
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return {"output": output.decode()}
+    args = shlex.split(cmd)
+    if not args or args[0] not in ALLOWED_COMMANDS:
+        return jsonify({"error": "command not allowed"}), 403
+    output = subprocess.check_output(args, shell=False)
+    return jsonify({"output": output.decode()})
 
 @app.route("/redirect")
 def open_redirect():
