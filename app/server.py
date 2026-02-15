@@ -21,8 +21,17 @@ def search():
 
 @app.route("/run")
 def run_command():
+    ALLOWED_COMMANDS = {
+        "echo hello": ["echo", "hello"],
+        "ls": ["ls"],
+        "whoami": ["whoami"],
+        "date": ["date"],
+    }
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return {"error": "command not allowed"}, 403
+    safe_cmd = ALLOWED_COMMANDS[cmd]
+    output = subprocess.check_output(safe_cmd)
     return {"output": output.decode()}
 
 @app.route("/redirect")
