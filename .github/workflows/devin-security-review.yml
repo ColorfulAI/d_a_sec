@@ -296,13 +296,30 @@ jobs:
 
           echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
 
-          PR_ALERTS=$(curl -s -L \
-            -H "Authorization: token $GH_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=$PR_REF&state=open&per_page=100")
+          # Fetch ALL alerts with pagination (enterprise repos can have >100 alerts)
+          PAGE=1
+          echo '[]' > /tmp/pr_alerts_paginated.json
+          while true; do
+            RESP=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=$PR_REF&state=open&per_page=100&page=$PAGE")
+            PAGE_COUNT=$(echo "$RESP" | jq 'if type == "array" then length else 0 end')
+            if [ "$PAGE_COUNT" -eq 0 ] || [ "$PAGE_COUNT" = "null" ]; then
+              break
+            fi
+            echo "$RESP" > /tmp/pr_alerts_page.json
+            jq -s '.[0] + .[1]' /tmp/pr_alerts_paginated.json /tmp/pr_alerts_page.json > /tmp/pr_alerts_merged.json
+            mv /tmp/pr_alerts_merged.json /tmp/pr_alerts_paginated.json
+            if [ "$PAGE_COUNT" -lt 100 ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          PR_ALERTS=$(cat /tmp/pr_alerts_paginated.json)
 
           PR_ALERT_COUNT=$(echo "$PR_ALERTS" | jq 'if type == "array" then length else 0 end')
-          echo "Found $PR_ALERT_COUNT alert(s) on PR merge ref"
+          echo "Found $PR_ALERT_COUNT alert(s) on PR merge ref (across $PAGE page(s))"
 
           if [ "$PR_ALERT_COUNT" -eq 0 ] || [ "$PR_ALERT_COUNT" = "null" ]; then
             echo "No alerts found."
@@ -313,13 +330,29 @@ jobs:
           fi
 
           echo "Fetching alerts on main branch for comparison..."
-          MAIN_ALERTS=$(curl -s -L \
-            -H "Authorization: token $GH_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100")
+          PAGE=1
+          echo '[]' > /tmp/main_alerts_paginated.json
+          while true; do
+            RESP=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100&page=$PAGE")
+            PAGE_COUNT=$(echo "$RESP" | jq 'if type == "array" then length else 0 end')
+            if [ "$PAGE_COUNT" -eq 0 ] || [ "$PAGE_COUNT" = "null" ]; then
+              break
+            fi
+            echo "$RESP" > /tmp/main_alerts_page.json
+            jq -s '.[0] + .[1]' /tmp/main_alerts_paginated.json /tmp/main_alerts_page.json > /tmp/main_alerts_merged.json
+            mv /tmp/main_alerts_merged.json /tmp/main_alerts_paginated.json
+            if [ "$PAGE_COUNT" -lt 100 ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          MAIN_ALERTS=$(cat /tmp/main_alerts_paginated.json)
 
           MAIN_ALERT_COUNT=$(echo "$MAIN_ALERTS" | jq 'if type == "array" then length else 0 end')
-          echo "Found $MAIN_ALERT_COUNT alert(s) on main"
+          echo "Found $MAIN_ALERT_COUNT alert(s) on main (across $PAGE page(s))"
 
           echo "$PR_ALERTS" > /tmp/pr_alerts_raw.json
           echo "$MAIN_ALERTS" > /tmp/main_alerts_raw.json
@@ -434,12 +467,27 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="$PR_NUMBER"
 
-          # Fetch comments and write to temp file (avoids shell string corruption)
-          curl -s -L \
-            -H "Authorization: token $GH_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-            > /tmp/pr_comments.json
+          # Fetch ALL comments with pagination (enterprise PRs can have >100 comments)
+          PAGE=1
+          echo '[]' > /tmp/pr_comments.json
+          while true; do
+            curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100&page=$PAGE" \
+              > /tmp/pr_comments_page.json
+            PAGE_COUNT=$(jq 'if type == "array" then length else 0 end' /tmp/pr_comments_page.json)
+            if [ "$PAGE_COUNT" -eq 0 ]; then
+              break
+            fi
+            jq -s '.[0] + .[1]' /tmp/pr_comments.json /tmp/pr_comments_page.json > /tmp/pr_comments_merged.json
+            mv /tmp/pr_comments_merged.json /tmp/pr_comments.json
+            if [ "$PAGE_COUNT" -lt 100 ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+          echo "Fetched $(jq length /tmp/pr_comments.json) total comments (across $PAGE page(s))"
 
           # Parse from file — safe regardless of comment content
           python3 << 'HISTORY_EOF'
@@ -1301,12 +1349,26 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="$PR_NUMBER"
 
-          # Find existing comment (write to file to avoid shell string corruption)
-          curl -s -L \
-            -H "Authorization: token $GH_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-            > /tmp/pr_comments_resolve.json
+          # Find existing comment with pagination (enterprise PRs can have >100 comments)
+          PAGE=1
+          echo '[]' > /tmp/pr_comments_resolve.json
+          while true; do
+            curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100&page=$PAGE" \
+              > /tmp/pr_comments_resolve_page.json
+            PAGE_COUNT=$(jq 'if type == "array" then length else 0 end' /tmp/pr_comments_resolve_page.json)
+            if [ "$PAGE_COUNT" -eq 0 ]; then
+              break
+            fi
+            jq -s '.[0] + .[1]' /tmp/pr_comments_resolve.json /tmp/pr_comments_resolve_page.json > /tmp/pr_comments_resolve_merged.json
+            mv /tmp/pr_comments_resolve_merged.json /tmp/pr_comments_resolve.json
+            if [ "$PAGE_COUNT" -lt 100 ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
 
           COMMENT_ID=$(jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))] | last | .id // empty' /tmp/pr_comments_resolve.json)
 
