@@ -55,6 +55,69 @@ jobs:
           fetch-depth: 2
 
       # ------------------------------------------------------------------
+      # STEP 0: Health check — validate secrets and API availability.
+      # If Devin API is unreachable, we enter "graceful degradation" mode:
+      # the workflow still posts alert summaries on the PR, but skips
+      # session creation. CodeQL's required status check still blocks
+      # merging of vulnerable code — our workflow is advisory, not a gate.
+      # ------------------------------------------------------------------
+      - name: Health check (validate secrets and Devin API)
+        id: health-check
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          HEALTHY=true
+          DEVIN_AVAILABLE=true
+
+          # Check GH_PAT
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is not set. The workflow cannot access the GitHub API."
+            HEALTHY=false
+          else
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/${{ github.repository }}")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::error::GH_PAT returned HTTP $HTTP_CODE — token may be expired or lack required scopes (repo, security_events)."
+              HEALTHY=false
+            else
+              echo "GH_PAT: valid (HTTP 200)"
+            fi
+          fi
+
+          # Check DEVIN_API_KEY
+          if [ -z "$DEVIN_API_KEY" ]; then
+            echo "::warning::DEVIN_API_KEY secret is not set. Entering degraded mode — alerts will be reported but not auto-fixed."
+            DEVIN_AVAILABLE=false
+          else
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X GET "https://api.devin.ai/v1/sessions" \
+              -H "Authorization: Bearer $DEVIN_API_KEY")
+            if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+              echo "::warning::DEVIN_API_KEY returned HTTP $HTTP_CODE — key may be invalid. Entering degraded mode."
+              DEVIN_AVAILABLE=false
+            elif [ "$HTTP_CODE" = "000" ]; then
+              echo "::warning::Devin API is unreachable (connection failed). Entering degraded mode."
+              DEVIN_AVAILABLE=false
+            else
+              echo "Devin API: reachable (HTTP $HTTP_CODE)"
+            fi
+          fi
+
+          if [ "$HEALTHY" = "false" ]; then
+            echo "::error::Health check failed — critical secrets are missing or invalid."
+            exit 1
+          fi
+
+          echo "devin_available=$DEVIN_AVAILABLE" >> $GITHUB_OUTPUT
+          if [ "$DEVIN_AVAILABLE" = "false" ]; then
+            echo "::warning::Running in DEGRADED MODE — Devin API unavailable. Alerts will be reported but auto-fix is disabled. CodeQL still blocks merging of vulnerable code."
+          else
+            echo "Health check passed — all systems operational."
+          fi
+
+      # ------------------------------------------------------------------
       # STEP 1: Detect if this run was triggered by a Devin fix commit.
       # If so, we set a flag to apply stricter alert filtering downstream.
       # This prevents the infinite loop: Devin push -> workflow run ->
@@ -440,7 +503,7 @@ jobs:
       # - max_acu_limit to cap resource usage
       # ------------------------------------------------------------------
       - name: Create Devin session for new-in-PR alerts
-        if: steps.filter-alerts.outputs.new_actionable_count != '0'
+        if: steps.filter-alerts.outputs.new_actionable_count != '0' && steps.health-check.outputs.devin_available == 'true'
         id: devin-new-pr
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
@@ -549,7 +612,7 @@ jobs:
       # prevents duplicate sessions for the same prompt.
       # ------------------------------------------------------------------
       - name: Create Devin sessions for pre-existing alerts (batched)
-        if: steps.filter-alerts.outputs.pre_actionable_count != '0'
+        if: steps.filter-alerts.outputs.pre_actionable_count != '0' && steps.health-check.outputs.devin_available == 'true'
         id: devin-preexisting
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
@@ -735,24 +798,27 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
-          NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
-          PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
-          NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
-          PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
-          UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
-          NEW_SESSION_URL="${{ steps.devin-new-pr.outputs.session_url }}"
-          NEW_SESSION_CREATED="${{ steps.devin-new-pr.outputs.session_created }}"
-          PRE_SESSIONS_CREATED="${{ steps.devin-preexisting.outputs.sessions_created }}"
-          PRE_FIRST_URL="${{ steps.devin-preexisting.outputs.first_session_url }}"
-          PRE_SESSION_COUNT="${{ steps.devin-preexisting.outputs.session_count }}"
-          FIX_BRANCH="${{ steps.devin-preexisting.outputs.fix_branch }}"
-          EXISTING_COMMENT_ID="${{ steps.load-history.outputs.comment_id }}"
+          export REPO="${{ github.repository }}"
+          export PR_NUMBER="${{ github.event.pull_request.number }}"
+          export TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
+          export NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
+          export PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
+          export NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
+          export PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
+          export UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
+          export NEW_SESSION_URL="${{ steps.devin-new-pr.outputs.session_url }}"
+          export NEW_SESSION_CREATED="${{ steps.devin-new-pr.outputs.session_created }}"
+          export PRE_SESSIONS_CREATED="${{ steps.devin-preexisting.outputs.sessions_created }}"
+          export PRE_FIRST_URL="${{ steps.devin-preexisting.outputs.first_session_url }}"
+          export PRE_SESSION_COUNT="${{ steps.devin-preexisting.outputs.session_count }}"
+          export FIX_BRANCH="${{ steps.devin-preexisting.outputs.fix_branch }}"
+          export EXISTING_COMMENT_ID="${{ steps.load-history.outputs.comment_id }}"
+          export DEVIN_AVAILABLE="${{ steps.health-check.outputs.devin_available }}"
+          export GITHUB_RUN_ID="${{ github.run_id }}"
+          export GITHUB_SERVER_URL="${{ github.server_url }}"
 
-          NEW_SUMMARY=$(cat /tmp/new_in_pr_summary.txt 2>/dev/null || echo "None")
-          PRE_SUMMARY=$(cat /tmp/preexisting_summary.txt 2>/dev/null || echo "None")
+          export NEW_SUMMARY=$(cat /tmp/new_in_pr_summary.txt 2>/dev/null || echo "None")
+          export PRE_SUMMARY=$(cat /tmp/preexisting_summary.txt 2>/dev/null || echo "None")
 
           # Build the comment body using Python for cleaner string handling
           python3 << 'COMMENT_EOF'
@@ -775,7 +841,8 @@ jobs:
           existing_comment_id = os.environ.get("EXISTING_COMMENT_ID", "")
           new_summary = os.environ.get("NEW_SUMMARY", "None")
           pre_summary = os.environ.get("PRE_SUMMARY", "None")
-          server_url = "https://github.com"
+          devin_available = os.environ.get("DEVIN_AVAILABLE", "true")
+          server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
           run_id = os.environ.get("GITHUB_RUN_ID", "")
           pr_url = f"{server_url}/{repo}/pull/{pr_number}"
 
@@ -799,10 +866,15 @@ jobs:
           lines.append("## Devin Security Review\n")
           lines.append(f"**Total CodeQL Alerts: {total}**\n")
 
+          # Degraded mode banner (Devin API unavailable)
+          if devin_available != "true":
+              lines.append("> **DEGRADED MODE** — Devin API is currently unavailable. Alerts are listed below but cannot be auto-fixed.\n")
+              lines.append("> **Your code is still protected.** CodeQL's required status check blocks merging of PRs with unresolved security alerts. Fix these issues manually or wait for Devin to come back online and re-run this workflow.\n")
+
           # Status signal (safe-to-merge vs needs manual review)
           if int(unfixable_count) > 0:
               lines.append(f"> **REQUIRES MANUAL REVIEW** — {unfixable_count} alert(s) could not be auto-fixed after multiple attempts. See details below.\n")
-          elif new_actionable == "0" and pre_actionable == "0" and int(total) > 0:
+          elif devin_available == "true" and new_actionable == "0" and pre_actionable == "0" and int(total) > 0:
               lines.append("> **All alerts are being handled** — Devin sessions are working on fixes or alerts have been resolved.\n")
 
           # New-in-PR section
