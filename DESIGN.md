@@ -849,6 +849,247 @@ Next run only retries `failed_dispatch` alerts, not `dispatched` ones. This prev
 
 **Implementation status**: DESIGNED, not yet implemented. P0 (exit code + honest comments) should be implemented before any production deployment.
 
+### Edge Case 12: Busy Devin — State Preservation, Deferred Alerts, and Zombie Detection
+
+**Problem**: When Devin is at capacity (all concurrent session slots occupied), the workflow cannot create new sessions. Alerts are discovered but cannot be dispatched. If the workflow simply exits, the next run rediscovers the same alerts and hits the same capacity wall — or worse, capacity frees up and the next run duplicates work that a previous run already queued mentally but never recorded.
+
+**Observed in production**: PR #3 testing on 2026-02-15. The Devin API returned HTTP 429 ("concurrent session limit of 5 exceeded"). Investigation revealed 5 active sessions from previous test runs (Run 2 created 8 sessions; 5 were still in running/blocked state when the new workflow run attempted to create more). This is expected behavior — Devin sessions persist until they finish or are manually stopped — but the workflow had no awareness of existing session load.
+
+**Why 5 concurrent sessions existed (investigation)**:
+
+The 5 sessions were NOT from the current test run. They accumulated from multiple previous runs:
+- **Run 2** (pre-rewrite testing): Created 8 sessions for 10 alerts. 7 finished, but sessions in "blocked" state (Devin finished work, waiting for human input) still count toward the concurrent limit.
+- **Session carryover**: Devin sessions don't auto-terminate. A session in "blocked" or "running" state occupies a slot until explicitly stopped or until Devin's internal timeout (which can be hours).
+- **No cleanup step**: Our workflow creates sessions but never cleans them up. Over multiple test runs, sessions accumulate.
+
+This is the root cause: **session lifecycle is unbounded**. The workflow is a session producer with no corresponding consumer/cleanup.
+
+**The core tension — EC10 vs EC12**:
+
+EC10 (Alert Claiming with TTL) and EC12 (State Preservation) address related but distinct problems:
+
+| Aspect | EC10 (Claiming) | EC12 (State Preservation) |
+|--------|-----------------|--------------------------|
+| **Problem** | Two runs see same alert, both dispatch | Run sees alert, can't dispatch (at capacity), state lost |
+| **When it matters** | Devin has capacity (sessions can be created) | Devin is at capacity (sessions cannot be created) |
+| **Goal** | Prevent duplicate sessions | Ensure alerts aren't forgotten when dispatch fails |
+| **Mechanism** | Lock (claim marker with TTL) | Queue (deferred marker with retry scheduling) |
+| **TTL semantics** | "Someone is working on this, don't touch for 30 min" | "We tried and failed, retry after cooldown" |
+
+These two systems must coexist without conflict. The key insight: **they operate on different alert states**.
+
+**Alert state machine** (unified model across EC10, EC11, EC12):
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │                                             │
+                    ▼                                             │
+┌──────────┐   ┌────────┐   ┌───────────┐   ┌─────────┐   ┌─────────┐
+│ DETECTED │──▶│DISPATCH│──▶│  CLAIMED   │──▶│  FIXED  │   │UNFIXABLE│
+│          │   │ATTEMPT │   │(in-flight) │   │         │   │         │
+└──────────┘   └────────┘   └───────────┘   └─────────┘   └─────────┘
+                    │              │                             ▲
+                    │              │ TTL expired                 │
+                    │              │ (EC10)                      │
+                    │              ▼                             │
+                    │        ┌───────────┐                      │
+                    │        │  ZOMBIE   │──────────────────────▶│
+                    │        │ (stale)   │   (after max retries) │
+                    │        └───────────┘                       │
+                    │              │                             │
+                    │              │ Reclaimed by next run       │
+                    │              ▼                             │
+                    │        ┌───────────┐                      │
+                    │        │  CLAIMED  │ (new run takes over)  │
+                    │        └───────────┘                       │
+                    │
+                    │ Dispatch failed (429/500)
+                    │ (EC11 + EC12)
+                    ▼
+              ┌───────────┐
+              │ DEFERRED  │──▶ (next run picks up)
+              │(queued)   │
+              └───────────┘
+```
+
+**State definitions and marker formats**:
+
+| State | Marker Format | Meaning | Who transitions out |
+|-------|---------------|---------|---------------------|
+| DETECTED | (no marker — alert exists in CodeQL) | Alert found, not yet processed | Current run |
+| CLAIMED | `<!-- claimed:ALERT_KEY=RUN_ID:TIMESTAMP -->` | Session created, Devin is working on it | TTL expiry or fix confirmation |
+| DEFERRED | `<!-- deferred:ALERT_KEY=RUN_ID:TIMESTAMP:REASON -->` | Dispatch attempted but failed; queued for next run | Next run with available capacity |
+| ZOMBIE | (claimed marker with expired TTL + no fix commits) | Session was created but appears stuck/failed | Next run reclaims it |
+| FIXED | (alert disappears from CodeQL results) | CodeQL no longer reports it | Terminal state |
+| UNFIXABLE | `<!-- unfixable:ALERT_KEY -->` | Max attempts reached, needs human review | Terminal state (human action) |
+
+**How DEFERRED differs from CLAIMED (preventing EC10/EC12 collision)**:
+
+The critical design decision: DEFERRED and CLAIMED are **distinct states with distinct markers**. A run checking for claims will NOT confuse a deferred alert with a claimed one:
+
+- `<!-- claimed:... -->` → "Don't touch this, someone is actively fixing it"
+- `<!-- deferred:... -->` → "Nobody could fix this last time, please try again"
+
+A new run seeing a `deferred:` marker should **immediately try to dispatch** (it's explicitly queued for pickup). A new run seeing a `claimed:` marker should **respect the TTL** and skip unless expired.
+
+**Deferred alert handling (the queue)**:
+
+When dispatch fails (HTTP 429, 500, etc.), instead of silently dropping the alert:
+
+```
+1. Write a DEFERRED marker:
+   <!-- deferred:py/sql-injection:app/server.py:18=run_22028000619:1739581732:429 -->
+   Format: alert_key = run_id : timestamp : http_status_code
+
+2. PR comment honestly states:
+   "Alert py/sql-injection deferred — Devin at capacity (HTTP 429). Will retry on next run."
+
+3. Next workflow run:
+   a. Reads all deferred markers
+   b. Checks if Devin has capacity (EC11 Solution 4: session budget check)
+   c. If capacity available: dispatch session, replace deferred→claimed
+   d. If still at capacity: update deferred timestamp, increment retry count
+   e. If retry count > MAX_DEFERRED_RETRIES (default: 6 = 30 min at 5-min cron):
+      escalate to PR comment warning "Alert stuck in queue for 30+ minutes"
+```
+
+**Zombie detection (stale claims that should be recycled)**:
+
+A "zombie" is a claimed alert where the session appears to have failed silently:
+
+```
+Zombie detection criteria (ALL must be true):
+1. claimed: marker exists with timestamp older than CLAIM_TTL (30 min)
+2. Alert still exists in CodeQL results (not fixed)
+3. No fix commits matching the alert's rule_id since the claim timestamp
+4. (Optional) Session status check: GET /v1/sessions/{id} returns "errored" or "stopped"
+```
+
+**Why criterion #3 matters**: Without checking for fix commits, we might reclaim an alert that Devin already fixed but CodeQL hasn't re-scanned yet. The commit check provides a grace period — if Devin pushed a `fix: [rule_id]...` commit, the alert is likely fixed and we just need to wait for the next CodeQL run to confirm.
+
+**Zombie resolution**:
+
+```
+if is_zombie(alert):
+    if alert.attempt_count >= MAX_ATTEMPTS:
+        transition to UNFIXABLE
+        "Alert zombie detected — Devin session appears stuck after {N} attempts. Marked as unfixable."
+    else:
+        transition to DETECTED (clear claim, allow re-dispatch)
+        increment attempt_count
+        "Alert zombie detected — reclaiming for retry (attempt {N+1}/{MAX})."
+```
+
+**Session cleanup (addressing root cause)**:
+
+The 5-session pileup reveals a deeper issue: our workflow never cleans up finished sessions. Proposed solutions:
+
+| Approach | Mechanism | Pros | Cons |
+|----------|-----------|------|------|
+| **Pre-dispatch cleanup** | Before creating sessions, poll existing sessions. Stop any in "blocked" state older than 1 hour. | Frees slots proactively | Requires session list API; may stop sessions user wants to keep |
+| **Post-dispatch polling** | After creating session, poll every 2 min for 10 min. If session finishes, update PR comment. | Provides completion feedback | Extends workflow run time; GitHub Actions has 6-hour limit |
+| **Deferred cleanup job** | Separate scheduled workflow that runs hourly, stops all "blocked" sessions older than 2 hours | Decoupled; doesn't slow main workflow | Another workflow to maintain; another thing that can break |
+| **Session TTL in Devin prompt** | Add to Devin prompt: "If you cannot fix the issue within 20 minutes, stop and report failure" | Simple; no infrastructure | Devin may not honor time-based instructions reliably |
+
+**Recommended approach**: **Pre-dispatch cleanup** for immediate wins, with **deferred cleanup job** for production. The main workflow should be lightweight (fire-and-forget), while a separate cleanup job handles session hygiene.
+
+**Unified marker format (combining EC10 + EC11 + EC12)**:
+
+All state is stored in a single hidden block in the PR comment:
+
+```html
+<!-- devin-security-state
+claimed:py/sql-injection:app/server.py:18=run_123:1739581732:session_abc
+claimed:py/xss:app/server.py:46=run_123:1739581732:session_def
+deferred:py/command-injection:app/server.py:25=run_123:1739581800:429:retry_1
+deferred:py/flask-debug:app/server.py:51=run_123:1739581800:429:retry_1
+unfixable:py/url-redirection:app/server.py:31
+rate_limited:1739581800:cooldown_300
+-->
+```
+
+This single block replaces multiple scattered markers. Benefits:
+- **Atomic read-modify-write**: One block to parse, one block to update
+- **No marker collision**: All states are in one namespace with distinct prefixes
+- **Visible in DEBUG mode**: The entire state machine is inspectable
+- **Self-documenting**: Each line has a clear prefix indicating the state
+
+**Parsing logic** (pseudocode for the workflow):
+
+```python
+def parse_state_block(comment_body):
+    match = re.search(r'<!-- devin-security-state\n(.*?)\n-->', comment_body, re.DOTALL)
+    if not match:
+        return empty_state()
+    
+    state = {}
+    for line in match.group(1).strip().split('\n'):
+        prefix, rest = line.split(':', 1)
+        if prefix == 'claimed':
+            alert_key, meta = rest.rsplit('=', 1)
+            run_id, timestamp, session_id = meta.split(':')
+            state[alert_key] = ClaimedAlert(run_id, int(timestamp), session_id)
+        elif prefix == 'deferred':
+            alert_key, meta = rest.rsplit('=', 1)
+            run_id, timestamp, http_code, retry_info = meta.split(':')
+            retry_count = int(retry_info.replace('retry_', ''))
+            state[alert_key] = DeferredAlert(run_id, int(timestamp), http_code, retry_count)
+        elif prefix == 'unfixable':
+            state[rest] = UnfixableAlert()
+        elif prefix == 'rate_limited':
+            timestamp, cooldown = rest.split(':')
+            state['_rate_limit'] = RateLimit(int(timestamp), int(cooldown.replace('cooldown_', '')))
+    return state
+```
+
+**Decision flowchart for each alert** (what the workflow does per alert):
+
+```
+For each CodeQL alert:
+  1. Is it in UNFIXABLE state? → SKIP (already given up)
+  2. Is it in CLAIMED state?
+     a. Is claim TTL expired? → Mark as ZOMBIE, go to step 4
+     b. Is claim TTL valid? → SKIP (someone is working on it)
+  3. Is it in DEFERRED state?
+     a. Is retry count > MAX_DEFERRED_RETRIES? → ESCALATE (warn in comment)
+     b. Otherwise → try to dispatch (go to step 5)
+  4. Is it a ZOMBIE?
+     a. Are there fix commits since claim? → SKIP (likely fixed, wait for CodeQL rescan)
+     b. attempt_count >= MAX_ATTEMPTS? → transition to UNFIXABLE
+     c. Otherwise → clear claim, treat as DETECTED
+  5. DISPATCH attempt:
+     a. Check session budget (EC11 Solution 4)
+     b. If capacity available → create session → transition to CLAIMED
+     c. If at capacity → transition to DEFERRED with reason code
+```
+
+**How this prevents conflicts between EC10 and EC12**:
+
+| Scenario | EC10 alone | EC12 alone | EC10 + EC12 unified |
+|----------|-----------|-----------|---------------------|
+| Two runs, Devin has capacity | Both dispatch → duplicate | N/A | First claims, second skips (EC10) |
+| One run, Devin at capacity | Claim written but no session | Alert lost | Alert marked DEFERRED, next run picks up (EC12) |
+| Claimed alert, session stuck | Claim expires after TTL | N/A | Zombie detected, reclaimed or marked unfixable (EC10 TTL + EC12 zombie) |
+| Deferred alert, capacity returns | N/A | Alert rediscovered | Deferred marker triggers immediate dispatch (EC12) |
+| Deferred alert, still at capacity | N/A | Alert rediscovered, fails again | Retry count incremented, escalation after threshold (EC12) |
+
+**Configuration parameters**:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CLAIM_TTL` | 1800 (30 min) | How long a claim is valid before considered stale |
+| `MAX_ATTEMPTS` | 2 | Max fix attempts before marking unfixable |
+| `MAX_DEFERRED_RETRIES` | 6 | Max times an alert can be deferred before escalation |
+| `DEFERRED_ESCALATION_THRESHOLD` | 1800 (30 min) | Time in deferred state before warning |
+| `SESSION_CLEANUP_AGE` | 3600 (1 hour) | Age of "blocked" sessions eligible for cleanup |
+| `RATE_LIMIT_COOLDOWN` | 300 (5 min) | Minimum wait after rate limit before retrying |
+
+**Implementation status**: DESIGNED, not yet implemented. This is the most complex edge case and should be implemented incrementally:
+1. **Phase 1**: Unified state block format + DEFERRED state (replaces current scattered markers)
+2. **Phase 2**: Zombie detection + automatic reclaiming
+3. **Phase 3**: Pre-dispatch session cleanup
+4. **Phase 4**: Deferred cleanup job (separate workflow)
+
 ---
 
 ## Secrets and Authentication
