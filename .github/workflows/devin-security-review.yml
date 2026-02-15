@@ -438,34 +438,40 @@ jobs:
           BODY="## Devin Security Review\n\n"
           BODY+="**Total CodeQL Alerts: ${TOTAL_COUNT}**\n\n"
 
+          PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+
           if [ "$NEW_COUNT" != "0" ] && [ -n "$NEW_COUNT" ]; then
             BODY+="### New Alerts (introduced in this PR): ${NEW_COUNT}\n\n"
-            BODY+="Devin is pushing fixes directly to this PR branch.\n\n"
             BODY+="\`\`\`\n${NEW_SUMMARY}\n\`\`\`\n\n"
             if [ "$NEW_SESSION_CREATED" = "true" ]; then
-              BODY+="**Devin Session**: [View fix progress](${NEW_SESSION_URL}) | Status: \`${NEW_SESSION_STATUS}\`\n\n"
+              BODY+="**Devin is fixing these issues.** Each fix will appear as a separate commit on this PR.\n\n"
+              BODY+="| What | Link |\n"
+              BODY+="|------|------|\n"
+              BODY+="| Watch Devin work | [Devin Session](${NEW_SESSION_URL}) |\n"
+              BODY+="| See fix commits | [Commits tab](${PR_URL}/commits) |\n"
+              BODY+="| Review all changes | [Files changed](${PR_URL}/files) |\n\n"
             fi
           fi
 
           if [ "$PRE_COUNT" != "0" ] && [ -n "$PRE_COUNT" ]; then
             BODY+="### Pre-existing Alerts (already on main): ${PRE_COUNT}\n\n"
-            BODY+="These exist on main and are not introduced by this PR. "
+            BODY+="These exist on main and were not introduced by this PR.\n\n"
+            BODY+="\`\`\`\n${PRE_SUMMARY}\n\`\`\`\n\n"
             if [ "$PRE_SESSIONS_CREATED" = "true" ]; then
-              BODY+="Devin is fixing them on branch \`${FIX_BRANCH}\` (separate PR will follow).\n\n"
-              BODY+="**Devin Sessions** (${PRE_SESSION_COUNT}):\n"
-
+              BODY+="**Devin is fixing these on branch \`${FIX_BRANCH}\`.** A separate PR will be created.\n\n"
+              BODY+="| Session | Link |\n"
+              BODY+="|---------|------|\n"
               if [ -f /tmp/preexisting_session_urls.txt ]; then
                 i=1
                 while IFS= read -r url; do
                   if [ -n "$url" ]; then
-                    BODY+="- [Session ${i}](${url})\n"
+                    BODY+="| Batch ${i} | [Watch Devin work](${url}) |\n"
                     i=$((i + 1))
                   fi
                 done < /tmp/preexisting_session_urls.txt
               fi
               BODY+="\n"
             fi
-            BODY+="\`\`\`\n${PRE_SUMMARY}\n\`\`\`\n\n"
           fi
 
           BODY+="---\n"
