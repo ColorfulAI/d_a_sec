@@ -257,7 +257,7 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$REPO/commits/$SHA/check-runs")
 
-            CODEQL_RUNS=$(echo "$CHECK_RUNS" | jq '[.check_runs[] | select(.name == "CodeQL" or (.name | startswith("Analyze")))]')
+            CODEQL_RUNS=$(echo "$CHECK_RUNS" | jq '[(.check_runs // [])[] | select(.name == "CodeQL" or (.name | startswith("Analyze")))]')
             TOTAL=$(echo "$CODEQL_RUNS" | jq 'length')
             COMPLETED=$(echo "$CODEQL_RUNS" | jq '[.[] | select(.status == "completed")] | length')
 
@@ -1203,7 +1203,7 @@ jobs:
               elif devin_available != "true":
                   lines.append("**Devin API is unavailable.** Alerts listed above require manual fixing or wait for Devin to come back online.\n")
               elif new_actionable == "0":
-                  lines.append("All new alerts have been attempted (max retries reached). See unfixable section below.\n")
+                  lines.append("No remaining actionable alerts. Unfixable alerts (if any) are listed below.\n")
               elif new_session_created == "false":
                   lines.append("**Session creation failed.** Alerts listed above require manual attention. This workflow run has been marked as failed.\n")
 
@@ -1319,8 +1319,18 @@ jobs:
                       lines.append("| Alert Key | Attempts | Status |")
                       lines.append("|-----------|----------|--------|")
                       uf_keys = set(df.get("unfixable_keys", []))
+                      fk_set = set(df.get("fixed_keys", []))
                       for k, v in ah.items():
-                          status = "unfixable" if k in uf_keys else ("dispatched" if v < 2 else "max reached")
+                          rf_prefix = k.rsplit(':', 1)[0] if ':' in k else k
+                          is_fixed = k in fk_set or any(fk.startswith(rf_prefix) for fk in fk_set)
+                          if k in uf_keys:
+                              status = "unfixable"
+                          elif is_fixed:
+                              status = "fixed"
+                          elif v < 2:
+                              status = "dispatched"
+                          else:
+                              status = "max reached"
                           lines.append(f"| `{k}` | {v}/2 | {status} |")
               except Exception:
                   lines.append("- Filter data not available")
