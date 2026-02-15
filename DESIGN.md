@@ -533,6 +533,82 @@ The internal retry approach is strictly better: fewer sessions, faster feedback,
 
 ---
 
+## Fortune 500 Production Edge Cases
+
+These edge cases were identified through systematic testing and code analysis. Each represents a real failure mode that can occur in enterprise environments with high PR volume and accumulated security debt.
+
+### EC-1: Batch Isolation — Pre-existing Failures Must Not Fail PR Check
+
+**Scenario**: A developer opens a PR on a codebase with 200 pre-existing CodeQL alerts on main. Their PR code is clean, but the pre-existing batch session fails (API error, timeout, etc.).
+
+**Why this matters**: In enterprise environments, main branches accumulate hundreds of pre-existing alerts. A new PR author should not be blocked or stigmatized for tech debt they didn't create. If the workflow marks the PR check as "failed" because of pre-existing batch issues, developers lose trust and start ignoring security checks.
+
+**Design rule**: The workflow exit code ONLY fails when:
+1. New-in-PR session creation fails (`session_failed=true`)
+2. Devin API is unavailable AND there are new-in-PR actionable alerts
+
+Pre-existing batch failures are logged but never affect the PR's pass/fail status.
+
+### EC-2: Banner and Label Misattribution
+
+**Scenario**: A PR introduces 2 new alerts (both fixable by Devin) but the codebase has 5 pre-existing unfixable alerts on main. The PR comment shows "REQUIRES MANUAL REVIEW — 5 alerts could not be auto-fixed" and applies the `devin:manual-review-needed` label.
+
+**Why this matters**: The PR author sees a scary banner and red label implying THEIR code has unfixable security issues. In reality, their code is fine — the unfixable alerts are inherited from main. This erodes trust and creates friction in the PR review process.
+
+**Design rule**:
+- The "REQUIRES MANUAL REVIEW" banner only appears for NEW-IN-PR unfixable alerts
+- Pre-existing unfixable alerts get a softer "Note" callout that explicitly says "not introduced by this PR"
+- The `devin:manual-review-needed` label is only applied when NEW-IN-PR alerts are unfixable
+- Unfixable counts are split: `new_unfixable_count` and `pre_unfixable_count`
+
+### EC-3: Comment Race Condition Under High PR Volume
+
+**Scenario**: Developer pushes code → workflow run A starts. Devin pushes a fix → workflow run B starts. Both runs read the same PR comment, build their own updated version, and PATCH it. Run B's PATCH overwrites run A's attempt history.
+
+**Why this matters**: Fortune 500 repos can have dozens of PRs per hour. Each Devin fix push triggers a re-run. If two runs overlap, the second PATCH silently overwrites the first's data, potentially resetting attempt counters or losing fixed-alert tracking.
+
+**Current mitigation**: The `<!-- devin-security-review -->` marker ensures we always find the correct comment. Each run reads the latest state before writing. However, there is no lock/mutex — true concurrent PATCHes can still race.
+
+**Future improvement**: Use GitHub's `If-Match` / ETag headers on PATCH requests to detect conflicts, or implement a simple retry-on-conflict loop.
+
+### EC-4: Alert Explosion — Hundreds of Pre-existing Alerts
+
+**Scenario**: A mature codebase has 500+ pre-existing CodeQL alerts. Developer opens a PR that adds 2 new alerts.
+
+**Why this matters**: The workflow creates up to 20 sessions (15 alerts each = 300 max). The remaining 200+ alerts are silently dropped. The PR comment could become enormous (hundreds of table rows), potentially exceeding GitHub's 65536 character limit for comment bodies.
+
+**Current mitigation**:
+- Session cap: max 20 sessions per run (300 alerts)
+- Severity prioritization: critical/high alerts processed first
+- Per-alert status tables could grow very large
+
+**Future improvement**: Paginate alert tables (show top 50, collapse the rest), add a "and N more" summary, implement cross-run continuity so subsequent runs pick up where the previous left off.
+
+### EC-5: Concurrent PRs Fixing Same Pre-existing Alerts
+
+**Scenario**: PR #10 and PR #11 are open simultaneously. Both detect the same 20 pre-existing alerts on main. Both create Devin sessions to fix them. Both sessions push to branch `devin/security-fixes-prN`.
+
+**Why this matters**: Two Devin sessions fixing the same alert independently will produce conflicting commits. When the fix PRs try to merge to main, there will be merge conflicts.
+
+**Current mitigation**: The fix branch name is deterministic per PR (`devin/security-fixes-pr{N}`), so different PRs use different branches. However, the fixes target the same code, so merging both to main will conflict.
+
+**Future improvement**: Implement a global lock (GitHub issue comment or label) to prevent concurrent pre-existing fix sessions. Or use a single shared fix branch with conflict detection.
+
+### EC-6: Stress Test — Mass PR Creation
+
+**Scenario**: 100 PRs are opened simultaneously against a repo with pre-existing vulnerabilities.
+
+**Why this matters**: This tests the system's behavior under load — API rate limits (both GitHub and Devin), concurrent workflow runs competing for resources, comment creation contention, and session exhaustion.
+
+**Key concerns**:
+- GitHub Actions concurrency limits (varies by plan)
+- Devin API rate limits (429 responses)
+- GitHub REST API rate limits (5000 req/hr for PATs)
+- Each PR creates its own comment, sessions, and labels — no cross-PR interference expected
+- But all PRs detect the same pre-existing alerts, creating redundant session work
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations

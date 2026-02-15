@@ -355,6 +355,68 @@ Developer doesn't know when all fixes are applied and verified.
 4. When all alerts are fixed: label removed from PR
 **Validates**: Label creation check-before-create logic. No wasted API calls.
 
+### TC-M: Exit Code Isolation — Pre-existing Batch Failure Must Not Fail PR Check
+**Setup**: Open a clean PR. Push code that introduces 1 new-in-PR alert (fixable) alongside a codebase that has pre-existing alerts on main. Simulate a scenario where the pre-existing batch Devin session fails but the new-in-PR session succeeds.
+**Expected**:
+1. Workflow exit code is `0` (success) — the PR check passes
+2. The `session_failed` output is only checked for the new-in-PR session, not pre-existing
+3. PR comment shows new-in-PR alert as fixed
+4. Pre-existing alerts shown separately with their own status
+5. No `devin:manual-review-needed` label applied (because no NEW-IN-PR unfixable alerts)
+**Validates**: EC-1 batch isolation. A developer's PR is not blocked by tech debt they didn't create.
+**Production scenario**: Fortune 500 repo with 200+ pre-existing alerts. New developer opens their first PR — it should pass if their code is clean.
+
+### TC-N: Banner Misattribution — Pre-existing Unfixable Must Not Show "REQUIRES MANUAL REVIEW"
+**Setup**: Open a clean PR on a codebase where main has unfixable alerts. Push clean code that introduces NO new vulnerabilities, or only fixable ones.
+**Expected**:
+1. PR comment does NOT show "REQUIRES MANUAL REVIEW" banner (because no NEW-IN-PR unfixable)
+2. PR comment shows a softer "Note: N pre-existing alert(s) on main also need manual attention (not introduced by this PR)"
+3. `devin:manual-review-needed` label is NOT applied to the PR
+4. If both new-in-PR AND pre-existing unfixable exist, banner says "N alert(s) introduced by this PR" (not total)
+**Validates**: EC-2 banner/label misattribution. PR author is not blamed for inherited tech debt.
+**Production scenario**: Enterprise security team rolls out CodeQL on a legacy codebase with hundreds of known issues. Every new PR would get a scary red banner — devs would quickly learn to ignore it.
+
+### TC-O: Label Attribution — Label Only for New-in-PR Unfixable
+**Setup**: Open a PR where all new-in-PR alerts are fixable, but pre-existing alerts are unfixable.
+**Expected**:
+1. `devin:manual-review-needed` label is NOT applied (all new-in-PR alerts fixed)
+2. Pre-existing unfixable alerts shown with "Note" callout, not "REQUIRES MANUAL REVIEW"
+3. If a subsequent push introduces an unfixable new-in-PR alert, label IS applied
+4. If that alert is later fixed, label is removed
+**Validates**: Label lifecycle tied to new-in-PR unfixable count, not total unfixable count.
+
+### TC-P: Comment Race Condition — Overlapping Workflow Runs
+**Setup**: Push code to trigger workflow run A. Before A completes, push again to trigger run B. Both runs will try to PATCH the same PR comment.
+**Expected**:
+1. Both runs complete without error
+2. The final PR comment reflects the latest state (run B's data)
+3. No attempt history is lost (attempt counters are monotonically increasing)
+4. No duplicate entries in the alert table
+**Validates**: EC-3 comment race condition. In high-volume repos, overlapping runs are common.
+**Production scenario**: Developer pushes code, gets a review comment, pushes a fix 30 seconds later. Both workflow runs overlap.
+
+### TC-Q: Alert Explosion — Many Alerts in Single PR
+**Setup**: Push code that creates 10+ vulnerabilities across multiple files in a single commit.
+**Expected**:
+1. Workflow handles all alerts without crashing
+2. PR comment renders a large table without exceeding GitHub's 65536 char limit
+3. Alerts are sorted by severity (critical → high → medium → low)
+4. Session creation respects the cap (max 20 sessions, 15 alerts per batch)
+5. Debug log shows all alerts processed
+**Validates**: EC-4 alert explosion. Mature codebases can have hundreds of alerts.
+
+### TC-R: Stress Test — Mass PR Creation (~100 PRs)
+**Setup**: Create ~100 branches, each with a unique vulnerability, and open PRs for all of them in rapid succession.
+**Expected**:
+1. Each PR gets its own independent workflow run
+2. No cross-PR contamination (PR #10's alerts don't appear in PR #11's comment)
+3. GitHub Actions concurrency limits are hit gracefully (queued, not failed)
+4. Devin API rate limits (429) are handled with retry logic
+5. GitHub REST API rate limits (5000 req/hr) are not exhausted
+6. All PRs eventually get their security review comment
+**Validates**: EC-6 stress test. Fortune 500 companies can have spikes of 50-100 PRs in a release window.
+**Key metrics**: Time to first comment, API error rate, session creation success rate.
+
 ---
 
 ## Known Issues

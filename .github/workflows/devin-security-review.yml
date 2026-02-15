@@ -32,8 +32,8 @@
 #    - "REQUIRES MANUAL REVIEW" with details if any alerts are unfixable
 #    A GitHub label (devin:manual-review-needed) is added when manual review is needed.
 #
-# 7. RESOURCE CAPS: max_acu_limit on Devin sessions, idempotent flag to prevent
-#    duplicate sessions, max 20 sessions per workflow run, 3 concurrent.
+# 7. RESOURCE CAPS: max_acu_limit on Devin sessions, max 20 sessions per
+#    workflow run, 3 concurrent. Retry logic is internal to each session.
 
 name: Devin Security Review
 
@@ -726,9 +726,20 @@ jobs:
 
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
           with open(gh_out, "a") as f:
+              # Split unfixable counts by origin so the exit code and label
+              # steps can distinguish PR-author issues from pre-existing debt.
+              new_unfixable_keys = set()
+              for a in new_skipped + new_newly_unfixable:
+                  new_unfixable_keys.add(a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}"))
+              pre_unfixable_keys = set()
+              for a in pre_skipped + pre_newly_unfixable:
+                  pre_unfixable_keys.add(a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}"))
+
               f.write(f"new_actionable_count={len(new_actionable)}\n")
               f.write(f"pre_actionable_count={len(pre_actionable)}\n")
               f.write(f"unfixable_count={len(all_unfixable)}\n")
+              f.write(f"new_unfixable_count={len(new_unfixable_keys)}\n")
+              f.write(f"pre_unfixable_count={len(pre_unfixable_keys)}\n")
 
           debug_filter = {
               "is_devin_fix": is_devin_fix,
@@ -1084,6 +1095,8 @@ jobs:
           export NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
           export PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
           export UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
+          export NEW_UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.new_unfixable_count }}"
+          export PRE_UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.pre_unfixable_count }}"
           export NEW_SESSION_URL="${{ steps.devin-new-pr.outputs.session_url }}"
           export NEW_SESSION_CREATED="${{ steps.devin-new-pr.outputs.session_created }}"
           export PRE_SESSIONS_CREATED="${{ steps.devin-preexisting.outputs.sessions_created }}"
@@ -1112,6 +1125,8 @@ jobs:
           new_actionable = os.environ.get("NEW_ACTIONABLE", "0")
           pre_actionable = os.environ.get("PRE_ACTIONABLE", "0")
           unfixable_count = os.environ.get("UNFIXABLE_COUNT", "0")
+          new_unfixable_count = os.environ.get("NEW_UNFIXABLE_COUNT", "0")
+          pre_unfixable_count = os.environ.get("PRE_UNFIXABLE_COUNT", "0")
           new_session_url = os.environ.get("NEW_SESSION_URL", "")
           new_session_created = os.environ.get("NEW_SESSION_CREATED", "false")
           pre_sessions_created = os.environ.get("PRE_SESSIONS_CREATED", "false")
@@ -1187,9 +1202,13 @@ jobs:
               lines.append("> **Your code is still protected.** CodeQL's required status check blocks merging of PRs with unresolved security alerts. Fix these issues manually or wait for Devin to come back online and re-run this workflow.\n")
 
           # Status signal (safe-to-merge vs needs manual review)
-          if int(unfixable_count) > 0:
-              lines.append(f"> **REQUIRES MANUAL REVIEW** — {unfixable_count} alert(s) could not be auto-fixed after multiple attempts. See details below.\n")
-          elif devin_available == "true" and new_actionable == "0" and pre_actionable == "0" and int(total) > 0:
+          # IMPORTANT: Only blame the PR author for NEW-IN-PR unfixable alerts.
+          # Pre-existing unfixable alerts are tech debt, not the author's fault.
+          if int(new_unfixable_count) > 0:
+              lines.append(f"> **REQUIRES MANUAL REVIEW** — {new_unfixable_count} alert(s) introduced by this PR could not be auto-fixed. See details below.\n")
+          if int(pre_unfixable_count) > 0:
+              lines.append(f"> **Note:** {pre_unfixable_count} pre-existing alert(s) on main also need manual attention (not introduced by this PR).\n")
+          if int(unfixable_count) == 0 and devin_available == "true" and new_actionable == "0" and pre_actionable == "0" and int(total) > 0:
               lines.append("> **All alerts are being handled** — Devin sessions are working on fixes or alerts have been resolved.\n")
 
           # New-in-PR section
@@ -1434,10 +1453,13 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="$PR_NUMBER"
           UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
+          NEW_UNFIXABLE="${{ steps.filter-alerts.outputs.new_unfixable_count }}"
           LABEL="devin:manual-review-needed"
 
-          if [ "$UNFIXABLE_COUNT" != "0" ] && [ -n "$UNFIXABLE_COUNT" ]; then
-            echo "Adding label '$LABEL' to PR #$PR_NUMBER (unfixable alerts exist)..."
+          # Only apply the label when NEW-IN-PR alerts are unfixable.
+          # Pre-existing unfixable alerts are tech debt — don't stigmatize the PR author.
+          if [ "$NEW_UNFIXABLE" != "0" ] && [ -n "$NEW_UNFIXABLE" ]; then
+            echo "Adding label '$LABEL' to PR #$PR_NUMBER (new-in-PR unfixable alerts exist)..."
             # Create the label only if it doesn't already exist (avoids 422 on every run)
             LABEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $GH_PAT" \
@@ -1548,7 +1570,6 @@ jobs:
           NEW_FAILED="${{ steps.devin-new-pr.outputs.session_failed }}"
           DEVIN_AVAILABLE="${{ steps.health-check.outputs.devin_available }}"
           NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
-          PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
 
           if [ "$NEW_FAILED" = "true" ]; then
             echo "::error::Devin session creation failed for new-in-PR alerts. Marking workflow as failed (EC11: honest exit code)."
