@@ -85,13 +85,15 @@ jobs:
         id: pr-context
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_PULL_REQUESTS: ${{ toJson(github.event.workflow_run.pull_requests) }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             echo "Triggered by workflow_run (CodeQL completed)"
-            HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
+            HEAD_BRANCH="$WORKFLOW_HEAD_BRANCH"
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
 
-            PR_NUMBER=$(echo '${{ toJson(github.event.workflow_run.pull_requests) }}' | jq -r '.[0].number // empty')
+            PR_NUMBER=$(echo "$WORKFLOW_PULL_REQUESTS" | jq -r '.[0].number // empty')
 
             if [ -z "$PR_NUMBER" ]; then
               echo "pull_requests array empty — searching by branch..."

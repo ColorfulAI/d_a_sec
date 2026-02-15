@@ -3,7 +3,7 @@ import subprocess
 import json
 import base64
 from markupsafe import escape
-from flask import Flask, request, redirect, make_response
+from flask import Flask, request, redirect, make_response, jsonify
 
 app = Flask(__name__)
 
@@ -18,7 +18,7 @@ def search():
     cursor = db.cursor()
     cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return {"results": results}
+    return jsonify({"results": results})
 
 @app.route("/run")
 def run_command():
@@ -35,10 +35,19 @@ def run_command():
     output = subprocess.check_output(safe_cmd)
     return {"output": output.decode()}
 
+ALLOWED_REDIRECTS = {
+    "/": "/",
+    "/search": "/search",
+    "/profile": "/profile",
+    "/page": "/page",
+    "/run": "/run",
+}
+
 @app.route("/redirect")
-def open_redirect():
+def safe_redirect():
     url = request.args.get("url", "/")
-    return redirect(url)
+    target = ALLOWED_REDIRECTS.get(url, "/")
+    return redirect(target)
 
 @app.route("/profile")
 def profile():
