@@ -1240,9 +1240,10 @@ jobs:
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
           UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
           LABEL="devin:manual-review-needed"
 
