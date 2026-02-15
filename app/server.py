@@ -14,7 +14,7 @@ def search():
     cursor = db.cursor()
     cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return str(results)
+    return jsonify(results)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
