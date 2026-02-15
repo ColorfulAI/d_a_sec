@@ -1,6 +1,5 @@
 import ast
 import operator
-import os
 from flask import Flask, request, redirect, render_template_string, jsonify
 
 app = Flask(__name__)
@@ -70,8 +69,8 @@ def read_file():
 
 @app.route("/render")
 def render_page():
-    template = request.args.get("template", "<h1>Hello</h1>")
-    return render_template_string(template)
+    content = request.args.get("template", "Hello")
+    return render_template_string("<h1>{{ content }}</h1>", content=content)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
