@@ -640,6 +640,73 @@ This prevents running on CodeQL pushes to main or failed CodeQL runs.
 
 **Polling fallback**: When triggered by `pull_request` (fallback), the old polling logic (Step 2) still runs to wait for CodeQL. When triggered by `workflow_run`, Step 2 is skipped entirely since CodeQL is already complete.
 
+### Edge Case 10: Duplicate Fix Sessions from Concurrent / Scheduled Runs
+
+**Problem**: If the workflow runs on a schedule (e.g., cron every 5 minutes) or multiple `workflow_run` events fire in quick succession, several workflow runs may see the same unfixed alerts simultaneously. Each run dispatches a Devin session for the same alert, wasting resources and potentially creating conflicting fix commits.
+
+**Why existing mitigations are insufficient**:
+
+| Existing mitigation | What it prevents | What it doesn't prevent |
+|---------------------|-----------------|------------------------|
+| `idempotent=true` on Devin sessions | Duplicate sessions with identical prompts | Sessions with slightly different prompts (different timestamps, run IDs) |
+| Attempt tracking (`<!-- attempts:... -->`) | Re-dispatching after max attempts | Two runs reading the same attempt count before either updates it |
+| Devin-commit detection | Re-processing after a fix commit | Two runs starting before any fix commit exists |
+
+The core issue is a **TOCTOU race** (time-of-check to time-of-use): Run A reads "0 attempts" → Run B reads "0 attempts" → both dispatch sessions → both increment to "1 attempt".
+
+**Proposed solution — Alert Claiming with TTL**:
+
+Extend the hidden PR comment markers with a **claim** system:
+
+```html
+<!-- claimed:py/sql-injection:app/server.py:18=run_22028000619:1739581732 -->
+```
+
+Format: `alert_key = workflow_run_id : unix_timestamp_of_claim`
+
+**Claim lifecycle**:
+
+```
+1. Workflow reads PR comment, parses claimed: markers
+2. For each actionable alert:
+   a. If unclaimed → write claimed: marker with run_id + timestamp → dispatch Devin session
+   b. If claimed AND (now - claim_timestamp) < TTL → skip (another run is handling it)
+   c. If claimed AND (now - claim_timestamp) >= TTL → claim is stale, overwrite → dispatch
+3. After Devin completes (or on next run):
+   a. If alert is fixed → remove claimed: marker, update attempts:
+   b. If alert still exists → increment attempts, remove claimed:
+```
+
+**TTL (time-to-live)**: The critical design parameter.
+
+| TTL value | Trade-off |
+|-----------|-----------|
+| Too short (5 min) | Multiple runs fight over the same alert; Devin may not have finished yet |
+| Too long (2 hours) | Stale claims from crashed runs block fixes for hours |
+| **30 minutes (recommended)** | Devin sessions typically take 5-20 min; 30 min gives buffer for retries |
+
+TTL should be configurable via workflow input (default: 30 minutes).
+
+**Why PR comment markers (not a database or GitHub Actions cache)?**:
+
+| State store | Pros | Cons |
+|-------------|------|------|
+| **PR comment markers** (chosen) | Zero infrastructure; visible in DEBUG mode; atomic via GitHub API; already used for attempts | Size limit on comment body (~64KB); GitHub API serialization is eventual, not strict |
+| GitHub Actions cache | Fast; built-in | No cross-workflow visibility; expires after 7 days; cache key conflicts |
+| External database | Strict locking; unlimited size | Requires infrastructure; another dependency that can go down |
+| GitHub commit status / check annotations | Visible in UI | Not designed for structured data; hard to parse |
+
+**Concurrency edge case**: Two runs may PATCH the comment nearly simultaneously. GitHub's API serializes writes, but both runs may have read the old state. The `idempotent=true` flag on Devin sessions provides a safety net — even if two sessions are dispatched for the same alert, Devin's idempotency key prevents duplicate work if the prompts match.
+
+**Implementation status**: DESIGNED, not yet implemented. The current attempt-tracking system handles the common case (sequential runs). The claiming system is needed for high-frequency scheduled runs (cron < 30 min interval).
+
+**Future enhancement — Session polling**: If we add a step that polls Devin session status after creation, we can:
+1. Remove the claim when the session finishes (success or failure)
+2. Update the PR comment with actual fix results (not just "Devin is working on it")
+3. Immediately mark alerts as unfixable if Devin reports failure
+
+This would make the claim TTL less critical, since claims are actively managed rather than passively expired.
+
 ---
 
 ## Secrets and Authentication
