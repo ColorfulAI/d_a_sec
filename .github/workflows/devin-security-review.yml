@@ -288,9 +288,10 @@ jobs:
         id: classify-alerts
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
           PR_REF="refs/pull/${PR_NUMBER}/merge"
 
           echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
@@ -428,9 +429,10 @@ jobs:
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
 
           # Fetch comments and write to temp file (avoids shell string corruption)
           curl -s -L \
@@ -630,10 +632,12 @@ jobs:
         id: devin-new-pr
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
+          PR_BRANCH: ${{ steps.pr-context.outputs.head_branch }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
-          PR_BRANCH="${{ steps.pr-context.outputs.head_branch }}"
+          PR_NUMBER="$PR_NUMBER"
+          PR_BRANCH="$PR_BRANCH"
           ALERT_SUMMARY=$(cat /tmp/new_actionable_summary.txt)
           ALERT_DETAILS=$(cat /tmp/new_in_pr_actionable.json)
 
@@ -742,9 +746,10 @@ jobs:
         id: devin-preexisting
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          export PR_NUMBER="$PR_NUMBER"
           export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
 
           echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
@@ -924,9 +929,10 @@ jobs:
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          export PR_NUMBER="$PR_NUMBER"
           export TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
           export NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
           export PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
@@ -1234,9 +1240,10 @@ jobs:
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
           UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
           LABEL="devin:manual-review-needed"
 
@@ -1277,9 +1284,10 @@ jobs:
         if: steps.classify-alerts.outputs.total_count == '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_NUMBER="$PR_NUMBER"
 
           # Find existing comment (write to file to avoid shell string corruption)
           curl -s -L \

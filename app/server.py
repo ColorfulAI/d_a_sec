@@ -1,8 +1,11 @@
 import sqlite3
+import shlex
 import subprocess
-import pickle
+import json
 import base64
-from flask import Flask, request, redirect
+
+from flask import Flask, request, redirect, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -17,32 +20,47 @@ def search():
     cursor = db.cursor()
     cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return {"results": results}
+    return jsonify({"results": results})
+
+ALLOWED_COMMANDS = {"echo", "date", "whoami", "uname", "hostname"}
 
 @app.route("/run")
 def run_command():
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return {"output": output.decode()}
+    args = shlex.split(cmd)
+    if not args or args[0] not in ALLOWED_COMMANDS:
+        return jsonify({"error": "command not allowed"}), 403
+    output = subprocess.check_output(args, shell=False)
+    return jsonify({"output": output.decode()})
+
+REDIRECT_MAP = {
+    "/": "/",
+    "/home": "/home",
+    "/dashboard": "/dashboard",
+    "/profile": "/profile",
+    "/search": "/search",
+    "/page": "/page",
+}
 
 @app.route("/redirect")
 def open_redirect():
     url = request.args.get("url", "/")
-    return redirect(url)
+    safe_url = REDIRECT_MAP.get(url, "/")
+    return redirect(safe_url)
 
 @app.route("/profile")
 def profile():
     data = request.cookies.get("session_data", "")
     if data:
-        user = pickle.loads(base64.b64decode(data))
-        return {"username": user.get("name", "anonymous")}
-    return {"username": "anonymous"}
+        user = json.loads(base64.b64decode(data))
+        return jsonify({"username": user.get("name", "anonymous")})
+    return jsonify({"username": "anonymous"})
 
 @app.route("/page")
 def render_page():
     title = request.args.get("title", "Home")
     content = request.args.get("content", "")
-    return f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    return f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
