@@ -15,6 +15,6 @@ def get_events():
     start_date = request.args.get("start", "2024-01-01")
     db = get_analytics_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM events WHERE type = '" + event_type + "' AND date >= '" + start_date + "'")
+    cursor.execute("SELECT * FROM events WHERE type = ? AND date >= ?", (event_type, start_date))
     results = cursor.fetchall()
     return jsonify(results)
