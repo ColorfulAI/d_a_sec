@@ -664,6 +664,25 @@ jobs:
           for k in stale_unfixable:
               unfixable.discard(k)
 
+          # Prune stale attempt keys superseded by fuzzy matches.
+          # When code edits shift line numbers, new keys are created but old ones linger.
+          # Keep only: (a) keys matching current alerts, (b) keys with no current successor.
+          current_exact_keys = set()
+          for a in new_alerts + pre_alerts:
+              current_exact_keys.add(f"{a['rule_id']}:{a['file']}:{a['start_line']}")
+          pruned = {}
+          for k, v in attempts.items():
+              if k in current_exact_keys:
+                  pruned[k] = v
+              else:
+                  parts = k.rsplit(':', 1)
+                  rf = parts[0] if len(parts) == 2 else k
+                  if rf not in current_rf_keys:
+                      pruned[k] = v
+                  else:
+                      print(f"  [PRUNE] {k} — superseded by current alert at new line")
+          attempts = pruned
+
           all_unfixable = list(unfixable)
           all_unfixable_alerts = [a for a in (new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable)
                                   if a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}") in unfixable]
@@ -1177,6 +1196,8 @@ jobs:
                   att = history["attempts"].get(key, rf_max_display.get(rf_key, 0))
                   if key in unfixable_set or rf_key in {u.rsplit(':', 1)[0] for u in unfixable_set}:
                       status = "Needs Manual Fix"
+                  elif att >= 2:
+                      status = "Final Attempt"
                   elif att > 0:
                       status = "In Progress"
                   else:
@@ -1219,6 +1240,8 @@ jobs:
                   att = history["attempts"].get(key, rf_max_display.get(rf_key, 0))
                   if key in unfixable_set or rf_key in {u.rsplit(':', 1)[0] for u in unfixable_set}:
                       status = "Needs Manual Fix"
+                  elif att >= 2:
+                      status = "Final Attempt"
                   elif att > 0:
                       status = "In Progress"
                   else:
@@ -1226,7 +1249,7 @@ jobs:
                   lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | **{status}** | {att}/2 |")
               lines.append("")
 
-          # Unfixable alerts section (critical for developer visibility)
+          # Unfixable alerts section(critical for developer visibility)
           if unfixable_alerts:
               lines.append("### Unfixable Alerts (REQUIRES MANUAL REVIEW)\n")
               lines.append("These alerts could not be automatically fixed after 2 attempts. A developer must review and fix these manually.\n")
