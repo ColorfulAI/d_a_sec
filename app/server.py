@@ -1,6 +1,6 @@
 import ast
 import operator
-from flask import Flask, request, redirect, render_template_string, jsonify
+from flask import Flask, Response, request, redirect, render_template_string, jsonify
 
 app = Flask(__name__)
 
@@ -65,7 +65,7 @@ def read_file():
     if path is None:
         return "File not allowed", 403
     with open(path) as f:
-        return f.read()
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render")
 def render_page():
