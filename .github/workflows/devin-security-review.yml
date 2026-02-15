@@ -451,45 +451,48 @@ jobs:
           ALERT_SUMMARY=$(cat /tmp/new_actionable_summary.txt)
           ALERT_DETAILS=$(cat /tmp/new_in_pr_actionable.json)
 
-          PROMPT="You are a security engineer fixing vulnerabilities found by CodeQL in PR #${PR_NUMBER} of repository ${REPO}.
+          PROMPT=$(cat <<PROMPT_EOF
+          You are a security engineer fixing vulnerabilities found by CodeQL in PR #${PR_NUMBER} of repository ${REPO}.
 
-These alerts were INTRODUCED by this PR on branch '${PR_BRANCH}':
+          These alerts were INTRODUCED by this PR on branch '${PR_BRANCH}':
 
-${ALERT_SUMMARY}
+          ${ALERT_SUMMARY}
 
-Detailed alert information:
-${ALERT_DETAILS}
+          Detailed alert information:
+          ${ALERT_DETAILS}
 
-Instructions:
-1. Clone the repository: https://github.com/${REPO}.git
-2. Checkout branch '${PR_BRANCH}'
-3. Pull latest changes: git pull --rebase origin '${PR_BRANCH}'
-4. For each alert, read the surrounding code and understand the full context
-5. Fix each alert ONE AT A TIME. For each alert:
-   a. Apply a minimal, focused fix following the codebase's existing conventions
-   b. VERIFY the fix locally using CodeQL CLI before committing:
-      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
-      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
-      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
-      - Check if the specific alert rule ID still appears in /tmp/results.sarif for the same file and line
-   c. If the alert STILL appears after your fix, revise the fix and re-run CodeQL (max 2 attempts)
-   d. If after 2 attempts the alert persists, SKIP this alert — do NOT commit the broken fix. Note it as unfixable.
-   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
-6. Conventions to follow:
-   - If the project uses an ORM, use parameterized queries via the ORM
-   - If there are existing sanitization utilities, reuse them
-   - Do not introduce new dependencies unless absolutely necessary
-7. If the repository has tests, run them to ensure no regressions
-8. Before pushing, run: git pull --rebase origin '${PR_BRANCH}'
-9. Push all commit(s) to branch '${PR_BRANCH}'
+          Instructions:
+          1. Clone the repository: https://github.com/${REPO}.git
+          2. Checkout branch '${PR_BRANCH}'
+          3. Pull latest changes: git pull --rebase origin '${PR_BRANCH}'
+          4. For each alert, read the surrounding code and understand the full context
+          5. Fix each alert ONE AT A TIME. For each alert:
+             a. Apply a minimal, focused fix following the codebase's existing conventions
+             b. VERIFY the fix locally using CodeQL CLI before committing:
+                - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
+                - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
+                - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
+                - Check if the specific alert rule ID still appears in /tmp/results.sarif for the same file and line
+             c. If the alert STILL appears after your fix, revise the fix and re-run CodeQL (max 2 attempts)
+             d. If after 2 attempts the alert persists, SKIP this alert — do NOT commit the broken fix. Note it as unfixable.
+             e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
+          6. Conventions to follow:
+             - If the project uses an ORM, use parameterized queries via the ORM
+             - If there are existing sanitization utilities, reuse them
+             - Do not introduce new dependencies unless absolutely necessary
+          7. If the repository has tests, run them to ensure no regressions
+          8. Before pushing, run: git pull --rebase origin '${PR_BRANCH}'
+          9. Push all commit(s) to branch '${PR_BRANCH}'
 
-IMPORTANT:
-- Each security issue MUST be a separate commit
-- Do NOT just suppress or ignore alerts — fix the root cause
-- Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
-- Keep fixes minimal and surgical — do not refactor unrelated code
-- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and move to the next one
-- At the end, report which alerts were fixed and which were unfixable"
+          IMPORTANT:
+          - Each security issue MUST be a separate commit
+          - Do NOT just suppress or ignore alerts — fix the root cause
+          - Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
+          - Keep fixes minimal and surgical — do not refactor unrelated code
+          - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and move to the next one
+          - At the end, report which alerts were fixed and which were unfixable
+          PROMPT_EOF
+          )
 
           PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
 
@@ -620,44 +623,40 @@ IMPORTANT:
               summary = "\n".join(summary_lines)
               details = json.dumps(batch, indent=2)
 
-              prompt = f"""You are a security engineer fixing pre-existing vulnerabilities found by CodeQL in repository {repo}.
-
-These alerts exist on the main branch and were detected during review of PR #{pr_number}:
-
-{summary}
-
-Detailed alert information:
-{details}
-
-Instructions:
-1. Clone the repository: https://github.com/{repo}.git
-2. Create and checkout branch '{fix_branch}' from main (or pull --rebase if it already exists)
-3. For each alert, read the surrounding code and understand the full context
-4. Fix each alert ONE AT A TIME. For each alert:
-   a. Apply a minimal, focused fix following the codebase's existing conventions
-   b. VERIFY the fix locally using CodeQL CLI before committing:
-      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
-      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
-      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
-      - Check if the specific alert rule ID still appears for the same file and line
-   c. If the alert STILL appears after your fix, revise and re-run CodeQL (max 2 attempts)
-   d. If after 2 attempts the alert persists, SKIP it — do NOT commit a broken fix. Note it as unfixable.
-   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
-5. Conventions to follow:
-   - If the project uses an ORM, use parameterized queries via the ORM
-   - If there are existing sanitization utilities, reuse them
-   - Do not introduce new dependencies unless absolutely necessary
-6. If the repository has tests, run them to ensure no regressions
-7. Before pushing, run: git pull --rebase origin '{fix_branch}' (handle conflicts if any)
-8. Push all commit(s) to branch '{fix_branch}'
-
-IMPORTANT:
-- Each security issue MUST be a separate commit
-- Do NOT just suppress or ignore alerts — fix the root cause
-- Do NOT create a new PR — just push to branch '{fix_branch}'
-- Keep fixes minimal and surgical — do not refactor unrelated code
-- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and continue
-- At the end, report which alerts were fixed and which were unfixable"""
+              prompt = (
+                  f"You are a security engineer fixing pre-existing vulnerabilities found by CodeQL in repository {repo}.\n\n"
+                  f"These alerts exist on the main branch and were detected during review of PR #{pr_number}:\n\n"
+                  f"{summary}\n\n"
+                  f"Detailed alert information:\n{details}\n\n"
+                  "Instructions:\n"
+                  f"1. Clone the repository: https://github.com/{repo}.git\n"
+                  f"2. Create and checkout branch '{fix_branch}' from main (or pull --rebase if it already exists)\n"
+                  "3. For each alert, read the surrounding code and understand the full context\n"
+                  "4. Fix each alert ONE AT A TIME. For each alert:\n"
+                  "   a. Apply a minimal, focused fix following the codebase's existing conventions\n"
+                  "   b. VERIFY the fix locally using CodeQL CLI before committing:\n"
+                  "      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip\n"
+                  "      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite\n"
+                  "      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download\n"
+                  "      - Check if the specific alert rule ID still appears for the same file and line\n"
+                  "   c. If the alert STILL appears after your fix, revise and re-run CodeQL (max 2 attempts)\n"
+                  "   d. If after 2 attempts the alert persists, SKIP it - do NOT commit a broken fix. Note it as unfixable.\n"
+                  "   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)\n"
+                  "5. Conventions to follow:\n"
+                  "   - If the project uses an ORM, use parameterized queries via the ORM\n"
+                  "   - If there are existing sanitization utilities, reuse them\n"
+                  "   - Do not introduce new dependencies unless absolutely necessary\n"
+                  "6. If the repository has tests, run them to ensure no regressions\n"
+                  f"7. Before pushing, run: git pull --rebase origin '{fix_branch}' (handle conflicts if any)\n"
+                  f"8. Push all commit(s) to branch '{fix_branch}'\n\n"
+                  "IMPORTANT:\n"
+                  "- Each security issue MUST be a separate commit\n"
+                  "- Do NOT just suppress or ignore alerts - fix the root cause\n"
+                  f"- Do NOT create a new PR - just push to branch '{fix_branch}'\n"
+                  "- Keep fixes minimal and surgical - do not refactor unrelated code\n"
+                  "- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and continue\n"
+                  "- At the end, report which alerts were fixed and which were unfixable"
+              )
 
               body_bytes = json.dumps({
                   "prompt": prompt,
