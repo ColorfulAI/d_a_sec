@@ -257,6 +257,30 @@ This document tracks all test scenarios, results, and regression checks for the 
 
 ---
 
+### T14: Pre-Existing Alert Sessions Don't Create Infinite PRs
+
+**Purpose**: Verify that Devin sessions created for pre-existing alerts push to a deterministic branch without creating new PRs, preventing an infinite PR creation cascade.
+
+**Steps**:
+1. Trigger workflow on a PR with pre-existing alerts (alerts that also exist on main)
+2. Verify Devin session prompt includes "Do NOT create a pull request"
+3. Verify the target branch name is deterministic: `devin/security-fixes-pr{N}`
+4. Verify `idempotent=true` is set on session creation
+5. Monitor: no new PRs created by the Devin session
+6. If a cascade starts, verify attempt tracking stops it after 2 attempts per alert
+
+**Expected**:
+- Devin pushes commits to `devin/security-fixes-pr{N}` (not a new timestamped branch)
+- No PR is created by the Devin session
+- Re-runs with the same prompt reuse the existing session (idempotent)
+- If the same alert is retried, attempt counter increments and stops at 2
+
+**Risk factors**:
+- Devin may ignore negative constraints ("do not create a PR") — monitor first few runs
+- Future mitigation: add branch pattern filter to workflow trigger to skip `devin/security-fixes-*` branches
+
+---
+
 ## Historical Test Runs
 
 ### Run 1 (2026-02-14 23:13 UTC) — Initial Pipeline
@@ -306,3 +330,4 @@ Before each release, verify:
 - [ ] T11: No merge commits from Devin fix pushes
 - [ ] T12: CodeQL config matches between CI and Devin prompt
 - [ ] T13: Batch processing continues past unfixable alerts
+- [ ] T14: Pre-existing alert sessions don't create infinite PRs

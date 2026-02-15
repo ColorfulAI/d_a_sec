@@ -519,6 +519,29 @@ Devin Sessions: [Session 1](https://...)
 - Rate limit handling: Exponential backoff prevents API failures
 - Subsequent runs process the next batch of alerts (the attempt tracker prevents re-processing already-handled alerts)
 
+### Edge Case 7: Infinite PR Creation from Pre-Existing Alert Batches
+
+**Problem**: When pre-existing alerts are detected, the workflow creates Devin sessions that push fixes to a dedicated branch (`devin/security-fixes-pr{N}`). If Devin autonomously creates a PR from that branch targeting `main`, CodeQL runs on the new PR, detects the same (or new) alerts, triggers another Devin Security Review run, which creates more sessions — potentially cascading into infinite PR creation.
+
+**Risk chain**:
+```
+PR #3 has pre-existing alerts
+  → Workflow creates Devin session → pushes to devin/security-fixes-pr3
+  → Devin autonomously opens PR #5 from that branch
+  → CodeQL runs on PR #5 → detects alerts
+  → Devin Security Review runs on PR #5 → creates sessions
+  → Sessions push to devin/security-fixes-pr5
+  → Devin opens PR #6 → ...
+```
+
+**Solution (4 layers)**:
+1. **Deterministic branch names**: Pre-existing alert fix branches use `devin/security-fixes-pr{N}` (where N is the original PR number). If a cascade were to start, subsequent runs would push to the same branch rather than creating new ones.
+2. **Explicit prompt instruction**: The Devin prompt for pre-existing alerts includes "Do NOT create a pull request. Only push commits to the specified branch." This prevents the cascade trigger.
+3. **Idempotent sessions**: `idempotent=true` on session creation means re-runs with the same prompt don't create duplicate sessions.
+4. **Attempt tracking**: Even if a cascade somehow starts, the per-alert attempt tracker (max 2) stops it after 2 fix attempts per alert.
+
+**Residual risk**: Devin may ignore the "do not create a PR" instruction, as AI agents don't always follow negative constraints perfectly. Monitoring is recommended for the first few production runs. A future improvement could add a branch name pattern filter to the workflow trigger (e.g., skip runs on branches matching `devin/security-fixes-*`).
+
 ---
 
 ## Secrets and Authentication
@@ -556,6 +579,7 @@ Devin Sessions: [Session 1](https://...)
 | Resource waste (8 sessions for 6 alerts) | SOLVED | Idempotent flag, ACU limits, attempt tracking prevents duplicates |
 | Unfixable alerts silently ignored | SOLVED | Prominent "REQUIRES MANUAL REVIEW" section + `devin:manual-review-needed` label |
 | Merge commits cluttering history | SOLVED | `git pull --rebase` instruction in Devin prompt |
+| Infinite PR creation from pre-existing alerts | MITIGATED | Deterministic branch names + explicit "do not create PR" prompt + idempotent sessions + attempt tracking |
 
 ### Planned Improvements
 
