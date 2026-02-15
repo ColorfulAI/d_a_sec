@@ -432,26 +432,26 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
 
-          COMMENTS=$(curl -s -L \
+          # Fetch comments and write to temp file (avoids shell string corruption)
+          curl -s -L \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            > /tmp/pr_comments.json
 
+          # Parse from file — safe regardless of comment content
           python3 << 'HISTORY_EOF'
           import json, os, re
 
-          comments = json.loads(open("/dev/stdin", "r").read() if False else os.environ.get("_COMMENTS", "[]"))
-          HISTORY_EOF
+          with open("/tmp/pr_comments.json") as f:
+              try:
+                  comments = json.load(f)
+                  if not isinstance(comments, list):
+                      comments = []
+              except Exception:
+                  comments = []
 
-          # Find our marker comment and extract attempt data
-          python3 -c "
-          import json, os, re, sys
-
-          comments_raw = '''$COMMENTS'''
-          try:
-              comments = json.loads(comments_raw) if comments_raw.strip() else []
-          except Exception:
-              comments = []
+          print(f"Loaded {len(comments)} comments from API")
 
           marker = '<!-- devin-security-review -->'
           comment_id = ''
@@ -462,14 +462,12 @@ jobs:
               body = c.get('body', '')
               if marker in body:
                   comment_id = str(c.get('id', ''))
-                  # Extract attempt counts: <!-- attempts:key1=N,key2=M -->
                   m = re.search(r'<!-- attempts:(.*?) -->', body)
                   if m:
                       for pair in m.group(1).split(','):
                           if '=' in pair:
                               k, v = pair.rsplit('=', 1)
                               attempts[k.strip()] = int(v.strip())
-                  # Extract unfixable list: <!-- unfixable:key1,key2 -->
                   m = re.search(r'<!-- unfixable:(.*?) -->', body)
                   if m:
                       for k in m.group(1).split(','):
@@ -484,14 +482,14 @@ jobs:
           with open('/tmp/attempt_history.json', 'w') as f:
               json.dump({'attempts': attempts, 'unfixable': list(unfixable), 'comment_id': comment_id}, f)
 
-          print(f'Found existing comment: {\"yes (id=\" + comment_id + \")\" if comment_id else \"no\"}')
+          print(f'Found existing comment: {"yes (id=" + comment_id + ")" if comment_id else "no"}')
           print(f'Attempt history: {len(attempts)} alerts tracked')
           print(f'Unfixable alerts: {len(unfixable)}')
           for k, v in attempts.items():
               print(f'  {k}: {v} attempt(s)')
           for k in unfixable:
               print(f'  [unfixable] {k}')
-          "
+          HISTORY_EOF
 
       # ------------------------------------------------------------------
       # STEP 5: Filter alerts — skip already-attempted (>=2) and unfixable.
@@ -1283,13 +1281,14 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
 
-          # Find existing comment
-          COMMENTS=$(curl -s -L \
+          # Find existing comment (write to file to avoid shell string corruption)
+          curl -s -L \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+            > /tmp/pr_comments_resolve.json
 
-          COMMENT_ID=$(echo "$COMMENTS" | jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))][0].id // empty')
+          COMMENT_ID=$(jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))][0].id // empty' /tmp/pr_comments_resolve.json)
 
           if [ -n "$COMMENT_ID" ]; then
             echo "Updating existing comment to show all-clear..."
