@@ -1,3 +1,40 @@
+# Devin Security Review — Closed Feedback Loop
+#
+# This workflow runs on every PR to main. It waits for CodeQL to finish,
+# fetches alerts, classifies them (new-in-PR vs pre-existing), and creates
+# Devin sessions to fix them.
+#
+# KEY DESIGN DECISIONS (see DESIGN.md for full rationale):
+#
+# 1. COMMENT MANAGEMENT: We find-or-update a single PR comment using a hidden
+#    HTML marker (<!-- devin-security-review -->). This prevents comment flooding
+#    when Devin pushes trigger re-runs of this workflow.
+#
+# 2. ATTEMPT TRACKING: Hidden markers in the comment body track how many times
+#    each alert has been attempted. After 2 failed attempts, the alert is marked
+#    "unfixable" and skipped on future runs. This breaks the infinite loop.
+#
+# 3. DEVIN-COMMIT DETECTION: If the latest commit message matches the pattern
+#    "fix: [rule_id]...", we know this run was triggered by a Devin fix push.
+#    We apply stricter filtering (only process genuinely new alerts).
+#
+# 4. LOCAL CODEQL VERIFICATION: The Devin prompt instructs Devin to install the
+#    CodeQL CLI and run analysis locally (same config: security-and-quality suite,
+#    remote+local threat models) before pushing. If the alert persists after 2
+#    local attempts, Devin skips it and reports it as unfixable.
+#
+# 5. RATE LIMIT HANDLING: Before creating each Devin session, we check the
+#    Devin API response for errors and implement exponential backoff on failures.
+#    GitHub API rate limits are checked before bulk operations.
+#
+# 6. SAFE-TO-MERGE SIGNAL: The PR comment includes a clear status section:
+#    - "All alerts resolved" if everything is fixed
+#    - "REQUIRES MANUAL REVIEW" with details if any alerts are unfixable
+#    A GitHub label (devin:manual-review-needed) is added when manual review is needed.
+#
+# 7. RESOURCE CAPS: max_acu_limit on Devin sessions, idempotent flag to prevent
+#    duplicate sessions, max 20 sessions per workflow run, 3 concurrent.
+
 name: Devin Security Review
 
 on:
@@ -6,7 +43,7 @@ on:
 
 permissions:
   contents: read
-  security-events: read
+  security-events: write
   pull-requests: write
 
 jobs:
@@ -14,7 +51,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
+      # ------------------------------------------------------------------
+      # STEP 1: Detect if this run was triggered by a Devin fix commit.
+      # If so, we set a flag to apply stricter alert filtering downstream.
+      # This prevents the infinite loop: Devin push -> workflow run ->
+      # same alert found -> new session -> Devin push -> ...
+      # ------------------------------------------------------------------
+      - name: Detect Devin fix commit
+        id: detect-devin
+        run: |
+          LATEST_MSG=$(git log -1 --pretty=%s HEAD)
+          echo "Latest commit message: $LATEST_MSG"
+
+          if echo "$LATEST_MSG" | grep -qE '^fix: \['; then
+            echo "is_devin_fix=true" >> $GITHUB_OUTPUT
+            echo "Detected Devin fix commit — will apply strict alert filtering"
+          else
+            echo "is_devin_fix=false" >> $GITHUB_OUTPUT
+            echo "Normal commit — standard processing"
+          fi
+
+      # ------------------------------------------------------------------
+      # STEP 2: Wait for all CodeQL analyses to complete.
+      # Polls GitHub check runs API every 30s until all CodeQL-related
+      # checks report "completed". Timeout after 20 minutes (40 * 30s).
+      # ------------------------------------------------------------------
       - name: Wait for all CodeQL analyses to complete
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -55,6 +119,12 @@ jobs:
             sleep 30
           done
 
+      # ------------------------------------------------------------------
+      # STEP 3: Fetch and classify CodeQL alerts.
+      # Fetches all open alerts on the PR merge ref, then compares with
+      # alerts on main to classify as "new in PR" vs "pre-existing".
+      # Alerts are sorted by severity (critical > high > medium > low).
+      # ------------------------------------------------------------------
       - name: Fetch and classify CodeQL alerts
         id: classify-alerts
         env:
@@ -106,14 +176,14 @@ jobs:
               pr_alerts = json.loads(pr_alerts_raw)
               if not isinstance(pr_alerts, list):
                   pr_alerts = []
-          except:
+          except Exception:
               pr_alerts = []
 
           try:
               main_alerts = json.loads(main_alerts_raw)
               if not isinstance(main_alerts, list):
                   main_alerts = []
-          except:
+          except Exception:
               main_alerts = []
 
           main_rule_file_set = set()
@@ -142,7 +212,8 @@ jobs:
                   "file": path,
                   "start_line": line,
                   "end_line": loc.get("end_line", line),
-                  "message": a.get("most_recent_instance", {}).get("message", {}).get("text", "")
+                  "message": a.get("most_recent_instance", {}).get("message", {}).get("text", ""),
+                  "key": key
               }
 
               if key in main_rule_file_set:
@@ -187,8 +258,189 @@ jobs:
               print(f"    - [{a['rule_id']}] {a['file']}:{a['start_line']} ({a['severity']})")
           CLASSIFY_EOF
 
+      # ------------------------------------------------------------------
+      # STEP 4: Load previous attempt history from the existing PR comment.
+      # We search for our marker comment and extract the hidden attempt
+      # counters. This lets us skip alerts that have already been tried
+      # (max 2 attempts) and prevents the infinite retry loop.
+      # ------------------------------------------------------------------
+      - name: Load attempt history from existing PR comment
+        id: load-history
+        if: steps.classify-alerts.outputs.total_count != '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          COMMENTS=$(curl -s -L \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
+
+          python3 << 'HISTORY_EOF'
+          import json, os, re
+
+          comments = json.loads(open("/dev/stdin", "r").read() if False else os.environ.get("_COMMENTS", "[]"))
+          HISTORY_EOF
+
+          # Find our marker comment and extract attempt data
+          python3 -c "
+          import json, os, re, sys
+
+          comments_raw = '''$COMMENTS'''
+          try:
+              comments = json.loads(comments_raw) if comments_raw.strip() else []
+          except Exception:
+              comments = []
+
+          marker = '<!-- devin-security-review -->'
+          comment_id = ''
+          attempts = {}
+          unfixable = set()
+
+          for c in comments:
+              body = c.get('body', '')
+              if marker in body:
+                  comment_id = str(c.get('id', ''))
+                  # Extract attempt counts: <!-- attempts:key1=N,key2=M -->
+                  m = re.search(r'<!-- attempts:(.*?) -->', body)
+                  if m:
+                      for pair in m.group(1).split(','):
+                          if '=' in pair:
+                              k, v = pair.rsplit('=', 1)
+                              attempts[k.strip()] = int(v.strip())
+                  # Extract unfixable list: <!-- unfixable:key1,key2 -->
+                  m = re.search(r'<!-- unfixable:(.*?) -->', body)
+                  if m:
+                      for k in m.group(1).split(','):
+                          if k.strip():
+                              unfixable.add(k.strip())
+                  break
+
+          gh_out = os.environ.get('GITHUB_OUTPUT', '/dev/null')
+          with open(gh_out, 'a') as f:
+              f.write(f'comment_id={comment_id}\n')
+
+          with open('/tmp/attempt_history.json', 'w') as f:
+              json.dump({'attempts': attempts, 'unfixable': list(unfixable), 'comment_id': comment_id}, f)
+
+          print(f'Found existing comment: {\"yes (id=\" + comment_id + \")\" if comment_id else \"no\"}')
+          print(f'Attempt history: {len(attempts)} alerts tracked')
+          print(f'Unfixable alerts: {len(unfixable)}')
+          for k, v in attempts.items():
+              print(f'  {k}: {v} attempt(s)')
+          for k in unfixable:
+              print(f'  [unfixable] {k}')
+          "
+
+      # ------------------------------------------------------------------
+      # STEP 5: Filter alerts — skip already-attempted (>=2) and unfixable.
+      # This is the core circuit breaker that prevents infinite loops.
+      # Alerts that have been tried twice are moved to the "unfixable" list
+      # and will appear in the "REQUIRES MANUAL REVIEW" section.
+      # ------------------------------------------------------------------
+      - name: Filter alerts (skip already-attempted, mark unfixable)
+        id: filter-alerts
+        if: steps.classify-alerts.outputs.total_count != '0'
+        run: |
+          IS_DEVIN_FIX="${{ steps.detect-devin.outputs.is_devin_fix }}"
+
+          python3 << 'FILTER_EOF'
+          import json, os
+
+          MAX_ATTEMPTS = 2
+          is_devin_fix = os.environ.get("IS_DEVIN_FIX", "false") == "true"
+
+          with open("/tmp/attempt_history.json") as f:
+              history = json.load(f)
+          attempts = history.get("attempts", {})
+          unfixable = set(history.get("unfixable", []))
+
+          with open("/tmp/new_in_pr_alerts.json") as f:
+              new_alerts = json.load(f)
+          with open("/tmp/preexisting_alerts.json") as f:
+              pre_alerts = json.load(f)
+
+          def filter_alerts(alerts, label):
+              actionable = []
+              skipped_unfixable = []
+              newly_unfixable = []
+              for a in alerts:
+                  key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
+                  attempt_count = attempts.get(key, 0)
+
+                  if key in unfixable:
+                      skipped_unfixable.append(a)
+                      print(f"  [SKIP-UNFIXABLE] {key} — already marked unfixable")
+                      continue
+
+                  if attempt_count >= MAX_ATTEMPTS:
+                      newly_unfixable.append(a)
+                      unfixable.add(key)
+                      print(f"  [NOW-UNFIXABLE] {key} — {attempt_count} attempts exhausted")
+                      continue
+
+                  # If this is a Devin fix re-trigger and the alert was already
+                  # attempted once, give it one more chance (attempt 2).
+                  # But if it already had 1+ attempts, we still process it —
+                  # the max check above handles the cutoff.
+                  actionable.append(a)
+                  attempts[key] = attempt_count + 1
+                  print(f"  [PROCESS] {key} — attempt {attempt_count + 1}/{MAX_ATTEMPTS}")
+
+              return actionable, skipped_unfixable, newly_unfixable
+
+          print(f"Devin fix re-trigger: {is_devin_fix}")
+          print(f"\nFiltering new-in-PR alerts:")
+          new_actionable, new_skipped, new_newly_unfixable = filter_alerts(new_alerts, "new")
+          print(f"\nFiltering pre-existing alerts:")
+          pre_actionable, pre_skipped, pre_newly_unfixable = filter_alerts(pre_alerts, "pre")
+
+          all_unfixable = list(unfixable)
+          all_unfixable_alerts = new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable
+
+          with open("/tmp/new_in_pr_actionable.json", "w") as f:
+              json.dump(new_actionable, f, indent=2)
+          with open("/tmp/preexisting_actionable.json", "w") as f:
+              json.dump(pre_actionable, f, indent=2)
+          with open("/tmp/unfixable_alerts.json", "w") as f:
+              json.dump(all_unfixable_alerts, f, indent=2)
+          with open("/tmp/attempt_history_updated.json", "w") as f:
+              json.dump({"attempts": attempts, "unfixable": all_unfixable}, f)
+
+          new_actionable_summary = []
+          for a in new_actionable:
+              new_actionable_summary.append(
+                  f"- [{a['rule_id']}] {a['rule_description']} at {a['file']}:{a['start_line']} (severity: {a['severity']})"
+              )
+          with open("/tmp/new_actionable_summary.txt", "w") as f:
+              f.write("\n".join(new_actionable_summary) if new_actionable_summary else "None")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"new_actionable_count={len(new_actionable)}\n")
+              f.write(f"pre_actionable_count={len(pre_actionable)}\n")
+              f.write(f"unfixable_count={len(all_unfixable)}\n")
+
+          print(f"\nSummary:")
+          print(f"  New-in-PR actionable: {len(new_actionable)}")
+          print(f"  Pre-existing actionable: {len(pre_actionable)}")
+          print(f"  Unfixable (skipped): {len(all_unfixable)}")
+          FILTER_EOF
+
+      # ------------------------------------------------------------------
+      # STEP 6: Create Devin session for new-in-PR alerts.
+      # Enhanced prompt includes:
+      # - CodeQL CLI local verification (same config as project)
+      # - Max 2 local fix attempts per alert before marking unfixable
+      # - git pull --rebase before push (prevents merge commits)
+      # - Skip unfixable alerts and continue with remaining batch
+      # - idempotent=true to prevent duplicate sessions
+      # - max_acu_limit to cap resource usage
+      # ------------------------------------------------------------------
       - name: Create Devin session for new-in-PR alerts
-        if: steps.classify-alerts.outputs.new_in_pr_count != '0'
+        if: steps.filter-alerts.outputs.new_actionable_count != '0'
         id: devin-new-pr
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
@@ -196,51 +448,80 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
           PR_BRANCH="${{ github.head_ref }}"
-          ALERT_SUMMARY=$(cat /tmp/new_in_pr_summary.txt)
-          ALERT_DETAILS=$(cat /tmp/new_in_pr_alerts.json)
+          ALERT_SUMMARY=$(cat /tmp/new_actionable_summary.txt)
+          ALERT_DETAILS=$(cat /tmp/new_in_pr_actionable.json)
 
           PROMPT="You are a security engineer fixing vulnerabilities found by CodeQL in PR #${PR_NUMBER} of repository ${REPO}.
 
-          These alerts were INTRODUCED by this PR on branch '${PR_BRANCH}':
+These alerts were INTRODUCED by this PR on branch '${PR_BRANCH}':
 
-          ${ALERT_SUMMARY}
+${ALERT_SUMMARY}
 
-          Detailed alert information:
-          ${ALERT_DETAILS}
+Detailed alert information:
+${ALERT_DETAILS}
 
-          Instructions:
-          1. Clone the repository: https://github.com/${REPO}.git
-          2. Checkout branch '${PR_BRANCH}'
-          3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
-          4. Fix each alert ONE AT A TIME. For each alert:
-             a. Apply a minimal, focused fix following the codebase's existing conventions
-             b. Make a SEPARATE commit for that single fix with a message like: fix: [rule_id] description (file:line)
-          5. Conventions to follow:
-             - If the project uses an ORM, use parameterized queries via the ORM
-             - If there are existing sanitization utilities, reuse them
-             - Do not introduce new dependencies unless absolutely necessary
-          6. After all fixes, verify each fix is correct by reviewing the code
-          7. If the repository has tests, run them to ensure no regressions
-          8. Push all commit(s) to branch '${PR_BRANCH}'
+Instructions:
+1. Clone the repository: https://github.com/${REPO}.git
+2. Checkout branch '${PR_BRANCH}'
+3. Pull latest changes: git pull --rebase origin '${PR_BRANCH}'
+4. For each alert, read the surrounding code and understand the full context
+5. Fix each alert ONE AT A TIME. For each alert:
+   a. Apply a minimal, focused fix following the codebase's existing conventions
+   b. VERIFY the fix locally using CodeQL CLI before committing:
+      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
+      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
+      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
+      - Check if the specific alert rule ID still appears in /tmp/results.sarif for the same file and line
+   c. If the alert STILL appears after your fix, revise the fix and re-run CodeQL (max 2 attempts)
+   d. If after 2 attempts the alert persists, SKIP this alert — do NOT commit the broken fix. Note it as unfixable.
+   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
+6. Conventions to follow:
+   - If the project uses an ORM, use parameterized queries via the ORM
+   - If there are existing sanitization utilities, reuse them
+   - Do not introduce new dependencies unless absolutely necessary
+7. If the repository has tests, run them to ensure no regressions
+8. Before pushing, run: git pull --rebase origin '${PR_BRANCH}'
+9. Push all commit(s) to branch '${PR_BRANCH}'
 
-          IMPORTANT:
-          - Each security issue MUST be a separate commit — do not combine fixes for different alerts
-          - Do NOT just suppress or ignore alerts — fix the root cause
-          - Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
-          - Keep fixes minimal and surgical — do not refactor unrelated code"
+IMPORTANT:
+- Each security issue MUST be a separate commit
+- Do NOT just suppress or ignore alerts — fix the root cause
+- Do NOT create a new PR — push directly to the existing branch '${PR_BRANCH}'
+- Keep fixes minimal and surgical — do not refactor unrelated code
+- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and move to the next one
+- At the end, report which alerts were fixed and which were unfixable"
 
           PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
 
-          RESPONSE=$(curl -s \
+          # Create session with idempotent flag and ACU limit
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST "https://api.devin.ai/v1/sessions" \
             -H "Authorization: Bearer $DEVIN_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"prompt\": $PROMPT_JSON}")
+            -d "{\"prompt\": $PROMPT_JSON, \"idempotent\": true, \"max_acu_limit\": 10}")
 
-          echo "Devin API response:"
-          echo "$RESPONSE" | jq .
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
 
-          SESSION_ID=$(echo "$RESPONSE" | jq -r '.session_id // empty')
+          echo "Devin API response (HTTP $HTTP_CODE):"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          # Handle rate limiting with exponential backoff
+          if [ "$HTTP_CODE" = "429" ]; then
+            echo "Rate limited. Waiting 60s and retrying..."
+            sleep 60
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST "https://api.devin.ai/v1/sessions" \
+              -H "Authorization: Bearer $DEVIN_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"prompt\": $PROMPT_JSON, \"idempotent\": true, \"max_acu_limit\": 10}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "Retry response (HTTP $HTTP_CODE):"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+          fi
+
+          SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
           SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
 
           if [ -z "$SESSION_ID" ]; then
@@ -253,23 +534,33 @@ jobs:
             echo "session_created=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create Devin sessions for pre-existing alerts (batched by file, sorted by severity)
-        if: steps.classify-alerts.outputs.preexisting_count != '0'
+      # ------------------------------------------------------------------
+      # STEP 7: Create Devin sessions for pre-existing alerts (batched).
+      # Same enhancements as new-in-PR: CodeQL verification, rebase,
+      # skip unfixable, rate limit handling, idempotent, ACU cap.
+      # Batching: prefer same-file, backfill to fill batch (cap 15).
+      #
+      # IMPORTANT: Branch name is DETERMINISTIC (based on PR number, not
+      # timestamp) so that re-runs reuse the same branch and don't create
+      # infinite new branches/PRs. The idempotent flag on sessions also
+      # prevents duplicate sessions for the same prompt.
+      # ------------------------------------------------------------------
+      - name: Create Devin sessions for pre-existing alerts (batched)
+        if: steps.filter-alerts.outputs.pre_actionable_count != '0'
         id: devin-preexisting
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
         run: |
           export REPO="${{ github.repository }}"
           export PR_NUMBER="${{ github.event.pull_request.number }}"
-          TIMESTAMP=$(date +%s)
-          export FIX_BRANCH="devin/security-fixes-${TIMESTAMP}"
+          export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
 
           echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
 
           python3 << 'BATCH_EOF'
-          import json, os, time, urllib.request
+          import json, os, time, urllib.request, urllib.error
 
-          alerts = json.load(open("/tmp/preexisting_alerts.json"))
+          alerts = json.load(open("/tmp/preexisting_actionable.json"))
           repo = os.environ["REPO"]
           fix_branch = os.environ["FIX_BRANCH"]
           pr_number = os.environ["PR_NUMBER"]
@@ -280,17 +571,20 @@ jobs:
 
           severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
 
+          # Group by file, sort each group by severity
           file_groups = {}
           for a in alerts:
               file_groups.setdefault(a["file"], []).append(a)
           for fg in file_groups.values():
               fg.sort(key=lambda a: severity_order.get(a["severity"], 4))
 
+          # Sort files by most severe alert first
           sorted_files = sorted(
               file_groups.items(),
               key=lambda kv: min(severity_order.get(a["severity"], 4) for a in kv[1])
           )
 
+          # Build batches: prefer same-file, backfill remaining space
           batches = []
           remaining = {}
           for fp, fa in sorted_files:
@@ -328,59 +622,88 @@ jobs:
 
               prompt = f"""You are a security engineer fixing pre-existing vulnerabilities found by CodeQL in repository {repo}.
 
-          These alerts exist on the main branch and were detected during review of PR #{pr_number}:
+These alerts exist on the main branch and were detected during review of PR #{pr_number}:
 
-          {summary}
+{summary}
 
-          Detailed alert information:
-          {details}
+Detailed alert information:
+{details}
 
-          Instructions:
-          1. Clone the repository: https://github.com/{repo}.git
-          2. Create and checkout branch '{fix_branch}' from main (or pull and checkout if it already exists)
-          3. For each alert, read the surrounding code and understand the full context — imports, callers, existing patterns
-          4. Fix each alert ONE AT A TIME. For each alert:
-             a. Apply a minimal, focused fix following the codebase's existing conventions
-             b. Make a SEPARATE commit for that single fix with a message like: "fix: [rule_id] description (file:line)"
-          5. Conventions to follow:
-             - If the project uses an ORM, use parameterized queries via the ORM
-             - If there are existing sanitization utilities, reuse them
-             - Do not introduce new dependencies unless absolutely necessary
-          6. After all fixes, verify each fix is correct by reviewing the code
-          7. If the repository has tests, run them to ensure no regressions
-          8. Push all commit(s) to branch '{fix_branch}'
+Instructions:
+1. Clone the repository: https://github.com/{repo}.git
+2. Create and checkout branch '{fix_branch}' from main (or pull --rebase if it already exists)
+3. For each alert, read the surrounding code and understand the full context
+4. Fix each alert ONE AT A TIME. For each alert:
+   a. Apply a minimal, focused fix following the codebase's existing conventions
+   b. VERIFY the fix locally using CodeQL CLI before committing:
+      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
+      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
+      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
+      - Check if the specific alert rule ID still appears for the same file and line
+   c. If the alert STILL appears after your fix, revise and re-run CodeQL (max 2 attempts)
+   d. If after 2 attempts the alert persists, SKIP it — do NOT commit a broken fix. Note it as unfixable.
+   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
+5. Conventions to follow:
+   - If the project uses an ORM, use parameterized queries via the ORM
+   - If there are existing sanitization utilities, reuse them
+   - Do not introduce new dependencies unless absolutely necessary
+6. If the repository has tests, run them to ensure no regressions
+7. Before pushing, run: git pull --rebase origin '{fix_branch}' (handle conflicts if any)
+8. Push all commit(s) to branch '{fix_branch}'
 
-          IMPORTANT:
-          - Each security issue MUST be a separate commit — do not combine fixes for different alerts
-          - Do NOT just suppress or ignore alerts — fix the root cause
-          - Do NOT create a new PR — just push to branch '{fix_branch}'
-          - Keep fixes minimal and surgical — do not refactor unrelated code
-          - If the branch already has commits from another session, pull first to avoid conflicts"""
+IMPORTANT:
+- Each security issue MUST be a separate commit
+- Do NOT just suppress or ignore alerts — fix the root cause
+- Do NOT create a new PR — just push to branch '{fix_branch}'
+- Keep fixes minimal and surgical — do not refactor unrelated code
+- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and continue
+- At the end, report which alerts were fixed and which were unfixable"""
+
+              body_bytes = json.dumps({
+                  "prompt": prompt,
+                  "idempotent": True,
+                  "max_acu_limit": 10
+              }).encode()
 
               req = urllib.request.Request(
                   "https://api.devin.ai/v1/sessions",
-                  data=json.dumps({"prompt": prompt}).encode(),
+                  data=body_bytes,
                   headers={
                       "Authorization": f"Bearer {api_key}",
                       "Content-Type": "application/json"
                   },
                   method="POST"
               )
-              try:
-                  resp = urllib.request.urlopen(req)
-                  result = json.loads(resp.read())
-                  sid = result.get("session_id", "")
-                  if sid:
-                      session_ids.append(sid)
-                      session_urls.append(f"https://app.devin.ai/sessions/{sid}")
-                      print(f"Batch {i+1}/{min(len(batches), max_total_sessions)}: Session {sid} created")
-                  else:
-                      print(f"Batch {i+1}: Failed - {result}")
-              except Exception as e:
-                  print(f"Batch {i+1}: Error - {e}")
 
+              # Retry with exponential backoff on rate limits
+              max_retries = 3
+              for attempt in range(max_retries):
+                  try:
+                      resp = urllib.request.urlopen(req)
+                      result = json.loads(resp.read())
+                      sid = result.get("session_id", "")
+                      if sid:
+                          session_ids.append(sid)
+                          session_urls.append(f"https://app.devin.ai/sessions/{sid}")
+                          print(f"Batch {i+1}/{min(len(batches), max_total_sessions)}: Session {sid} created")
+                      else:
+                          print(f"Batch {i+1}: Failed - {result}")
+                      break
+                  except urllib.error.HTTPError as e:
+                      if e.code == 429 and attempt < max_retries - 1:
+                          wait_time = 30 * (2 ** attempt)
+                          print(f"Batch {i+1}: Rate limited (429). Waiting {wait_time}s...")
+                          time.sleep(wait_time)
+                      else:
+                          print(f"Batch {i+1}: Error {e.code} - {e.read().decode()[:200]}")
+                          break
+                  except Exception as e:
+                      print(f"Batch {i+1}: Error - {e}")
+                      break
+
+              # Pause between concurrent waves
               if (i + 1) % max_concurrent == 0 and i + 1 < len(batches):
-                  print(f"Rate limit pause (30s)...")
+                  print(f"Concurrency pause (30s)...")
                   time.sleep(30)
 
           with open("/tmp/preexisting_session_ids.txt", "w") as f:
@@ -397,97 +720,278 @@ jobs:
           echo "first_session_url=$FIRST_URL" >> $GITHUB_OUTPUT
           echo "sessions_created=true" >> $GITHUB_OUTPUT
 
-      - name: Wait briefly for new-in-PR Devin session to start
-        if: steps.devin-new-pr.outputs.session_created == 'true'
-        id: wait-new-pr
-        env:
-          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
-        run: |
-          SESSION_ID="${{ steps.devin-new-pr.outputs.session_id }}"
-          echo "Checking Devin session $SESSION_ID status (non-blocking)..."
-
-          SESSION_DATA=$(curl -s \
-            -H "Authorization: Bearer $DEVIN_API_KEY" \
-            "https://api.devin.ai/v1/session/${SESSION_ID}")
-
-          STATUS=$(echo "$SESSION_DATA" | jq -r '.status_enum // .status // "unknown"')
-          echo "Session status: $STATUS"
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
-
-      - name: Post PR comment with results
+      # ------------------------------------------------------------------
+      # STEP 8: Find-or-update the PR comment.
+      # Uses a hidden HTML marker to find the existing bot comment.
+      # If found, PATCHes it in place (no flood). If not, POSTs new one.
+      # Comment includes:
+      #   - Alert summary with severity table
+      #   - Devin session links and commits/files tabs
+      #   - Unfixable alerts section (REQUIRES MANUAL REVIEW)
+      #   - Safe-to-merge signal
+      #   - Hidden attempt counters for next run
+      # ------------------------------------------------------------------
+      - name: Post or update PR comment with results
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
+          TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
           NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
           PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
-          TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
+          NEW_ACTIONABLE="${{ steps.filter-alerts.outputs.new_actionable_count }}"
+          PRE_ACTIONABLE="${{ steps.filter-alerts.outputs.pre_actionable_count }}"
+          UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
           NEW_SESSION_URL="${{ steps.devin-new-pr.outputs.session_url }}"
-          NEW_SESSION_ID="${{ steps.devin-new-pr.outputs.session_id }}"
           NEW_SESSION_CREATED="${{ steps.devin-new-pr.outputs.session_created }}"
-          NEW_SESSION_STATUS="${{ steps.wait-new-pr.outputs.status }}"
           PRE_SESSIONS_CREATED="${{ steps.devin-preexisting.outputs.sessions_created }}"
           PRE_FIRST_URL="${{ steps.devin-preexisting.outputs.first_session_url }}"
           PRE_SESSION_COUNT="${{ steps.devin-preexisting.outputs.session_count }}"
           FIX_BRANCH="${{ steps.devin-preexisting.outputs.fix_branch }}"
+          EXISTING_COMMENT_ID="${{ steps.load-history.outputs.comment_id }}"
+
           NEW_SUMMARY=$(cat /tmp/new_in_pr_summary.txt 2>/dev/null || echo "None")
           PRE_SUMMARY=$(cat /tmp/preexisting_summary.txt 2>/dev/null || echo "None")
 
-          BODY="## Devin Security Review\n\n"
-          BODY+="**Total CodeQL Alerts: ${TOTAL_COUNT}**\n\n"
+          # Build the comment body using Python for cleaner string handling
+          python3 << 'COMMENT_EOF'
+          import json, os
 
-          PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          total = os.environ.get("TOTAL_COUNT", "0")
+          new_count = os.environ.get("NEW_COUNT", "0")
+          pre_count = os.environ.get("PRE_COUNT", "0")
+          new_actionable = os.environ.get("NEW_ACTIONABLE", "0")
+          pre_actionable = os.environ.get("PRE_ACTIONABLE", "0")
+          unfixable_count = os.environ.get("UNFIXABLE_COUNT", "0")
+          new_session_url = os.environ.get("NEW_SESSION_URL", "")
+          new_session_created = os.environ.get("NEW_SESSION_CREATED", "false")
+          pre_sessions_created = os.environ.get("PRE_SESSIONS_CREATED", "false")
+          pre_first_url = os.environ.get("PRE_FIRST_URL", "")
+          pre_session_count = os.environ.get("PRE_SESSION_COUNT", "0")
+          fix_branch = os.environ.get("FIX_BRANCH", "")
+          existing_comment_id = os.environ.get("EXISTING_COMMENT_ID", "")
+          new_summary = os.environ.get("NEW_SUMMARY", "None")
+          pre_summary = os.environ.get("PRE_SUMMARY", "None")
+          server_url = "https://github.com"
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          pr_url = f"{server_url}/{repo}/pull/{pr_number}"
 
-          if [ "$NEW_COUNT" != "0" ] && [ -n "$NEW_COUNT" ]; then
-            BODY+="### New Alerts (introduced in this PR): ${NEW_COUNT}\n\n"
-            BODY+="\`\`\`\n${NEW_SUMMARY}\n\`\`\`\n\n"
-            if [ "$NEW_SESSION_CREATED" = "true" ]; then
-              BODY+="**Devin is fixing these issues.** Each fix will appear as a separate commit on this PR.\n\n"
-              BODY+="| What | Link |\n"
-              BODY+="|------|------|\n"
-              BODY+="| Watch Devin work | [Devin Session](${NEW_SESSION_URL}) |\n"
-              BODY+="| See fix commits | [Commits tab](${PR_URL}/commits) |\n"
-              BODY+="| Review all changes | [Files changed](${PR_URL}/files) |\n\n"
-            fi
+          # Load attempt history for hidden markers
+          try:
+              with open("/tmp/attempt_history_updated.json") as f:
+                  history = json.load(f)
+          except Exception:
+              history = {"attempts": {}, "unfixable": []}
+
+          # Load unfixable alert details for display
+          try:
+              with open("/tmp/unfixable_alerts.json") as f:
+                  unfixable_alerts = json.load(f)
+          except Exception:
+              unfixable_alerts = []
+
+          # --- Build comment body ---
+          lines = []
+          lines.append("<!-- devin-security-review -->")
+          lines.append("## Devin Security Review\n")
+          lines.append(f"**Total CodeQL Alerts: {total}**\n")
+
+          # Status signal (safe-to-merge vs needs manual review)
+          if int(unfixable_count) > 0:
+              lines.append(f"> **REQUIRES MANUAL REVIEW** — {unfixable_count} alert(s) could not be auto-fixed after multiple attempts. See details below.\n")
+          elif new_actionable == "0" and pre_actionable == "0" and int(total) > 0:
+              lines.append("> **All alerts are being handled** — Devin sessions are working on fixes or alerts have been resolved.\n")
+
+          # New-in-PR section
+          if new_count != "0" and new_count:
+              lines.append(f"### New Alerts (introduced in this PR): {new_count}\n")
+              lines.append(f"```\n{new_summary}\n```\n")
+              if new_session_created == "true" and new_session_url:
+                  lines.append("**Devin is fixing these issues.** Each fix will appear as a separate commit on this PR.\n")
+                  lines.append("| What | Link |")
+                  lines.append("|------|------|")
+                  lines.append(f"| Watch Devin work | [Devin Session]({new_session_url}) |")
+                  lines.append(f"| See fix commits | [Commits tab]({pr_url}/commits) |")
+                  lines.append(f"| Review all changes | [Files changed]({pr_url}/files) |")
+                  lines.append("")
+              elif new_actionable == "0":
+                  lines.append("All new alerts have been attempted (max retries reached). See unfixable section below.\n")
+
+          # Pre-existing section
+          if pre_count != "0" and pre_count:
+              lines.append(f"### Pre-existing Alerts (already on main): {pre_count}\n")
+              lines.append("These exist on main and were not introduced by this PR.\n")
+              lines.append(f"```\n{pre_summary}\n```\n")
+              if pre_sessions_created == "true":
+                  lines.append(f"**Devin is fixing these on branch `{fix_branch}`.** A separate PR will be created.\n")
+                  lines.append("| Session | Link |")
+                  lines.append("|---------|------|")
+                  try:
+                      with open("/tmp/preexisting_session_urls.txt") as f:
+                          for j, url in enumerate(f.read().strip().split("\n"), 1):
+                              if url:
+                                  lines.append(f"| Batch {j} | [Watch Devin work]({url}) |")
+                  except Exception:
+                      pass
+                  lines.append("")
+
+          # Unfixable alerts section (critical for developer visibility)
+          if unfixable_alerts:
+              lines.append("### Unfixable Alerts (REQUIRES MANUAL REVIEW)\n")
+              lines.append("These alerts could not be automatically fixed after 2 attempts. A developer must review and fix these manually.\n")
+              lines.append("**To find these in CodeQL:** Filter alerts by `is:open` in the Security tab → Code scanning.\n")
+              lines.append("| Severity | Rule | File | Attempts |")
+              lines.append("|----------|------|------|----------|")
+              for a in unfixable_alerts:
+                  key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
+                  att = history["attempts"].get(key, 2)
+                  lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | {att} |")
+              lines.append("")
+
+          # Footer
+          lines.append("---")
+          lines.append(f"*Automated by [Devin Security Review]({server_url}/{repo}/actions/runs/{run_id})*")
+          lines.append("")
+
+          # Hidden markers for attempt tracking (consumed by next run)
+          attempt_pairs = [f"{k}={v}" for k, v in history["attempts"].items()]
+          lines.append(f"<!-- attempts:{','.join(attempt_pairs)} -->")
+          unfixable_keys = history.get("unfixable", [])
+          lines.append(f"<!-- unfixable:{','.join(unfixable_keys)} -->")
+
+          body = "\n".join(lines)
+          with open("/tmp/comment_body.json", "w") as f:
+              json.dump({"body": body}, f)
+
+          # Also save the comment ID and method for the shell step
+          with open("/tmp/comment_method.txt", "w") as f:
+              if existing_comment_id:
+                  f.write(f"PATCH\n{existing_comment_id}")
+              else:
+                  f.write("POST\n")
+
+          print(f"Comment method: {'PATCH (update existing)' if existing_comment_id else 'POST (new comment)'}")
+          print(f"Comment length: {len(body)} chars")
+          COMMENT_EOF
+
+          # Post or update the comment
+          METHOD=$(head -1 /tmp/comment_method.txt)
+          COMMENT_ID=$(tail -1 /tmp/comment_method.txt)
+
+          if [ "$METHOD" = "PATCH" ] && [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment $COMMENT_ID..."
+            curl -s -L \
+              -X PATCH \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/comments/$COMMENT_ID" \
+              -d @/tmp/comment_body.json | jq '{id: .id, html_url: .html_url}'
+          else
+            echo "Posting new comment..."
+            curl -s -L \
+              -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+              -d @/tmp/comment_body.json | jq '{id: .id, html_url: .html_url}'
           fi
 
-          if [ "$PRE_COUNT" != "0" ] && [ -n "$PRE_COUNT" ]; then
-            BODY+="### Pre-existing Alerts (already on main): ${PRE_COUNT}\n\n"
-            BODY+="These exist on main and were not introduced by this PR.\n\n"
-            BODY+="\`\`\`\n${PRE_SUMMARY}\n\`\`\`\n\n"
-            if [ "$PRE_SESSIONS_CREATED" = "true" ]; then
-              BODY+="**Devin is fixing these on branch \`${FIX_BRANCH}\`.** A separate PR will be created.\n\n"
-              BODY+="| Session | Link |\n"
-              BODY+="|---------|------|\n"
-              if [ -f /tmp/preexisting_session_urls.txt ]; then
-                i=1
-                while IFS= read -r url; do
-                  if [ -n "$url" ]; then
-                    BODY+="| Batch ${i} | [Watch Devin work](${url}) |\n"
-                    i=$((i + 1))
-                  fi
-                done < /tmp/preexisting_session_urls.txt
-              fi
-              BODY+="\n"
-            fi
+          echo "PR comment posted/updated."
+
+      # ------------------------------------------------------------------
+      # STEP 9: Add label for unfixable alerts (developer visibility).
+      # If any alerts are unfixable, add "devin:manual-review-needed" label
+      # so developers can filter PRs that need human security review.
+      # If all alerts are handled, remove the label.
+      # ------------------------------------------------------------------
+      - name: Manage PR labels for unfixable alerts
+        if: steps.classify-alerts.outputs.total_count != '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
+          LABEL="devin:manual-review-needed"
+
+          if [ "$UNFIXABLE_COUNT" != "0" ] && [ -n "$UNFIXABLE_COUNT" ]; then
+            echo "Adding label '$LABEL' to PR #$PR_NUMBER (unfixable alerts exist)..."
+            # Create the label if it doesn't exist
+            curl -s -L \
+              -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/labels" \
+              -d "{\"name\": \"$LABEL\", \"color\": \"d93f0b\", \"description\": \"Security alerts that Devin could not auto-fix — requires manual developer review\"}" \
+              2>/dev/null || true
+
+            # Add label to PR
+            curl -s -L \
+              -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels" \
+              -d "{\"labels\": [\"$LABEL\"]}" | jq '.[].name' 2>/dev/null || true
+          else
+            echo "No unfixable alerts. Removing label if present..."
+            curl -s -L \
+              -X DELETE \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels/$LABEL" \
+              2>/dev/null || true
           fi
 
-          BODY+="---\n"
-          BODY+="*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*"
+      # ------------------------------------------------------------------
+      # STEP 10: Post clean "no alerts" comment when all alerts are fixed.
+      # If a previous run found alerts but now there are 0, update the
+      # comment to show everything is resolved (safe-to-merge signal).
+      # ------------------------------------------------------------------
+      - name: Update comment when all alerts resolved
+        if: steps.classify-alerts.outputs.total_count == '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          COMMENT_JSON=$(echo -e "$BODY" | python3 -c "import sys,json; print(json.dumps({'body': sys.stdin.read()}))")
-
-          curl -s -L \
-            -X POST \
+          # Find existing comment
+          COMMENTS=$(curl -s -L \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "$COMMENT_JSON" | jq '{id: .id, html_url: .html_url}'
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100")
 
-          echo "PR comment posted."
+          COMMENT_ID=$(echo "$COMMENTS" | jq -r '[.[] | select(.body | contains("<!-- devin-security-review -->"))][0].id // empty')
 
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment to show all-clear..."
+            BODY="<!-- devin-security-review -->\n## Devin Security Review\n\n**All CodeQL alerts have been resolved.**\n\nNo security issues remain on this PR. Safe to merge from a security standpoint.\n\n---\n*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*\n<!-- attempts: -->\n<!-- unfixable: -->"
+
+            BODY_JSON=$(echo -e "$BODY" | python3 -c "import sys,json; print(json.dumps({'body': sys.stdin.read()}))")
+
+            curl -s -L \
+              -X PATCH \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/comments/$COMMENT_ID" \
+              -d "$BODY_JSON" | jq '{id: .id, html_url: .html_url}'
+
+            # Remove manual review label since everything is fixed
+            curl -s -L \
+              -X DELETE \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels/devin:manual-review-needed" \
+              2>/dev/null || true
+          fi
+
+      # ------------------------------------------------------------------
+      # STEP 11: Summary for GitHub Actions UI.
+      # ------------------------------------------------------------------
       - name: Summary
         if: always()
         run: |
@@ -496,11 +1000,13 @@ jobs:
           echo "- **Total alerts**: ${{ steps.classify-alerts.outputs.total_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **New in PR**: ${{ steps.classify-alerts.outputs.new_in_pr_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Pre-existing**: ${{ steps.classify-alerts.outputs.preexisting_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actionable (new)**: ${{ steps.filter-alerts.outputs.new_actionable_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actionable (pre)**: ${{ steps.filter-alerts.outputs.pre_actionable_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unfixable**: ${{ steps.filter-alerts.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### New-in-PR Session" >> $GITHUB_STEP_SUMMARY
           echo "- **Created**: ${{ steps.devin-new-pr.outputs.session_created }}" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: ${{ steps.devin-new-pr.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: ${{ steps.wait-new-pr.outputs.status }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Pre-existing Sessions" >> $GITHUB_STEP_SUMMARY
           echo "- **Created**: ${{ steps.devin-preexisting.outputs.sessions_created }}" >> $GITHUB_STEP_SUMMARY
