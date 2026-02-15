@@ -75,10 +75,18 @@ def read_file():
         content = f.read()
     return jsonify(content=content)
 
+ALLOWED_TEMPLATES = {
+    "hello": "<h1>Hello</h1>",
+    "welcome": "<h1>Welcome, {{ name }}!</h1>",
+    "goodbye": "<h1>Goodbye!</h1>",
+}
+
 @app.route("/render")
 def render_page():
-    template = request.args.get("template", "<h1>Hello</h1>")
-    return render_template_string(template)
+    template_key = request.args.get("template", "hello")
+    name = request.args.get("name", "Guest")
+    template = ALLOWED_TEMPLATES.get(template_key, ALLOWED_TEMPLATES["hello"])
+    return render_template_string(template, name=name)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
