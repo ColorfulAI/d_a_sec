@@ -19,10 +19,18 @@ def search():
     results = cursor.fetchall()
     return {"results": results}
 
+ALLOWED_COMMANDS = {
+    "hello": ["echo", "hello"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 @app.route("/run")
 def run_command():
-    cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
+    cmd = request.args.get("cmd", "hello")
+    if cmd not in ALLOWED_COMMANDS:
+        return {"error": "command not allowed"}, 400
+    output = subprocess.check_output(ALLOWED_COMMANDS[cmd])
     return {"output": output.decode()}
 
 @app.route("/redirect")
