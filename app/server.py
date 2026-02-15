@@ -12,9 +12,9 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
+    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
     results = cursor.fetchall()
-    return jsonify(results)
+    return str(results)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
