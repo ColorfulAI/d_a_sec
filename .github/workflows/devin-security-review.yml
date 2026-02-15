@@ -1134,7 +1134,7 @@ jobs:
               lines.append("<details>")
               lines.append("<summary><strong>Debug Log</strong> (workflow internals)</summary>")
               lines.append("")
-              lines.append(f"**Timestamp**: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+              lines.append(f"**Timestamp**: {datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
               lines.append(f"**Workflow Run**: [{run_id}]({server_url}/{repo}/actions/runs/{run_id})")
               lines.append(f"**Devin-commit detected**: `{is_devin_fix}`")
               lines.append(f"**Devin API available**: `{devin_available}`")
