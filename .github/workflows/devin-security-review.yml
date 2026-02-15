@@ -389,6 +389,9 @@ jobs:
 
           new_in_pr = []
           preexisting = []
+          skipped_non_security = []
+
+          SECURITY_SEVERITIES = {"critical", "high", "medium", "low"}
 
           for a in pr_alerts:
               rule_id = a.get("rule", {}).get("id", "")
@@ -396,12 +399,17 @@ jobs:
               path = loc.get("path", "")
               line = loc.get("start_line", 0)
               key = f"{rule_id}:{path}:{line}"
+              severity = a.get("rule", {}).get("security_severity_level") or ""
+
+              if severity.lower() not in SECURITY_SEVERITIES:
+                  skipped_non_security.append({"rule_id": rule_id, "file": path, "line": line, "severity": severity or "none"})
+                  continue
 
               alert_info = {
                   "number": a.get("number"),
                   "rule_id": rule_id,
                   "rule_description": a.get("rule", {}).get("description", rule_id),
-                  "severity": a.get("rule", {}).get("security_severity_level", "unknown"),
+                  "severity": severity,
                   "file": path,
                   "start_line": line,
                   "end_line": loc.get("end_line", line),
@@ -449,6 +457,10 @@ jobs:
           print(f"  Pre-existing: {len(preexisting)}")
           for a in preexisting:
               print(f"    - [{a['rule_id']}] {a['file']}:{a['start_line']} ({a['severity']})")
+          if skipped_non_security:
+              print(f"  Skipped (non-security): {len(skipped_non_security)}")
+              for s in skipped_non_security:
+                  print(f"    - [{s['rule_id']}] {s['file']}:{s['line']} (severity={s['severity']}, not a security alert)")
           CLASSIFY_EOF
 
       # ------------------------------------------------------------------
