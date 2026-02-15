@@ -457,6 +457,9 @@ jobs:
           print(f"  Pre-existing: {len(preexisting)}")
           for a in preexisting:
               print(f"    - [{a['rule_id']}] {a['file']}:{a['start_line']} ({a['severity']})")
+          with open("/tmp/skipped_non_security.json", "w") as f:
+              json.dump(skipped_non_security, f, indent=2)
+
           if skipped_non_security:
               print(f"  Skipped (non-security): {len(skipped_non_security)}")
               for s in skipped_non_security:
@@ -1087,9 +1090,20 @@ jobs:
 
           # --- Build comment body ---
           lines = []
+          try:
+              with open("/tmp/skipped_non_security.json") as f:
+                  skipped_non_security = json.load(f)
+          except Exception:
+              skipped_non_security = []
+
           lines.append("<!-- devin-security-review -->")
           lines.append("## Devin Security Review\n")
-          lines.append(f"**Total CodeQL Alerts: {total}**\n")
+          fixed_count = len(fixed_keys)
+          if fixed_count > 0:
+              lines.append(f"**{int(total) + fixed_count} alerts detected | {fixed_count} fixed | {total} remaining**\n")
+          else:
+              lines.append(f"**{total} security alert(s) detected**\n")
+          lines.append(f"*Last updated: {datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M UTC')}*\n")
 
           # Degraded mode banner (Devin API unavailable)
           if devin_available != "true":
@@ -1230,7 +1244,7 @@ jobs:
                       lines.append("|-----------|----------|--------|")
                       uf_keys = set(df.get("unfixable_keys", []))
                       for k, v in ah.items():
-                          status = "unfixable" if k in uf_keys else ("retry pending" if v < 2 else "max reached")
+                          status = "unfixable" if k in uf_keys else ("dispatched" if v < 2 else "max reached")
                           lines.append(f"| `{k}` | {v}/2 | {status} |")
               except Exception:
                   lines.append("- Filter data not available")
@@ -1255,6 +1269,13 @@ jobs:
               lines.append("")
               lines.append("</details>")
               lines.append("")
+
+          if skipped_non_security:
+              lines.append(f"<details>\n<summary>{len(skipped_non_security)} non-security code quality note(s) ignored</summary>\n")
+              lines.append("These CodeQL findings are code quality notes (not security vulnerabilities) and were not dispatched to Devin:\n")
+              for s in skipped_non_security:
+                  lines.append(f"- `{s['rule_id']}` at `{s['file']}:{s['line']}` (severity: {s.get('severity', 'none')})")
+              lines.append("\n</details>\n")
 
           # Footer
           lines.append("---")
@@ -1390,7 +1411,14 @@ jobs:
 
           if [ -n "$COMMENT_ID" ]; then
             echo "Updating existing comment to show all-clear..."
-            BODY="<!-- devin-security-review -->\n## Devin Security Review\n\n**All CodeQL alerts have been resolved.**\n\nNo security issues remain on this PR. Safe to merge from a security standpoint.\n\n---\n*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*\n<!-- attempts: -->\n<!-- unfixable: -->"
+
+            # Preserve attempt history from existing comment for audit trail
+            EXISTING_BODY=$(jq -r --arg cid "$COMMENT_ID" '[.[] | select(.id == ($cid | tonumber))] | .[0].body // ""' /tmp/pr_comments_resolve.json)
+            PREV_ATTEMPTS=$(echo "$EXISTING_BODY" | grep -oP '<!-- attempts:.*? -->' || echo "<!-- attempts: -->")
+            PREV_UNFIXABLE=$(echo "$EXISTING_BODY" | grep -oP '<!-- unfixable:.*? -->' || echo "<!-- unfixable: -->")
+
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            BODY="<!-- devin-security-review -->\n## Devin Security Review\n\n**All CodeQL alerts have been resolved.** :shield:\n\n*Last updated: ${TIMESTAMP}*\n\nNo security issues remain on this PR. Safe to merge from a security standpoint.\n\n---\n*Automated by [Devin Security Review](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*\n${PREV_ATTEMPTS}\n${PREV_UNFIXABLE}"
 
             BODY_JSON=$(echo -e "$BODY" | python3 -c "import sys,json; print(json.dumps({'body': sys.stdin.read()}))")
 

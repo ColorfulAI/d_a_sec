@@ -1,9 +1,6 @@
 import sqlite3
-import subprocess
 import os
-import json
-import hashlib
-from flask import Flask, request, redirect, make_response, jsonify, render_template_string
+from flask import Flask, request, redirect, jsonify, render_template_string
 
 app = Flask(__name__)
 
@@ -16,15 +13,9 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
+    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return str(results)
-
-@app.route("/run")
-def run_command():
-    cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return output.decode()
+    return jsonify(results)
 
 @app.route("/redirect")
 def open_redirect():
@@ -50,4 +41,4 @@ def render_page():
     return render_template_string(template)
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0")
+    app.run(host="0.0.0.0")
