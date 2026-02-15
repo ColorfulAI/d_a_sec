@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, Response, request
 
 app = Flask(__name__)
 
@@ -16,4 +16,4 @@ def view_log():
     if log_path is None:
         return "Log not found", 404
     with open(log_path) as f:
-        return f.read()
+        return Response(f.read(), content_type="text/plain")
