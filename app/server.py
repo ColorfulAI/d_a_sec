@@ -3,7 +3,8 @@ import shlex
 import subprocess
 import json
 import base64
-from flask import Flask, request, redirect
+from markupsafe import escape
+from flask import Flask, request, redirect, jsonify
 
 app = Flask(__name__)
 
@@ -43,14 +44,14 @@ def profile():
     data = request.cookies.get("session_data", "")
     if data:
         user = json.loads(base64.b64decode(data))
-        return {"username": user.get("name", "anonymous")}
-    return {"username": "anonymous"}
+        return jsonify({"username": user.get("name", "anonymous")})
+    return jsonify({"username": "anonymous"})
 
 @app.route("/page")
 def render_page():
     title = request.args.get("title", "Home")
     content = request.args.get("content", "")
-    return f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    return f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
 
 if __name__ == "__main__":
     app.run(debug=True)
