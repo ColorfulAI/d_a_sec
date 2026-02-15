@@ -1,6 +1,9 @@
+import shlex
 import sqlite3
 import subprocess
-from flask import Flask, request, redirect
+from urllib.parse import urlparse
+
+from flask import Flask, abort, jsonify, request, redirect
 
 app = Flask(__name__)
 
@@ -13,20 +16,29 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
+    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
     results = cursor.fetchall()
-    return {"results": results}
+    return jsonify({"results": results})
 
 @app.route("/run")
 def run_command():
+    ALLOWED_COMMANDS = {"echo", "date", "whoami", "uname"}
     cmd = request.args.get("cmd", "echo hello")
-    output = subprocess.check_output(cmd, shell=True)
-    return {"output": output.decode()}
+    args = shlex.split(cmd)
+    if not args or args[0] not in ALLOWED_COMMANDS:
+        abort(400, description="Command not allowed")
+    output = subprocess.check_output(args, shell=False)
+    return jsonify({"output": output.decode()})
 
 @app.route("/redirect")
-def open_redirect():
+def safe_redirect():
     url = request.args.get("url", "/")
-    return redirect(url)
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        abort(400, description="External redirects are not allowed")
+    if not url.startswith("/") or url.startswith("//") or "\\" in url:
+        abort(400, description="Only local redirects are allowed")
+    return redirect(parsed.path)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
