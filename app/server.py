@@ -1,7 +1,8 @@
 import sqlite3
 import subprocess
-from urllib.parse import urlparse
-from flask import Flask, request, redirect, jsonify
+import pickle
+import base64
+from flask import Flask, request, redirect, make_response
 
 app = Flask(__name__)
 
@@ -14,34 +15,37 @@ def search():
     query = request.args.get("q", "")
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM users WHERE name = ?", (query,))
+    cursor.execute("SELECT * FROM users WHERE name = '" + query + "'")
     results = cursor.fetchall()
-    return jsonify({"results": results})
-
-ALLOWED_COMMANDS = {
-    "echo hello": "echo hello",
-    "whoami": "whoami",
-    "date": "date",
-    "uptime": "uptime",
-}
+    return {"results": results}
 
 @app.route("/run")
 def run_command():
     cmd = request.args.get("cmd", "echo hello")
-    safe_cmd = ALLOWED_COMMANDS.get(cmd)
-    if safe_cmd is None:
-        return {"error": "Command not allowed"}, 400
-    output = subprocess.check_output(safe_cmd, shell=True)
+    output = subprocess.check_output(cmd, shell=True)
     return {"output": output.decode()}
 
 @app.route("/redirect")
 def open_redirect():
     url = request.args.get("url", "/")
-    parsed = urlparse(url)
-    if parsed.scheme or parsed.netloc:
-        return {"error": "External redirects not allowed"}, 400
-    target = parsed.path.replace("\\", "") or "/"
-    return redirect("/" + target.lstrip("/"))
+    return redirect(url)
+
+@app.route("/profile")
+def profile():
+    data = request.cookies.get("session_data", "")
+    if data:
+        user = pickle.loads(base64.b64decode(data))
+        return {"username": user.get("name", "anonymous")}
+    return {"username": "anonymous"}
+
+@app.route("/page")
+def render_page():
+    title = request.args.get("title", "Home")
+    content = request.args.get("content", "")
+    html = f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    resp = make_response(html)
+    resp.headers["Content-Type"] = "text/html"
+    return resp
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=True)
