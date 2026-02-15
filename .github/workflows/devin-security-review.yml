@@ -692,10 +692,15 @@ jobs:
               else:
                   parts = u.rsplit(':', 1)
                   uf_rf = parts[0] if len(parts) == 2 else u
-                  if uf_rf not in current_rf_keys:
-                      pruned_unfixable.add(u)
-                  else:
+                  if uf_rf in current_rf_keys:
                       print(f"  [PRUNE-UNFIXABLE] {u} — stale line number replaced by current key")
+                  elif uf_rf not in seen_rf_fixed:
+                      seen_rf_fixed.add(uf_rf)
+                      fixed_keys.append(u)
+                      stale_unfixable.append(u)
+                      print(f"  [FIXED-WAS-UNFIXABLE] {u} — was marked unfixable but now resolved")
+                  else:
+                      print(f"  [PRUNE-UNFIXABLE-DUP] {u} — already counted as fixed for {uf_rf}")
           unfixable = pruned_unfixable
 
           all_unfixable = list(unfixable)
