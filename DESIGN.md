@@ -1446,6 +1446,190 @@ With proposed solutions: **The cron sweep (Solution 3) fixes this entirely.** Ev
 
 ---
 
+### Edge Case 14: Failure Mode Taxonomy — "Tool Down" vs "Unfixable by AI"
+
+**Problem**: The system currently has one undifferentiated failure path. Whether Devin can't run (API down, rate limited, no capacity) or Devin tried and failed to fix the code (2 attempts, CodeQL still red), the outcome looks the same to the developer. But these are fundamentally different situations that require different responses:
+
+| Failure Mode | Cause | Correct Action | Should Retry? |
+|--------------|-------|----------------|---------------|
+| **TOOL_DOWN** | Devin API unavailable, rate limited, session limit, infra outage | Wait and retry automatically | YES — cron sweep retries |
+| **AI_FAILED** | Devin ran, pushed a fix, but CodeQL still reports the alert after 2 attempts | Human must review and fix manually | NO — retrying wastes resources |
+
+**Why this distinction matters**:
+
+1. **For retry logic**: TOOL_DOWN alerts should be retried indefinitely (until the tool recovers). AI_FAILED alerts should NEVER be retried — the AI already tried its best. Retrying an AI_FAILED alert burns Devin sessions and CI minutes with no expected improvement.
+
+2. **For the cron sweep**: The sweep should only dispatch retries for TOOL_DOWN alerts. If it can't distinguish TOOL_DOWN from AI_FAILED, it will waste resources retrying alerts that Devin already proved it can't fix.
+
+3. **For developer communication**: "Devin is temporarily at capacity, automatic retry scheduled" (TOOL_DOWN) is completely different from "Devin attempted to fix this twice but the vulnerability persists — please review manually" (AI_FAILED). Conflating these messages destroys trust.
+
+4. **For enterprise metrics**: A CISO wants to know: "How many vulnerabilities couldn't be auto-fixed?" (AI_FAILED count) vs "How many were delayed by infrastructure issues?" (TOOL_DOWN count). These are different KPIs.
+
+**The failure mode taxonomy**:
+
+```
+Alert detected by CodeQL
+       │
+       ├─▶ Dispatch attempted
+       │         │
+       │         ├─▶ Session created successfully
+       │         │         │
+       │         │         ├─▶ Devin pushes fix → CodeQL re-scans → alert gone ─▶ FIXED
+       │         │         │
+       │         │         ├─▶ Devin pushes fix → CodeQL re-scans → alert persists
+       │         │         │         │
+       │         │         │         ├─▶ Attempt < MAX_ATTEMPTS ─▶ AI_RETRY (try again)
+       │         │         │         │
+       │         │         │         └─▶ Attempt >= MAX_ATTEMPTS ─▶ AI_FAILED (human must fix)
+       │         │         │
+       │         │         └─▶ Devin session errors/times out ─▶ TOOL_DOWN (session-level failure)
+       │         │
+       │         └─▶ Session creation failed (429/500/timeout)
+       │                   │
+       │                   └─▶ TOOL_DOWN (dispatch-level failure)
+       │
+       └─▶ Dispatch not attempted (claimed by another run, or already unfixable)
+                  └─▶ (no state change)
+```
+
+**State markers with failure mode**:
+
+The existing state markers (from EC12) are extended with a `reason` field that encodes the failure mode:
+
+| State | Marker | Failure Mode | Retry Policy |
+|-------|--------|-------------|--------------|
+| DEFERRED | `<!-- deferred:ALERT_KEY=RUN:TS:429:tool_down:retry_N -->` | TOOL_DOWN | Auto-retry via cron sweep |
+| DEFERRED | `<!-- deferred:ALERT_KEY=RUN:TS:500:tool_down:retry_N -->` | TOOL_DOWN | Auto-retry via cron sweep |
+| DEFERRED | `<!-- deferred:ALERT_KEY=RUN:TS:timeout:tool_down:retry_N -->` | TOOL_DOWN | Auto-retry via cron sweep |
+| DEFERRED | `<!-- deferred:ALERT_KEY=RUN:TS:session_error:tool_down:retry_N -->` | TOOL_DOWN | Auto-retry via cron sweep |
+| UNFIXABLE | `<!-- unfixable:ALERT_KEY:ai_failed:attempt_2 -->` | AI_FAILED | NO auto-retry. Human review. |
+
+Key design rule: **The `reason` field determines retry eligibility.** The cron sweep MUST check this field:
+
+```python
+for alert in deferred_alerts:
+    if alert.reason == "tool_down":
+        retry(alert)  # tool was broken, try again
+    elif alert.reason == "ai_failed":
+        skip(alert)   # AI tried, don't waste resources
+```
+
+**TOOL_DOWN sub-categories**:
+
+| Sub-category | HTTP/Error | Meaning | Expected Recovery |
+|-------------|-----------|---------|-------------------|
+| `rate_limit` | 429 | Devin concurrent session limit hit | Minutes (when existing sessions finish) |
+| `api_error` | 500, 502, 503 | Devin API internal error | Minutes to hours (Devin team fixes) |
+| `api_timeout` | Timeout/no response | Network issue or Devin overloaded | Minutes |
+| `api_unreachable` | Connection refused | Devin completely down | Hours (major outage) |
+| `session_error` | Session created but errored immediately | Devin started but crashed | Minutes (likely transient) |
+| `auth_failure` | 401, 403 | API key invalid/expired | Manual fix required (NOT auto-retryable) |
+
+Note: `auth_failure` is a special TOOL_DOWN sub-category that should NOT be auto-retried. If the API key is wrong, retrying won't help. The cron sweep should detect this and escalate immediately.
+
+**AI_FAILED sub-categories**:
+
+| Sub-category | Meaning | Developer Action |
+|-------------|---------|------------------|
+| `max_attempts` | Devin tried MAX_ATTEMPTS times, fix didn't resolve alert | Review Devin's attempted fix, modify approach |
+| `wrong_fix` | Devin pushed code but introduced new alerts | Review Devin's fix for correctness |
+| `no_fix_pushed` | Devin session completed but no commits were pushed | Alert may require architectural changes |
+| `partial_fix` | Fix resolved some alerts but not this specific one | Check if remaining alert needs different approach |
+
+**PR comment UX per failure mode**:
+
+**TOOL_DOWN comment**:
+
+> **Devin Security Review** — Temporarily Delayed
+>
+> Devin detected 3 security alerts but is currently at capacity (HTTP 429).
+> Automatic retry is scheduled — fixes will begin within 15 minutes.
+>
+> | Alert | Severity | Status |
+> |-------|----------|--------|
+> | py/sql-injection at server.py:18 | high | Queued for automatic retry |
+> | py/xss at server.py:46 | medium | Queued for automatic retry |
+> | py/flask-debug at server.py:51 | warning | Queued for automatic retry |
+>
+> CodeQL is still protecting this PR from merging with unresolved vulnerabilities.
+
+**AI_FAILED comment**:
+
+> **Devin Security Review** — Requires Manual Review
+>
+> Devin attempted to fix 2 alerts but the vulnerabilities persist after 2 attempts each.
+> These require human review and a manual fix.
+>
+> | Alert | Severity | Devin Attempts | Status | Session |
+> |-------|----------|---------------|--------|---------|
+> | py/sql-injection at server.py:18 | high | 2/2 | Needs manual fix | [View Devin's attempt](session_url) |
+> | py/xss at server.py:46 | medium | 2/2 | Needs manual fix | [View Devin's attempt](session_url) |
+>
+> Devin's attempted fixes can be reviewed in the linked sessions above for context.
+
+**Mixed TOOL_DOWN + AI_FAILED comment**:
+
+> **Devin Security Review** — Partially Delayed
+>
+> | Alert | Severity | Status | Detail |
+> |-------|----------|--------|--------|
+> | py/sql-injection at server.py:18 | high | Needs manual fix | Devin tried 2x, vulnerability persists |
+> | py/xss at server.py:46 | medium | Queued for retry | Devin at capacity, auto-retry in 15 min |
+> | py/flask-debug at server.py:51 | warning | Fixed | Resolved in commit abc123 |
+
+This mixed view is critical for enterprise — one glance tells the developer exactly which alerts need their attention (AI_FAILED), which are being handled (TOOL_DOWN → auto-retry), and which are done (FIXED).
+
+**Impact on cron sweep (from EC13)**:
+
+The cron sweep's dispatch logic must respect the failure mode taxonomy:
+
+```python
+for pr in open_prs:
+    deferred = get_deferred_alerts(pr)
+    for alert in deferred:
+        if alert.reason.startswith("tool_down"):
+            if alert.sub_category == "auth_failure":
+                escalate_to_security_team(alert)  # manual fix needed
+            else:
+                retry(alert)  # auto-retry
+        elif alert.reason == "ai_failed":
+            pass  # never auto-retry AI failures
+```
+
+Without this check, the sweep would waste Devin sessions retrying alerts that Devin already proved it can't fix. At enterprise scale (100+ repos, thousands of alerts), this distinction is the difference between a useful tool and a resource-burning bot.
+
+**Impact on existing state machine (from EC12)**:
+
+The alert state machine gains a branching point at the UNFIXABLE terminal state:
+
+```
+                 UNFIXABLE
+                    │
+       ┌────────────┴────────────┐
+       │                         │
+  UNFIXABLE:ai_failed    UNFIXABLE:tool_down
+  (human must fix)       (should not reach here —
+                          TOOL_DOWN stays DEFERRED
+                          and retries, not UNFIXABLE)
+```
+
+Design rule: **TOOL_DOWN alerts should NEVER reach UNFIXABLE state.** If a TOOL_DOWN alert has been deferred 20+ times (5 hours at 15-min sweep), it escalates to the security team — but it stays DEFERRED, not UNFIXABLE. Only AI_FAILED alerts transition to UNFIXABLE. This prevents the system from permanently giving up on alerts that just need the tool to recover.
+
+Exception: `auth_failure` (API key issues) should escalate immediately and not retry, but still stays DEFERRED (with a `no_retry` flag) rather than UNFIXABLE — because fixing the API key will resolve it, no code change needed.
+
+**Configuration parameters (additions to EC12 table)**:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `TOOL_DOWN_MAX_RETRIES` | unlimited | TOOL_DOWN alerts retry indefinitely via cron sweep (sweep checks capacity first, so no waste) |
+| `TOOL_DOWN_ESCALATION_THRESHOLD` | 3600 (1 hour) | Time in TOOL_DOWN deferred state before notifying security team |
+| `AI_FAILED_MAX_ATTEMPTS` | 2 | Max Devin fix attempts before marking AI_FAILED (existing MAX_ATTEMPTS) |
+| `AI_FAILED_RETRY` | false | Whether to ever auto-retry AI_FAILED alerts (default: never) |
+
+**Implementation status**: DESIGNED, not yet implemented. This is a refinement of EC11/EC12/EC13 — the failure mode taxonomy should be implemented alongside the unified state block (EC12 Phase 1) since the marker format needs the `reason` field from the start.
+
+---
+
 ## Secrets and Authentication
 
 | Secret | Environment Variable | Purpose | API |

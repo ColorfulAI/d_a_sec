@@ -400,52 +400,62 @@ This document tracks all test scenarios, results, and regression checks for the 
 
 ---
 
-### T18: Stuck PR Recovery — Self-Scheduling Retry (EC13)
+### T18: Stuck PR Recovery — Cron Sweep Retry (EC13)
 
-**Purpose**: Verify that when our workflow fails to dispatch (rate limit, API error), the PR does not get stuck forever. The workflow should self-schedule a retry so the PR eventually gets fixed without manual intervention.
+**Purpose**: Verify that when our workflow fails to dispatch (rate limit, API error), the PR does not get stuck forever. The cron sweep should detect the stuck PR and trigger a retry automatically — no self-scheduling, no developer action required.
 
 **Relates to**: Edge Case 13 (Stuck PR — Failed Dispatch with No Re-Trigger)
+
+**Why NOT self-scheduling**: Self-scheduling retry was rejected (see DESIGN.md EC13). At enterprise scale (50+ repos, 2-hour Devin outage), self-scheduling creates hundreds of queued `workflow_dispatch` retries that cause a thundering herd when Devin recovers. Each retry clutters the Actions tab. The cron sweep is strictly better: centralized, rate-limited, capacity-aware, no accumulation during outages.
 
 **Setup**:
 1. Occupy all 5 Devin session slots
 2. Push vulnerable code to a PR with CodeQL alerts
+3. Ensure the cron sweep workflow is installed and enabled
 
 **Steps**:
 1. CodeQL runs, detects alerts (red check)
 2. Our workflow triggers, tries to create session, gets 429
 3. Verify: workflow exits red (not green — EC11 fix prerequisite)
-4. Verify: workflow schedules a `workflow_dispatch` retry for this PR (5-10 min delay with jitter)
-5. Wait for retry to fire
-6. If still at capacity: verify retry schedules another retry (with increased backoff)
-7. Free up Devin slots before next retry
-8. Verify: retry run creates session successfully, transitions alerts from DEFERRED to CLAIMED
-9. Verify: total retries capped at MAX_RETRIES (e.g., 6)
+4. Verify: workflow writes DEFERRED markers with `tool_down` reason (EC14)
+5. Verify: PR comment says "Temporarily Delayed — automatic retry within 15 minutes"
+6. Wait for next cron sweep interval (15 min)
+7. Sweep checks Devin capacity — if still at capacity, sweep exits (no retries dispatched, no accumulation)
+8. Free up Devin slots before next sweep
+9. Next sweep detects stuck PR with deferred markers, triggers `workflow_dispatch`
+10. Verify: retry run creates session successfully, transitions alerts DEFERRED → CLAIMED
+11. Verify: PR comment updates from "Temporarily Delayed" to "Fixing in Progress"
 
 **Expected**:
-- Original run: exits red, writes deferred markers, schedules retry
-- Retry 1 (5 min later): reads deferred markers, tries dispatch, fails, schedules retry 2
-- Retry 2 (10 min later): reads deferred markers, tries dispatch, succeeds
-- PR comment updated: "Alert dispatched on retry attempt 2"
-- No manual intervention required
+- Original run: exits red, writes deferred markers with `tool_down` reason
+- PR comment: "Temporarily Delayed — automatic retry within 15 minutes"
+- Cron sweep (15 min later): detects stuck PR, checks capacity, dispatches retry
+- Retry succeeds: PR comment updates to "Fixing in Progress"
+- No manual intervention required. No visible clutter in Actions tab beyond the sweep runs.
 
-**Worry (infinite self-scheduling)**: Without a retry cap, the workflow schedules retries forever, burning CI minutes. Mitigation: `MAX_RETRIES=6` with exponential backoff. After exhaustion, PR comment says "Automatic retry exhausted. Use `/devin retry` to trigger manually."
+**Worry (thundering herd on recovery)**: After a 2-hour outage across 50 repos, the sweep runs once and dispatches retries only up to the available Devin capacity (budget-aware). Remaining stuck PRs wait for the NEXT sweep. Verify: sweep dispatches at most N retries per run (where N = available session slots).
 
 **Worry (PR stuck forever with no retry mechanism — current state)**:
-1. Using the CURRENT workflow (no self-scheduling), push vulnerable code
+1. Using the CURRENT workflow (no cron sweep), push vulnerable code
 2. Ensure our workflow fails (rate limit)
 3. Do NOT push any new code to the PR
 4. Wait 30 minutes
 5. Verify: NO new workflow runs triggered. PR is stuck. CodeQL red, our workflow green (or red with EC11 fix).
-6. This confirms the stuck PR problem exists and motivates Solution 2.
+6. This confirms the stuck PR problem exists and motivates the cron sweep.
 
-**`/devin retry` command sub-test (EC13 Solution 5)**:
-1. After automatic retries are exhausted (or with no self-scheduling implemented)
+**Escalation sub-test (1+ hour failure)**:
+1. Keep Devin at capacity for 1+ hour (4 sweep intervals)
+2. Verify: after 4 failed sweep attempts, PR comment escalates to "Requires Attention — Devin unavailable for 1+ hour"
+3. Verify: Slack/email webhook fires to security team (if configured)
+4. Verify: alert stays DEFERRED (NOT UNFIXABLE) — tool-down alerts never give up permanently
+
+**`/devin retry` command sub-test (hidden power-user escape hatch)**:
+1. With cron sweep disabled or developer wants immediate retry
 2. Developer posts a comment on the PR: `/devin retry`
 3. Verify: `issue_comment` workflow detects the command and triggers `workflow_dispatch`
 4. Verify: security review workflow runs for this PR, creates session
 5. Verify: rate limit on `/devin retry` — posting it twice within 5 min should only trigger once
-
-**Worry (developer doesn't know about `/devin retry`)**: The PR comment after exhausted retries must clearly state this command as an option. Verify the comment text includes the exact command.
+6. Note: `/devin retry` is NOT mentioned in the standard PR comment. It exists only for power users and debugging.
 
 ---
 
@@ -529,6 +539,226 @@ This document tracks all test scenarios, results, and regression checks for the 
 
 ---
 
+### T22: TOOL_DOWN vs AI_FAILED Classification Correctness (EC14)
+
+**Purpose**: Verify the workflow correctly classifies failures into TOOL_DOWN (infrastructure issue, should auto-retry) vs AI_FAILED (Devin tried and couldn't fix, human must review). This is the foundational test for the failure mode taxonomy — if classification is wrong, every downstream behavior (retry logic, PR comments, cron sweep) is wrong.
+
+**Why we test this**: The single most dangerous failure in the entire system is misclassification. If a TOOL_DOWN alert gets labeled AI_FAILED, it will NEVER be retried — the developer is told "fix it yourself" when the only problem was Devin being temporarily busy. If an AI_FAILED alert gets labeled TOOL_DOWN, the cron sweep will retry it every 15 minutes forever, wasting Devin sessions on something Devin already proved it can't fix.
+
+**Relates to**: Edge Case 14 (Failure Mode Taxonomy)
+
+**Setup**:
+1. Prepare a PR with 4 CodeQL alerts of varying fixability
+2. Occupy 4/5 Devin session slots (to force partial failure)
+
+**Steps**:
+
+*Scenario A — TOOL_DOWN (dispatch-level):*
+1. Alert 1: workflow tries to create session, gets HTTP 429 (rate limit)
+2. Verify: alert marked `deferred:ALERT_KEY=RUN:TS:429:tool_down:retry_0`
+3. Verify: PR comment shows "Queued for automatic retry" for this alert
+4. Verify: cron sweep WILL pick this up on next run
+
+*Scenario B — TOOL_DOWN (session-level):*
+1. Alert 2: session created successfully, but Devin session errors out immediately (crashes before pushing any code)
+2. Verify: alert marked `deferred:ALERT_KEY=RUN:TS:session_error:tool_down:retry_0`
+3. Verify: PR comment shows "Queued for automatic retry" (not "Needs manual fix")
+4. Verify: this is treated identically to dispatch failure for retry purposes
+
+*Scenario C — AI_FAILED (max attempts):*
+1. Alert 3: Devin creates session, pushes fix, CodeQL re-scans, alert persists. Attempt 2: same result.
+2. Verify: alert marked `unfixable:ALERT_KEY:ai_failed:attempt_2`
+3. Verify: PR comment shows "Needs manual fix" with link to Devin's attempted fix session
+4. Verify: cron sweep will NOT retry this alert
+
+*Scenario D — AI_FAILED (no fix pushed):*
+1. Alert 4: Devin creates session, session completes, but no commits were pushed (Devin couldn't figure out a fix)
+2. Verify: alert marked `unfixable:ALERT_KEY:ai_failed:no_fix_pushed`
+3. Verify: PR comment shows "Needs manual fix — Devin could not determine a fix"
+
+**Expected**:
+- Each alert has the correct failure mode in its marker
+- PR comment accurately reflects per-alert status with no conflation
+- TOOL_DOWN alerts: retryable, shown as "Queued for retry"
+- AI_FAILED alerts: terminal, shown as "Needs manual fix" with session link
+
+**Worry (misclassification — TOOL_DOWN as AI_FAILED)**: Devin API returns 500 (internal server error) during session creation. The workflow incorrectly treats this as "Devin tried and failed" instead of "infrastructure issue." Result: alert marked AI_FAILED, never retried, developer told to fix manually when Devin never even attempted it. This is the WORST possible misclassification because the developer is blamed for an infrastructure problem.
+
+**Worry (misclassification — AI_FAILED as TOOL_DOWN)**: Devin session runs, pushes a fix that doesn't resolve the CodeQL alert, but the workflow marks it as TOOL_DOWN (e.g., because the session status check returned an unexpected status code). Result: cron sweep retries every 15 minutes, creating new Devin sessions that make the same unsuccessful fix attempt. At enterprise scale: hundreds of wasted sessions per day.
+
+**Worry (ambiguous session failure)**: Devin session created, ran for 20 minutes, then stopped with status "errored." Did Devin TRY to fix and fail (AI_FAILED)? Or did the session crash due to infrastructure (TOOL_DOWN)? Classification heuristic: check if any fix commits were pushed. If yes: AI attempted, classify based on CodeQL rescan. If no commits: TOOL_DOWN (session-level infrastructure failure).
+
+**Sub-test (boundary case — partial fix)**:
+1. Devin fixes 2 of 3 alerts in one session, but the 3rd persists after 2 attempts
+2. Verify: alerts 1-2 marked FIXED, alert 3 marked AI_FAILED
+3. Verify: PR comment shows mixed state correctly — "Fixed" for 1-2, "Needs manual fix" for 3
+4. Verify: cron sweep ignores this PR entirely (no TOOL_DOWN alerts remain)
+
+---
+
+### T23: Cron Sweep Respects Failure Mode Taxonomy (EC14 + EC13)
+
+**Purpose**: Verify the cron sweep ONLY retries TOOL_DOWN alerts and NEVER retries AI_FAILED alerts. This is the critical integration test between EC13 (cron sweep) and EC14 (failure taxonomy). Without this, the sweep becomes a resource-burning bot.
+
+**Why we test this**: At enterprise scale (100+ repos, thousands of alerts), the cron sweep runs every 15 minutes across all repos. If it doesn't respect failure modes, it will create Devin sessions for alerts that Devin already proved it can't fix. At $X per session, this is directly burning money with zero expected value.
+
+**Relates to**: Edge Case 13 (Cron Sweep) + Edge Case 14 (Failure Mode Taxonomy)
+
+**Setup**:
+1. Have 3 open PRs with our bot comment:
+   - PR-A: 2 alerts marked `deferred:...:tool_down:retry_1` (dispatch failed, should retry)
+   - PR-B: 2 alerts marked `unfixable:...:ai_failed:attempt_2` (Devin tried, human must fix)
+   - PR-C: 1 alert marked `deferred:...:tool_down:retry_0` + 1 alert marked `unfixable:...:ai_failed:attempt_2` (mixed)
+2. Devin has 3 available session slots
+
+**Steps**:
+1. Cron sweep runs
+2. Sweep scans all 3 PRs, reads deferred/unfixable markers
+3. For PR-A: finds 2 TOOL_DOWN alerts, dispatches retry
+4. For PR-B: finds only AI_FAILED alerts, SKIPS entirely (no dispatch)
+5. For PR-C: finds 1 TOOL_DOWN alert, dispatches retry for that one only. AI_FAILED alert untouched.
+6. Verify: exactly 2 workflow_dispatch calls made (PR-A and PR-C), NOT 3
+
+**Expected**:
+- PR-A: retried (both alerts are TOOL_DOWN)
+- PR-B: NOT retried (all alerts are AI_FAILED — nothing to do)
+- PR-C: retried, but ONLY the TOOL_DOWN alert. The AI_FAILED alert stays unfixable.
+- Total Devin sessions created: 2 (not 3, not 4)
+
+**Worry (sweep retries AI_FAILED alerts)**: Sweep doesn't check the `reason` field in deferred markers and treats ALL deferred/unfixable alerts as retryable. Result: every 15 minutes, it creates new Devin sessions for alerts Devin already failed to fix. The enterprise customer sees their Devin session budget being consumed with no new fixes. Trust destroyed.
+
+**Worry (sweep skips TOOL_DOWN alerts)**: Sweep checks for `deferred:` markers but the marker format changed (e.g., new field added) and the regex no longer matches. Result: TOOL_DOWN alerts are invisible to the sweep. PRs stay stuck forever. The cron sweep exists but is silently broken.
+
+**Worry (capacity exhaustion from retries)**: Sweep dispatches retries for PR-A (2 alerts) using 2 of 3 available slots. PR-C's TOOL_DOWN alert needs 1 more slot. What if retrying PR-A's alerts consumes all 3 slots (because each alert gets its own session)? Verify: sweep checks remaining capacity after each dispatch and stops when budget is exhausted.
+
+**Sub-test (sweep during extended outage)**:
+1. Devin has 0 available slots for 1+ hour
+2. Sweep runs 4 times (every 15 min), each time finds 0 capacity, exits immediately
+3. Verify: NO retries dispatched during the outage (no accumulation)
+4. Verify: each sweep run costs <5 seconds of Actions time (capacity-first exit)
+5. After 1 hour: PR comments escalate to "Requires Attention — Devin unavailable for 1+ hour"
+6. Verify: escalation webhook fires (if configured)
+7. Verify: TOOL_DOWN alerts still in DEFERRED state (NOT UNFIXABLE — tool-down never gives up)
+
+---
+
+### T24: Mixed Failure Modes on Single PR (EC14 UX)
+
+**Purpose**: Verify the PR comment correctly displays mixed alert states (FIXED + TOOL_DOWN + AI_FAILED) in a single unified view. This is the "one glance" test — a developer looking at the comment should immediately understand which alerts need their attention, which are being handled, and which are done.
+
+**Why we test this**: Enterprise developers manage dozens of PRs. They need to triage quickly. If the comment conflates failure modes or requires reading hidden markers to understand status, developers will ignore it. The comment must be scannable in under 5 seconds.
+
+**Relates to**: Edge Case 14 (PR comment UX per failure mode)
+
+**Setup**:
+1. PR with 5 CodeQL alerts that have been through various lifecycle stages:
+   - Alert 1: FIXED (Devin pushed fix, CodeQL confirmed resolved)
+   - Alert 2: AI_FAILED (Devin tried 2x, vulnerability persists)
+   - Alert 3: TOOL_DOWN / DEFERRED (dispatch failed, queued for cron sweep retry)
+   - Alert 4: CLAIMED (Devin session in progress, actively being fixed)
+   - Alert 5: AI_FAILED (Devin session completed, no commits pushed)
+
+**Steps**:
+1. Trigger workflow run that reads the unified state block
+2. Workflow builds PR comment with per-alert status table
+3. Verify comment content and formatting
+
+**Expected PR comment structure**:
+```
+**Devin Security Review** — Partially Delayed
+
+| Alert | Severity | Status | Detail |
+|-------|----------|--------|--------|
+| py/sql-injection at server.py:18 | high | Fixed | Resolved in commit abc123 |
+| py/xss at server.py:46 | medium | Needs manual fix | Devin tried 2x, vulnerability persists [View attempt](url) |
+| py/command-injection at server.py:25 | critical | Queued for retry | Devin at capacity, auto-retry in ~15 min |
+| py/flask-debug at server.py:51 | warning | Fixing in progress | Devin session active [View session](url) |
+| py/unsafe-deser at server.py:37 | critical | Needs manual fix | Devin could not determine a fix [View attempt](url) |
+
+CodeQL is still protecting this PR from merging with unresolved vulnerabilities.
+```
+
+**Verify**:
+- Comment title reflects the WORST active state ("Partially Delayed" because there's a TOOL_DOWN alert)
+- FIXED alerts show commit link
+- AI_FAILED alerts show Devin session link (so developer can review what Devin tried)
+- TOOL_DOWN alerts say "auto-retry in ~15 min" (sets developer expectation, no action needed)
+- CLAIMED alerts say "Fixing in progress" with session link
+- NO mention of `/devin retry` or any manual retry action in the standard comment
+
+**Worry (all alerts shown as same status)**: Comment doesn't differentiate between failure modes. All 5 alerts shown as "In Progress" or all as "Failed." Developer can't tell which need their attention. This is the pre-EC14 behavior we're fixing.
+
+**Worry (comment title doesn't reflect reality)**: Comment says "All Resolved" but 2 alerts are AI_FAILED. Or says "Temporarily Delayed" but some alerts are permanently unfixable. Title must reflect the worst active state.
+
+**Worry (stale comment after retry succeeds)**: Alert 3 was "Queued for retry." Cron sweep retries, Devin fixes it. But the PR comment still says "Queued for retry" because the retry workflow didn't update the comment. Verify: after successful retry, the comment is updated and alert 3 transitions to "Fixing in progress" then "Fixed."
+
+**Sub-test (comment title progression)**:
+1. Initial state: 3 TOOL_DOWN alerts -> title: "Temporarily Delayed"
+2. Sweep retries, 2 succeed, 1 still deferred -> title: "Partially Delayed"
+3. Last TOOL_DOWN retry succeeds, but 1 AI_FAILED remains -> title: "Requires Manual Review"
+4. Developer fixes the AI_FAILED alert, CodeQL re-scans -> title: "All Resolved"
+5. Verify: each transition updates the title correctly
+
+---
+
+### T25: Auth Failure — Non-Retryable TOOL_DOWN (EC14 Special Case)
+
+**Purpose**: Verify that `auth_failure` (HTTP 401/403 from Devin API) is classified as TOOL_DOWN but is NOT auto-retried. This is a special case: the tool is "down" from our perspective (can't create sessions), but retrying won't help because the API key is invalid. Must escalate immediately.
+
+**Why we test this**: If the API key expires or is rotated and someone forgets to update the repo secret, EVERY workflow run will fail with 401. Without special handling, the cron sweep would retry every 15 minutes forever, each time getting 401, each time wasting Actions time and logging noise. Worse: the PR comments would say "auto-retry in 15 min" indefinitely, setting a false expectation.
+
+**Relates to**: Edge Case 14 (TOOL_DOWN sub-categories, auth_failure special case)
+
+**Setup**:
+1. Set `DEVIN_API_KEY` repo secret to an invalid/expired key
+2. Push vulnerable code to a PR to trigger CodeQL alerts
+
+**Steps**:
+1. CodeQL runs, detects alerts
+2. Our workflow triggers, health check step tries to validate Devin API key
+3. Devin API returns HTTP 401 or 403
+4. Verify: health check identifies this as `auth_failure`
+5. Verify: workflow does NOT attempt to create any sessions (skip dispatch entirely)
+6. Verify: workflow exits red (not green)
+7. Check PR comment content
+8. Check if cron sweep handles this correctly
+
+**Expected**:
+- Health check: "Devin API key invalid (HTTP 401). Sessions cannot be created."
+- Workflow exits code 1 (red check)
+- PR comment:
+  > **Devin Security Review** — Configuration Error
+  >
+  > Devin API key is invalid or expired. Automatic security fixes are disabled until this is resolved.
+  > {N} security alerts detected by CodeQL require attention.
+  >
+  > **Action required**: Repository admin must update the `DEVIN_API_KEY` secret.
+  >
+  > CodeQL is still protecting this PR from merging with unresolved vulnerabilities.
+- Alert markers: `deferred:ALERT_KEY=RUN:TS:401:tool_down:auth_failure:no_retry`
+- The `no_retry` flag means the cron sweep will NOT dispatch retries for this PR
+
+**Worry (infinite retry on bad API key)**: Cron sweep doesn't check for `auth_failure` sub-category and retries every 15 minutes. Each retry: workflow starts, health check fails with 401, posts same "configuration error" comment, exits red. 96 failed runs per day, each consuming ~30 seconds of Actions time. GitHub sends 96 "workflow failed" email notifications. Enterprise admin's inbox flooded.
+
+**Worry (auth_failure confused with rate_limit)**: HTTP 429 (rate limit) and HTTP 401 (auth failure) are both "can't create session" but have completely different remediation. Rate limit: wait and retry. Auth failure: fix the API key. If the workflow doesn't distinguish them, a rate limit gets treated as "configuration error" (developer told to update API key when the key is fine) or an auth failure gets treated as "temporarily at capacity" (developer waits forever for something that will never auto-resolve).
+
+**Worry (API key rotated mid-session)**: Devin API key was valid at health check time, but rotated between health check and session creation. Session creation gets 401. Verify: workflow retries once (could be transient), on second 401 classifies as `auth_failure` and stops.
+
+**Sub-test (key fixed, sweep recovers)**:
+1. Start with invalid API key, verify auth_failure state (markers + comment)
+2. Admin fixes the API key (updates repo secret)
+3. Developer pushes new code to PR (triggers CodeQL, triggers workflow_run)
+4. New workflow run: health check passes, sessions created, alerts transition from `deferred:auth_failure:no_retry` to `claimed`
+5. Verify: the system fully recovers without needing to manually clear any state
+6. Alternative path: admin manually re-runs the failed workflow. Verify: same recovery.
+
+**Sub-test (distinguish 401 vs 403)**:
+1. HTTP 401 (Unauthorized): API key is missing or malformed. Message: "API key invalid."
+2. HTTP 403 (Forbidden): API key is valid but lacks permissions (e.g., wrong scope). Message: "API key lacks required permissions."
+3. Verify: both are `auth_failure` (no auto-retry), but the PR comment message is specific enough for the admin to know which to fix.
+
+---
+
 ## Historical Test Runs
 
 ### Run 1 (2026-02-14 23:13 UTC) — Initial Pipeline
@@ -582,7 +812,11 @@ Before each release, verify:
 - [ ] T15: Alert claiming prevents duplicate sessions (EC10)
 - [ ] T16: Session creation failure produces honest state (EC11)
 - [ ] T17: Deferred alerts are preserved and picked up (EC12)
-- [ ] T18: Stuck PR recovery via self-scheduling retry (EC13)
+- [ ] T18: Stuck PR recovery via cron sweep (EC13)
 - [ ] T19: CodeQL alerts persist on open PRs (EC13d)
 - [ ] T20: Cron sweep detects stuck PRs (EC13 Solution 3)
 - [ ] T21: Session accumulation and cleanup (EC12 root cause)
+- [ ] T22: TOOL_DOWN vs AI_FAILED classification correctness (EC14)
+- [ ] T23: Cron sweep respects failure mode taxonomy (EC14 + EC13)
+- [ ] T24: Mixed failure modes on single PR (EC14 UX)
+- [ ] T25: Auth failure — non-retryable TOOL_DOWN (EC14 special case)
