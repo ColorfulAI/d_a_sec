@@ -26,6 +26,8 @@ This document details every step needed to install the Devin Security Review pip
 | Devin account | Any tier (Free, Team, or Enterprise) with API access |
 | Languages supported | Python (currently). Extensible to JavaScript, Java, Go, C/C++ — see CodeQL Configuration |
 
+> **IMPORTANT: CodeQL is a hard prerequisite.** The Devin Security Review workflow triggers via `workflow_run` — it only starts **after** the CodeQL workflow completes. If CodeQL is not configured, disabled, or failing on a repository, the Devin Security Review workflow will **never run**. If you notice that Devin is not commenting on PRs, the first thing to check is whether CodeQL is running successfully on each PR. See [Troubleshooting](#troubleshooting) for details.
+
 ---
 
 ## Secrets Configuration
@@ -331,6 +333,15 @@ Run the full test suite documented in `TESTS.md`. Key scenarios:
 
 **Cause**: Devin's GitHub App doesn't have write access to the repository.
 **Fix**: Go to Devin **Settings → Git Connections** and grant access to the repository.
+
+### Devin Security Review workflow never runs
+
+**Cause**: The workflow uses a `workflow_run` trigger that fires only after the CodeQL workflow completes. If CodeQL is not configured, disabled, or failing, our workflow will never be triggered.
+**Fix**:
+1. Verify CodeQL is configured: Check that `.github/workflows/codeql.yml` exists and is enabled
+2. Verify CodeQL runs on PRs: Open a PR and check the "Checks" tab for CodeQL analysis jobs
+3. Verify the CodeQL workflow name matches: Our workflow triggers on `workflows: ["CodeQL"]` — if your CodeQL workflow has a different `name:` field, update our trigger to match
+4. Check CodeQL is succeeding: Our workflow only triggers when CodeQL completes with `conclusion: success`. If CodeQL itself is failing (e.g., build errors for compiled languages), fix CodeQL first
 
 ### Branch protection blocks Devin pushes
 

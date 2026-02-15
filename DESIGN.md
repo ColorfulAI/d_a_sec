@@ -587,6 +587,59 @@ PR #3 has pre-existing alerts
 | Invalid DEVIN_API_KEY | Degraded mode (same as down) | Reconfigure secret, re-run |
 | Both APIs healthy | Full automation | Review Devin's fix commits |
 
+### Edge Case 9: CodeQL Race Condition — `workflow_run` Trigger
+
+**Problem**: When both CodeQL and the Devin Security Review workflow trigger on `pull_request`, they start simultaneously. Our workflow polls for CodeQL completion (Step 2), but this is inefficient — it wastes runner minutes on polling loops and risks timeout if CodeQL takes longer than 20 minutes.
+
+**Root cause**: GitHub Actions has no native "run this workflow after that one" for the same event trigger. Both workflows receive the `pull_request` event at the same time and start independently.
+
+**Solution**: Use the `workflow_run` trigger instead of (or in addition to) `pull_request`.
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["CodeQL"]   # Only fires after THIS specific workflow
+    types: [completed]      # Only when CodeQL finishes (success or failure)
+```
+
+**Why `workflow_run` is the right choice**:
+
+| Approach | Race condition? | Runner waste | Complexity |
+|----------|----------------|-------------|------------|
+| `pull_request` + polling (old) | Mitigated (polling) | High (30s polls for up to 20 min) | Low |
+| `workflow_run` (new) | **Eliminated** | **Zero** (only runs after CodeQL) | Medium (PR context resolution) |
+| `needs:` job dependency | Not applicable | N/A | N/A — only works within same workflow |
+
+**Key property**: `workflow_run` is workflow-specific. Specifying `workflows: ["CodeQL"]` means ONLY the CodeQL workflow's completion triggers us. Other workflows (CI, build, linting) have no effect. This is not a generic "run after any workflow" trigger.
+
+**Trade-off — PR context resolution**: `workflow_run` runs in the context of the default branch, not the PR branch. This means `github.event.pull_request` is not available. We resolve PR context via:
+
+1. `github.event.workflow_run.pull_requests[0].number` — GitHub populates this array for same-repo PRs
+2. Fallback: Search GitHub API by branch name (`GET /repos/{owner}/{repo}/pulls?head={branch}`)
+3. If neither resolves a PR: skip the run (CodeQL ran on a push to main, not a PR)
+
+**Implementation — Step 0a (Resolve PR Context)**:
+
+The workflow normalizes PR context at the start regardless of trigger type:
+
+| Trigger | PR number source | Head SHA source |
+|---------|-----------------|-----------------|
+| `workflow_run` | `workflow_run.pull_requests[0]` or API search | `workflow_run.head_sha` |
+| `pull_request` | `event.pull_request.number` | `event.pull_request.head.sha` |
+| `workflow_dispatch` | Manual input `pr_number` | API lookup from PR data |
+
+All downstream steps use the normalized `steps.pr-context.outputs.*` values, making them trigger-agnostic.
+
+**Guard clause**: The workflow only runs on `workflow_run` when:
+- CodeQL completed **successfully** (`conclusion == 'success'`)
+- CodeQL was triggered by a **pull request** (`event == 'pull_request'`)
+
+This prevents running on CodeQL pushes to main or failed CodeQL runs.
+
+**Important prerequisite**: This design means our workflow **depends on CodeQL running**. If CodeQL is not configured or is disabled on the repository, our workflow will never trigger via `workflow_run`. See the [Installation Guide](INSTALL.md) for the prerequisite warning. The `pull_request` trigger is kept as a fallback for development/testing before the workflow is merged to main.
+
+**Polling fallback**: When triggered by `pull_request` (fallback), the old polling logic (Step 2) still runs to wait for CodeQL. When triggered by `workflow_run`, Step 2 is skipped entirely since CodeQL is already complete.
+
 ---
 
 ## Secrets and Authentication
@@ -626,6 +679,7 @@ PR #3 has pre-existing alerts
 | Merge commits cluttering history | SOLVED | `git pull --rebase` instruction in Devin prompt |
 | Infinite PR creation from pre-existing alerts | MITIGATED | Deterministic branch names + explicit "do not create PR" prompt + idempotent sessions + attempt tracking |
 | Devin API downtime blocking development | SOLVED | Health check + graceful degradation: workflow enters degraded mode, still reports alerts, CodeQL blocks merges independently |
+| CodeQL race condition (workflow starts before CodeQL finishes) | SOLVED | `workflow_run` trigger fires only after CodeQL completes; polling fallback for `pull_request` trigger |
 
 ### Planned Improvements
 

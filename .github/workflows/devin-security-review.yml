@@ -38,6 +38,9 @@
 name: Devin Security Review
 
 on:
+  workflow_run:
+    workflows: ["CodeQL"]
+    types: [completed]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -47,6 +50,10 @@ on:
         required: false
         type: boolean
         default: false
+      pr_number:
+        description: "PR number to analyze (for manual runs)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -59,10 +66,83 @@ env:
 jobs:
   security-review:
     runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request')
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      # ------------------------------------------------------------------
+      # STEP 0a: Resolve PR context.
+      # workflow_run doesn't have github.event.pull_request, so we resolve
+      # the PR number and head SHA from the triggering workflow's context.
+      # This step normalizes the context for all three trigger types.
+      # ------------------------------------------------------------------
+      - name: Resolve PR context
+        id: pr-context
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "Triggered by workflow_run (CodeQL completed)"
+            HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+
+            PR_NUMBER=$(echo '${{ toJson(github.event.workflow_run.pull_requests) }}' | jq -r '.[0].number // empty')
+
+            if [ -z "$PR_NUMBER" ]; then
+              echo "pull_requests array empty — searching by branch..."
+              PR_NUMBER=$(curl -s -L \
+                -H "Authorization: token $GH_PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository_owner }}:${HEAD_BRANCH}" \
+                | jq -r '.[0].number // empty')
+            fi
+
+            if [ -z "$PR_NUMBER" ]; then
+              echo "::warning::Could not resolve PR number from workflow_run. Skipping."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Resolved: PR #$PR_NUMBER, branch=$HEAD_BRANCH, sha=$HEAD_SHA"
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+            echo "head_branch=$HEAD_BRANCH" >> $GITHUB_OUTPUT
+            echo "trigger=workflow_run" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Triggered by pull_request"
+            echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+            echo "head_branch=${{ github.head_ref }}" >> $GITHUB_OUTPUT
+            echo "trigger=pull_request" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Triggered by workflow_dispatch"
+            PR_NUM="${{ github.event.inputs.pr_number }}"
+            if [ -z "$PR_NUM" ]; then
+              echo "::error::PR number required for manual dispatch."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            PR_DATA=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM")
+            HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+            HEAD_BRANCH=$(echo "$PR_DATA" | jq -r '.head.ref')
+            echo "pr_number=$PR_NUM" >> $GITHUB_OUTPUT
+            echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+            echo "head_branch=$HEAD_BRANCH" >> $GITHUB_OUTPUT
+            echo "trigger=workflow_dispatch" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
 
       # ------------------------------------------------------------------
       # STEP 0: Health check — validate secrets and API availability.
@@ -156,12 +236,13 @@ jobs:
       # checks report "completed". Timeout after 20 minutes (40 * 30s).
       # ------------------------------------------------------------------
       - name: Wait for all CodeQL analyses to complete
+        if: steps.pr-context.outputs.trigger != 'workflow_run'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "Waiting for all CodeQL analyses to complete..."
           REPO="${{ github.repository }}"
-          SHA="${{ github.event.pull_request.head.sha }}"
+          SHA="${{ steps.pr-context.outputs.head_sha }}"
           MAX_ATTEMPTS=40
           ATTEMPT=0
 
@@ -207,7 +288,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
           PR_REF="refs/pull/${PR_NUMBER}/merge"
 
           echo "Fetching code scanning alerts for $REPO ref=$PR_REF ..."
@@ -347,7 +428,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
 
           COMMENTS=$(curl -s -L \
             -H "Authorization: token $GH_PAT" \
@@ -539,8 +620,8 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_BRANCH="${{ github.head_ref }}"
+          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
+          PR_BRANCH="${{ steps.pr-context.outputs.head_branch }}"
           ALERT_SUMMARY=$(cat /tmp/new_actionable_summary.txt)
           ALERT_DETAILS=$(cat /tmp/new_in_pr_actionable.json)
 
@@ -618,7 +699,10 @@ jobs:
           fi
 
           SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
-          SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
+          SESSION_URL=$(echo "$BODY" | jq -r '.url // empty')
+          if [ -z "$SESSION_URL" ] && [ -n "$SESSION_ID" ]; then
+            SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
+          fi
 
           if [ -z "$SESSION_ID" ]; then
             echo "ERROR: Failed to create Devin session for new-in-PR alerts"
@@ -648,7 +732,7 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ github.event.pull_request.number }}"
+          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
           export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
 
           echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
@@ -776,7 +860,8 @@ jobs:
                       sid = result.get("session_id", "")
                       if sid:
                           session_ids.append(sid)
-                          session_urls.append(f"https://app.devin.ai/sessions/{sid}")
+                          surl = result.get("url", f"https://app.devin.ai/sessions/{sid}")
+                          session_urls.append(surl)
                           print(f"Batch {i+1}/{min(len(batches), max_total_sessions)}: Session {sid} created")
                       else:
                           print(f"Batch {i+1}: Failed - {result}")
@@ -829,7 +914,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ github.event.pull_request.number }}"
+          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
           export TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
           export NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
           export PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
@@ -1083,7 +1168,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
           UNFIXABLE_COUNT="${{ steps.filter-alerts.outputs.unfixable_count }}"
           LABEL="devin:manual-review-needed"
 
@@ -1126,7 +1211,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
 
           # Find existing comment
           COMMENTS=$(curl -s -L \
