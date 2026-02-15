@@ -6,5 +6,5 @@ def handler_5():
     param = request.args.get("q", "")
     conn = sqlite3.connect("app.db")
     c = conn.cursor()
-    c.execute("SELECT * FROM t WHERE col = '" + param + "'")
+    c.execute("SELECT * FROM t WHERE col = ?", (param,))
     return jsonify(c.fetchall())
