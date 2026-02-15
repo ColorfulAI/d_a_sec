@@ -33,20 +33,10 @@ def run_command():
     output = subprocess.check_output(args, shell=False)
     return jsonify({"output": output.decode()})
 
-REDIRECT_MAP = {
-    "/": "/",
-    "/home": "/home",
-    "/dashboard": "/dashboard",
-    "/profile": "/profile",
-    "/search": "/search",
-    "/page": "/page",
-}
-
 @app.route("/redirect")
 def open_redirect():
     url = request.args.get("url", "/")
-    safe_url = REDIRECT_MAP.get(url, "/")
-    return redirect(safe_url)
+    return redirect(url)
 
 @app.route("/profile")
 def profile():
