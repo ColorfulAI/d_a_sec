@@ -3,6 +3,7 @@ import shlex
 import subprocess
 import json
 import base64
+from urllib.parse import urlparse
 from flask import Flask, request, redirect, jsonify
 from markupsafe import escape
 
@@ -35,6 +36,9 @@ def run_command():
 @app.route("/redirect")
 def open_redirect():
     url = request.args.get("url", "/")
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        return jsonify({"error": "external redirects not allowed"}), 400
     return redirect(url)
 
 @app.route("/profile")
