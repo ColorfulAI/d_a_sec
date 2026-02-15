@@ -616,6 +616,8 @@ jobs:
 
                   if key in unfixable or rf_key in rf_unfixable:
                       skipped_unfixable.append(a)
+                      attempts[key] = MAX_ATTEMPTS
+                      unfixable.add(key)
                       print(f"  [SKIP-UNFIXABLE] {key} — already marked unfixable")
                       continue
 
@@ -682,6 +684,19 @@ jobs:
                   else:
                       print(f"  [PRUNE] {k} — superseded by current alert at new line")
           attempts = pruned
+
+          pruned_unfixable = set()
+          for u in unfixable:
+              if u in current_exact_keys:
+                  pruned_unfixable.add(u)
+              else:
+                  parts = u.rsplit(':', 1)
+                  uf_rf = parts[0] if len(parts) == 2 else u
+                  if uf_rf not in current_rf_keys:
+                      pruned_unfixable.add(u)
+                  else:
+                      print(f"  [PRUNE-UNFIXABLE] {u} — stale line number replaced by current key")
+          unfixable = pruned_unfixable
 
           all_unfixable = list(unfixable)
           all_unfixable_alerts = [a for a in (new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable)
