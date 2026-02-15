@@ -1,7 +1,7 @@
 import sqlite3
 import shlex
 import subprocess
-import pickle
+import json
 import base64
 from flask import Flask, request, redirect
 
@@ -42,7 +42,7 @@ def open_redirect():
 def profile():
     data = request.cookies.get("session_data", "")
     if data:
-        user = pickle.loads(base64.b64decode(data))
+        user = json.loads(base64.b64decode(data))
         return {"username": user.get("name", "anonymous")}
     return {"username": "anonymous"}
 
