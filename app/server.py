@@ -53,7 +53,7 @@ def profile():
 def render_page():
     title = request.args.get("title", "Home")
     content = request.args.get("content", "")
-    return f"<html><head><title>{title}</title></head><body>{content}</body></html>"
+    return f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
 
 if __name__ == "__main__":
     app.run(debug=True)
