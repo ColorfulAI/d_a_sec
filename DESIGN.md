@@ -707,6 +707,148 @@ TTL should be configurable via workflow input (default: 30 minutes).
 
 This would make the claim TTL less critical, since claims are actively managed rather than passively expired.
 
+### Edge Case 11: Session Creation Failure — False-Green Check and Cascading Failures
+
+**Problem**: The workflow exits with status 0 (green check) even when Devin session creation fails completely. A developer sees "Devin Security Review: Successful" alongside CodeQL's red check and assumes the security issue is being handled. In reality, no session was created and nobody is fixing anything.
+
+**Observed in production**: PR #3 run on 2026-02-15 — Devin API returned HTTP 429 ("concurrent session limit of 5 exceeded"), retry after 60s also returned 429. Workflow posted a PR comment but no session link. Check showed green.
+
+**Sub-cases and enterprise impact**:
+
+#### EC11a: Total session failure (rate limit / API error)
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | HTTP 429 (rate limit), 500 (server error), 503 (maintenance), network timeout |
+| **Behavior** | Workflow detects alerts, fails to create any session, posts comment saying "Devin is fixing" (misleading), exits green |
+| **Developer perception** | "Security is handled" — false sense of security |
+| **Enterprise risk** | HIGH — vulnerable code merges if CodeQL is not a required check; even if CodeQL blocks, developer delays manual fix because they think Devin is working on it |
+| **Cascading effect** | Next cron run hits same rate limit → infinite retry burn with zero progress |
+
+#### EC11b: Partial session creation
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | 5 alerts need sessions. Sessions 1-3 succeed, session 4 hits rate limit |
+| **Behavior** | Some alerts dispatched, others silently dropped. Comment lists all alerts but only some have sessions |
+| **Developer perception** | Sees partial fixes come in, waits for "the rest" indefinitely |
+| **Enterprise risk** | MEDIUM — some alerts fixed, some silently abandoned. Hard to detect which ones were missed |
+| **Cascading effect** | Next run sees remaining unfixed alerts, may create duplicate sessions for already-dispatched ones (no claiming system yet) |
+
+#### EC11c: Session created but Devin fails internally
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Session returns 200, but Devin hits internal error (bad repo access, malformed prompt, snapshot failure) |
+| **Behavior** | Session exists but status is "errored" or "blocked" with no commits pushed |
+| **Developer perception** | Clicks session link, sees Devin errored out. At least there's visibility |
+| **Enterprise risk** | MEDIUM — at least the failure is discoverable via the session link |
+| **Cascading effect** | Alert stays open, next run increments attempt count, eventually marked unfixable after 2 attempts |
+
+#### EC11d: Infinite retry burn from persistent rate limiting
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Enterprise with many repos, all running cron-triggered workflows. Global session limit reached |
+| **Behavior** | Every 5 minutes, every repo's workflow tries to create sessions, gets 429, retries, fails, exits green |
+| **Developer perception** | Doesn't notice — checks are green, CI logs fill up silently |
+| **Enterprise risk** | LOW-MEDIUM — wastes CI minutes, fills logs, masks real issues. At scale (100+ repos), significant cost |
+| **Cascading effect** | When rate limit clears, all workflows fire simultaneously → thundering herd → immediately rate limited again |
+
+#### EC11e: Stale "in progress" perception
+
+| Aspect | Detail |
+|--------|--------|
+| **Trigger** | Session created successfully but Devin takes 45+ minutes (complex multi-file fix) |
+| **Behavior** | PR comment says "Devin is fixing" for extended period. Cron runs 9 more times, each seeing unfixed alerts |
+| **Developer perception** | "It's been an hour, is Devin stuck?" — no way to tell from PR comment alone |
+| **Enterprise risk** | MEDIUM — developer uncertainty, potential duplicate sessions without claiming |
+| **Cascading effect** | Combines with EC10 — without claiming, massive session waste at scale |
+
+**Proposed solutions**:
+
+**Solution 1: Workflow exit code reflects actual outcome**
+
+```
+if (alerts_found > 0 AND sessions_created == 0 AND devin_available == true):
+    exit 1  # FAIL — we found issues and couldn't dispatch a fix
+elif (alerts_found > 0 AND sessions_created < alerts_dispatched):
+    exit 1  # FAIL — partial dispatch, some alerts unhandled
+else:
+    exit 0  # OK — either no alerts, or all dispatched, or degraded mode (Devin down)
+```
+
+This makes the check red when it should be red. Combined with CodeQL's red check, the developer sees the full picture.
+
+**Important nuance**: In degraded mode (Devin API entirely unreachable, detected at health check), the workflow should still exit 0 and clearly state "Devin unavailable — CodeQL is still protecting this PR." This avoids blocking CI when Devin is down for maintenance. The exit-1 should only happen when Devin is ostensibly available but session creation fails (e.g., rate limit, partial failure).
+
+**Solution 2: Honest PR comment states**
+
+Replace the current unconditional "Devin is fixing these issues" with state-aware messaging:
+
+| State | PR Comment Message |
+|-------|--------------------|
+| All sessions created | "Devin is fixing these issues. Each fix will appear as a separate commit." |
+| Partial creation | "**WARNING**: Devin dispatched fixes for {N}/{M} alerts. {K} alerts could not be dispatched (rate limited). These require manual attention or will be retried." |
+| Total failure (rate limit) | "**FAILED**: Devin could not create any sessions (HTTP 429 — concurrent session limit). All {N} alerts require manual attention. Will retry on next run." |
+| Total failure (API error) | "**FAILED**: Devin API returned an error (HTTP {code}). All {N} alerts require manual attention." |
+| Degraded mode | "Devin is currently unavailable. {N} alerts listed below require manual review. CodeQL is still blocking this PR from merging." |
+
+**Solution 3: Exponential backoff with jitter for cron scenarios**
+
+Current: fixed 60s retry, 1 attempt.
+
+Proposed:
+```
+wait = min(base_delay * 2^attempt + random(0, jitter), max_wait)
+max_retries = 3
+```
+
+Additionally, store rate-limit state in the PR comment:
+```html
+<!-- rate_limited:1739581732:attempt_3 -->
+```
+
+Next cron run reads this marker. If `(now - timestamp) < cooldown_period`, skip session creation entirely and just report "waiting for rate limit cooldown."
+
+**Solution 4: Session budget awareness**
+
+Before creating sessions, check capacity:
+```bash
+ACTIVE=$(curl -s "https://api.devin.ai/v1/sessions?status=running" | jq '.total_count')
+LIMIT=5  # from plan tier
+AVAILABLE=$((LIMIT - ACTIVE))
+```
+
+If budget is tight, prioritize by severity:
+1. Critical alerts → always dispatch
+2. High alerts → dispatch if budget allows
+3. Medium/Low → defer to next run
+
+Document in PR comment: "Session budget: {AVAILABLE}/{LIMIT}. Dispatched {N} sessions for critical/high alerts. {K} medium-severity alerts deferred."
+
+**Solution 5: Per-alert dispatch tracking**
+
+Extend comment markers to track individual alert dispatch status:
+
+```html
+<!-- dispatched:py/sql-injection:app/server.py:18=session_abc123:1739581732 -->
+<!-- failed_dispatch:py/xss:app/server.py:46=429:1739581732 -->
+```
+
+Next run only retries `failed_dispatch` alerts, not `dispatched` ones. This prevents duplicate sessions for partially-dispatched batches.
+
+**Implementation priority** (for production readiness):
+
+| Priority | Solution | Effort | Impact |
+|----------|----------|--------|--------|
+| P0 (must-have) | Solution 1 (exit code) + Solution 2 (honest comments) | Low | Eliminates false-green problem entirely |
+| P1 (should-have) | Solution 5 (per-alert dispatch tracking) | Medium | Prevents partial-dispatch cascading |
+| P2 (nice-to-have) | Solution 3 (backoff with jitter) | Low | Reduces rate-limit thundering herd |
+| P3 (future) | Solution 4 (session budget) | Medium | Optimizes resource usage at enterprise scale |
+
+**Implementation status**: DESIGNED, not yet implemented. P0 (exit code + honest comments) should be implemented before any production deployment.
+
 ---
 
 ## Secrets and Authentication
