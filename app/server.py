@@ -54,4 +54,4 @@ def render_page():
     return f"<html><head><title>{escape(title)}</title></head><body>{escape(content)}</body></html>"
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
