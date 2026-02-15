@@ -36,10 +36,8 @@ def safe_redirect():
     parsed = urlparse(url)
     if parsed.scheme or parsed.netloc:
         abort(400, description="External redirects are not allowed")
-    target = parsed.path or "/"
-    if not target.startswith("/") or target.startswith("//") or "\\" in target:
-        abort(400, description="Only local redirects are allowed")
-    return redirect(target)
+    target = parsed.path.replace("\\", "") or "/"
+    return redirect("/" + target.lstrip("/"))
 
 if __name__ == "__main__":
     app.run(debug=False)
