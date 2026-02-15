@@ -416,6 +416,28 @@ Developer doesn't know when all fixes are applied and verified.
 6. All PRs eventually get their security review comment
 **Validates**: EC-6 stress test. Fortune 500 companies can have spikes of 50-100 PRs in a release window.
 **Key metrics**: Time to first comment, API error rate, session creation success rate.
+**Actual results (99 PRs, Feb 2026)**:
+- 99/100 PRs created successfully (1 transient git 500)
+- 11/~30 completed Devin Security Review runs failed — all HTTP 429 (concurrent session limit)
+- CodeQL: 100% success rate under load
+- CI: 100% success rate under load
+- No cross-PR contamination detected
+- GitHub REST API rate limits NOT exhausted
+- GitHub Actions queued gracefully (242 queued at peak)
+- **BUG #9 discovered**: Single 60s retry insufficient for rate limiting under load
+
+### TC-S: Rate Limit Resilience — Exponential Backoff Under Concurrent Load
+**Setup**: Open 10+ PRs with vulnerabilities within 2 minutes. This will exceed the Devin API concurrent session limit (5 sessions).
+**Expected**:
+1. First 5 PRs create sessions successfully
+2. Remaining PRs get HTTP 429 on first attempt
+3. Workflow retries with exponential backoff (60s → 120s → 240s)
+4. As earlier sessions complete, retries succeed
+5. After 3 failed retries, workflow marks session as failed but does NOT permanently block the PR
+6. PR comment shows "Devin API was temporarily at capacity" instead of a generic error
+**Validates**: EC-7 rate limit resilience. The workflow must gracefully handle Devin API capacity limits without permanently failing PRs.
+**Production scenario**: Monday morning at a Fortune 500 — 30 developers push code within 15 minutes. Only 5 Devin sessions can run concurrently. The workflow must queue and retry, not fail.
+**Worry**: Without proper backoff, a PR burst will cause cascading failures where 80%+ of security reviews fail even though the issue is purely transient capacity.
 
 ---
 

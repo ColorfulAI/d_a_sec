@@ -607,6 +607,28 @@ Pre-existing batch failures are logged but never affect the PR's pass/fail statu
 - Each PR creates its own comment, sessions, and labels — no cross-PR interference expected
 - But all PRs detect the same pre-existing alerts, creating redundant session work
 
+**Actual stress test results (99 PRs, Feb 2026)**:
+- 99/100 PRs created (1 failed due to transient git 500 error)
+- 11 out of ~30 completed Devin Security Review runs **failed** — all due to Devin API HTTP 429 ("concurrent session limit of 5")
+- The workflow's single-retry (60s wait) was insufficient: after 60s the concurrent sessions were still running, so the retry also got 429
+- CodeQL runs: 100% success rate — no failures under load
+- CI runs: 100% success rate — no failures under load
+- No cross-PR contamination detected — each PR's comment was independent
+- GitHub REST API rate limits were NOT exhausted (stayed under 5000 req/hr)
+- GitHub Actions queued runs gracefully (242 queued at peak, processing ~20 at a time)
+
+### EC-7: Devin API Rate Limiting — Insufficient Retry Logic (BUG #9)
+
+**Scenario**: Multiple concurrent workflow runs each try to create a Devin session. The Devin API enforces a concurrent session limit (e.g., 5 sessions). The first 5 succeed; the rest get HTTP 429. The workflow retries once after 60s, but the original sessions are still running, so the retry also gets 429.
+
+**Why this matters**: In a Fortune 500 environment, PR bursts are common (release branches, batch merges, CI/CD pipelines). If 20 PRs are opened in 5 minutes, only 5 will get Devin sessions — the other 15 will fail permanently with no further retry. The workflow marks these as "session creation failed" and fails the PR check, even though the failure is transient and due to capacity, not a real problem with the PR's code.
+
+**How discovered**: Stress test with 99 PRs. 11 out of ~30 completed Devin Security Review runs failed, all with the same error: `HTTP 429 — "You exceeded your concurrent session limit of 5"`. The single 60s retry was insufficient because concurrent sessions from other PRs were still active.
+
+**Design rule**: Rate limiting (429) is a transient failure. The workflow must implement exponential backoff with multiple retries (at least 3 attempts with increasing wait times: 60s, 120s, 240s) to give concurrent sessions time to complete before retrying. After all retries are exhausted, the workflow should mark the run as needing manual re-trigger rather than permanently failing.
+
+**Fix applied**: Changed from single 60s retry to 3-attempt exponential backoff (60s → 120s → 240s). Total maximum wait: 420s (7 minutes). This gives concurrent Devin sessions time to complete before retrying.
+
 ---
 
 ## Limitations and Future Work

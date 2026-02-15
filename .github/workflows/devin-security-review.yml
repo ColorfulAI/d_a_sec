@@ -855,10 +855,14 @@ jobs:
           echo "Devin API response (HTTP $HTTP_CODE):"
           echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
 
-          # Handle rate limiting with exponential backoff
-          if [ "$HTTP_CODE" = "429" ]; then
-            echo "Rate limited. Waiting 60s and retrying..."
-            sleep 60
+          # Handle rate limiting with exponential backoff (3 retries: 60s, 120s, 240s)
+          RETRY_WAIT=60
+          RETRY_COUNT=0
+          MAX_RETRIES=3
+          while [ "$HTTP_CODE" = "429" ] && [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Rate limited (429). Retry ${RETRY_COUNT}/${MAX_RETRIES} — waiting ${RETRY_WAIT}s for concurrent sessions to finish..."
+            sleep $RETRY_WAIT
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               -X POST "https://api.devin.ai/v1/sessions" \
               -H "Authorization: Bearer $DEVIN_API_KEY" \
@@ -866,8 +870,12 @@ jobs:
               -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
             BODY=$(echo "$RESPONSE" | head -n -1)
-            echo "Retry response (HTTP $HTTP_CODE):"
+            echo "Retry ${RETRY_COUNT} response (HTTP $HTTP_CODE):"
             echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+            RETRY_WAIT=$((RETRY_WAIT * 2))
+          done
+          if [ "$HTTP_CODE" = "429" ]; then
+            echo "::warning::Devin API at capacity after ${MAX_RETRIES} retries. Session creation deferred — re-run the workflow when capacity is available."
           fi
 
           SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
