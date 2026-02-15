@@ -914,9 +914,9 @@ jobs:
         if: steps.classify-alerts.outputs.total_count != '0'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
           export REPO="${{ github.repository }}"
-          export PR_NUMBER="${{ steps.pr-context.outputs.pr_number }}"
           export TOTAL_COUNT="${{ steps.classify-alerts.outputs.total_count }}"
           export NEW_COUNT="${{ steps.classify-alerts.outputs.new_in_pr_count }}"
           export PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
