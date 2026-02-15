@@ -61,7 +61,7 @@ permissions:
   pull-requests: write
 
 env:
-  DEBUG: ${{ github.event.inputs.debug == 'true' || vars.DEVIN_SECURITY_DEBUG == 'true' }}
+  DEBUG: ${{ github.event.inputs.debug != 'false' || vars.DEVIN_SECURITY_DEBUG == 'true' }}
 
 jobs:
   security-review:
@@ -559,6 +559,16 @@ jobs:
           all_unfixable = list(unfixable)
           all_unfixable_alerts = new_skipped + new_newly_unfixable + pre_skipped + pre_newly_unfixable
 
+          current_alert_keys = set()
+          for a in new_alerts + pre_alerts:
+              current_alert_keys.add(a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}"))
+
+          fixed_keys = []
+          for prev_key in history.get("attempts", {}):
+              if prev_key not in current_alert_keys and prev_key not in unfixable:
+                  fixed_keys.append(prev_key)
+                  print(f"  [FIXED] {prev_key} — no longer in CodeQL alerts")
+
           with open("/tmp/new_in_pr_actionable.json", "w") as f:
               json.dump(new_actionable, f, indent=2)
           with open("/tmp/preexisting_actionable.json", "w") as f:
@@ -566,7 +576,7 @@ jobs:
           with open("/tmp/unfixable_alerts.json", "w") as f:
               json.dump(all_unfixable_alerts, f, indent=2)
           with open("/tmp/attempt_history_updated.json", "w") as f:
-              json.dump({"attempts": attempts, "unfixable": all_unfixable}, f)
+              json.dump({"attempts": attempts, "unfixable": all_unfixable, "fixed": fixed_keys}, f)
 
           new_actionable_summary = []
           for a in new_actionable:
@@ -595,6 +605,7 @@ jobs:
               "total_unfixable": len(all_unfixable),
               "attempt_history": attempts,
               "unfixable_keys": all_unfixable,
+              "fixed_keys": fixed_keys,
           }
           with open("/tmp/debug_filter.json", "w") as f:
               json.dump(debug_filter, f, indent=2)
@@ -603,6 +614,7 @@ jobs:
           print(f"  New-in-PR actionable: {len(new_actionable)}")
           print(f"  Pre-existing actionable: {len(pre_actionable)}")
           print(f"  Unfixable (skipped): {len(all_unfixable)}")
+          print(f"  Fixed (resolved): {len(fixed_keys)}")
           FILTER_EOF
 
       # ------------------------------------------------------------------
@@ -981,6 +993,21 @@ jobs:
           except Exception:
               unfixable_alerts = []
 
+          # Load all alerts for per-alert status table
+          try:
+              with open("/tmp/new_in_pr_alerts.json") as f:
+                  all_new_alerts = json.load(f)
+          except Exception:
+              all_new_alerts = []
+          try:
+              with open("/tmp/preexisting_alerts.json") as f:
+                  all_pre_alerts = json.load(f)
+          except Exception:
+              all_pre_alerts = []
+
+          fixed_keys = history.get("fixed", [])
+          unfixable_set = set(history.get("unfixable", []))
+
           # --- Build comment body ---
           lines = []
           lines.append("<!-- devin-security-review -->")
@@ -1001,7 +1028,6 @@ jobs:
           # New-in-PR section
           if new_count != "0" and new_count:
               lines.append(f"### New Alerts (introduced in this PR): {new_count}\n")
-              lines.append(f"```\n{new_summary}\n```\n")
               if new_session_created == "true" and new_session_url:
                   lines.append("**Devin is fixing these issues.** Each fix will appear as a separate commit on this PR.\n")
                   lines.append("| What | Link |")
@@ -1013,11 +1039,36 @@ jobs:
               elif new_actionable == "0":
                   lines.append("All new alerts have been attempted (max retries reached). See unfixable section below.\n")
 
+              # Per-alert status table
+              lines.append("| Severity | Rule | File | Status | Attempts |")
+              lines.append("|----------|------|------|--------|----------|")
+              for a in all_new_alerts:
+                  key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
+                  att = history["attempts"].get(key, 0)
+                  if key in unfixable_set:
+                      status = "Needs Manual Fix"
+                  elif att >= 2:
+                      status = "Needs Manual Fix"
+                  elif att > 0:
+                      status = "In Progress"
+                  else:
+                      status = "Queued"
+                  lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | **{status}** | {att}/2 |")
+              # Show fixed alerts from previous runs
+              for fk in fixed_keys:
+                  parts = fk.split(":")
+                  if len(parts) >= 3:
+                      rule = parts[0]
+                      fpath = ":".join(parts[1:-1])
+                      fline = parts[-1]
+                      att = history["attempts"].get(fk, 1)
+                      lines.append(f"| - | `{rule}` | `{fpath}:{fline}` | **Fixed** | {att}/2 |")
+              lines.append("")
+
           # Pre-existing section
           if pre_count != "0" and pre_count:
               lines.append(f"### Pre-existing Alerts (already on main): {pre_count}\n")
               lines.append("These exist on main and were not introduced by this PR.\n")
-              lines.append(f"```\n{pre_summary}\n```\n")
               if pre_sessions_created == "true":
                   lines.append(f"**Devin is fixing these on branch `{fix_branch}`.** A separate PR will be created.\n")
                   lines.append("| Session | Link |")
@@ -1030,6 +1081,23 @@ jobs:
                   except Exception:
                       pass
                   lines.append("")
+
+              # Per-alert status table for pre-existing
+              lines.append("| Severity | Rule | File | Status | Attempts |")
+              lines.append("|----------|------|------|--------|----------|")
+              for a in all_pre_alerts:
+                  key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
+                  att = history["attempts"].get(key, 0)
+                  if key in unfixable_set:
+                      status = "Needs Manual Fix"
+                  elif att >= 2:
+                      status = "Needs Manual Fix"
+                  elif att > 0:
+                      status = "In Progress"
+                  else:
+                      status = "Queued"
+                  lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | **{status}** | {att}/2 |")
+              lines.append("")
 
           # Unfixable alerts section (critical for developer visibility)
           if unfixable_alerts:
