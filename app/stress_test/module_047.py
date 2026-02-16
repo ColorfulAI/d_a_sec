@@ -62,6 +62,4 @@ def search_47_8():
 
 @app.route("/calc_47_9")
 def calculate_47_9():
-    expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    return make_response("endpoint disabled", 403)
