@@ -279,15 +279,15 @@ jobs:
                           print("WARNING: Cursor JSON corrupted. Starting fresh.")
 
           if cursor is None:
-                  cursor = {
-                      "processed_alert_ids": [],
-                      "unfixable_alert_ids": [],
-                      "attempted_alert_ids": [],
-                      "in_progress": {},
-                      "total_fixed": 0,
-                      "total_unfixable": 0,
-                      "total_attempted": 0
-                  }
+              cursor = {
+                  "processed_alert_ids": [],
+                  "unfixable_alert_ids": [],
+                  "attempted_alert_ids": [],
+                  "in_progress": {},
+                  "total_fixed": 0,
+                  "total_unfixable": 0,
+                  "total_attempted": 0
+              }
               print("No cursor found. Starting fresh scan.")
           else:
               print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable, {len(cursor.get('attempted_alert_ids', []))} attempted")
