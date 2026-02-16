@@ -5,6 +5,7 @@ import subprocess
 import re
 import pickle
 import urllib.request
+import urllib.parse
 from flask import Flask, request, make_response
 from markupsafe import escape
 
@@ -45,7 +46,12 @@ def render_page_48_3():
 @app.route("/fetch_48_4")
 def fetch_url_48_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    ALLOWED_HOSTS = {"example.com": True, "api.example.com": True}
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return "Forbidden host", 403
+    safe_url = urllib.parse.urlunsplit((parsed.scheme, parsed.hostname, parsed.path, parsed.query, parsed.fragment))
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_48_5")
