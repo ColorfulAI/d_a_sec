@@ -690,6 +690,7 @@ jobs:
               return result.get("status", "unknown"), result.get("conclusion")
 
           def update_cursor(cursor_data):
+              nonlocal cursor_comment_id
               marker = "<!-- backlog-cursor -->"
               cursor_json = json.dumps(cursor_data, indent=2)
               body = f"{marker}\n## Backlog Sweep Cursor\n\n*Last updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}*\n\n```json\n{cursor_json}\n```\n\n---\n*Updated by [orchestrator run](https://github.com/{repo}/actions/runs/{run_id})*"
@@ -699,8 +700,12 @@ jobs:
                   result, status = gh_api("PATCH", f"{url_base}/comments/{cursor_comment_id}", {"body": body})
                   if status == 200:
                       return True
-              # Create new comment
+              # Create new comment (Bug #26 fix: save the new comment ID so subsequent
+              # calls PATCH instead of creating more comments)
               result, status = gh_api("POST", f"{url_base}/{issue_num}/comments", {"body": body})
+              if status == 201 and result.get("id"):
+                  cursor_comment_id = str(result["id"])
+                  print(f"    Created cursor comment {cursor_comment_id}")
               return status == 201
 
           # ============================================================
@@ -906,6 +911,14 @@ jobs:
                       else:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
                           failed_batches.append({**batch, "conclusion": conclusion})
+                          # Bug #27 fix: Track failed batch alerts as "attempted" in cursor.
+                          # Without this, the next orchestrator run treats them as unprocessed
+                          # and re-dispatches them. Mark as attempted so re-verification can
+                          # check if a partial fix landed, or a future run can detect them.
+                          for aid in batch["alert_ids"]:
+                              if aid not in cursor.get("attempted_alert_ids", []):
+                                  cursor.setdefault("attempted_alert_ids", []).append(aid)
+                          cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
 
                       del active_children[key]
 
@@ -993,13 +1006,15 @@ jobs:
               f.write(f"unfixable_count={len(unfixable_ids)}\n")
               f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
 
-          # Write detailed results
+          # Write detailed results (Bug #28 fix: include pr_urls for step summary)
+          batch_pr_urls = [b.get("pr_url") for b in completed_batches if b.get("pr_url")]
           results = {
               "completed": [{"batch_id": b["batch_id"], "alert_ids": b["alert_ids"]} for b in completed_batches],
-              "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion")} for b in failed_batches],
+              "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion"), "alert_ids": b.get("alert_ids", [])} for b in failed_batches],
               "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches],
               "attempted_alert_ids": attempted_ids,
-              "unfixable_alert_ids": unfixable_ids
+              "unfixable_alert_ids": unfixable_ids,
+              "pr_urls": batch_pr_urls
           }
           with open("/tmp/orchestrator_results.json", "w") as f:
               json.dump(results, f, indent=2)
@@ -1023,6 +1038,28 @@ jobs:
           echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
           echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+
+          # Bug #28 fix: Include PR URLs in step summary so enterprise teams
+          # can start reviewing immediately from the Actions UI.
+          if [ -f /tmp/orchestrator_results.json ]; then
+            PR_URLS=$(python3 -c "
+import json
+try:
+    with open('/tmp/orchestrator_results.json') as f:
+        data = json.load(f)
+    prs = data.get('pr_urls', [])
+    if prs:
+        print('\\n'.join(prs))
+except: pass
+")
+            if [ -n "$PR_URLS" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### Fix PRs Created" >> $GITHUB_STEP_SUMMARY
+              echo "$PR_URLS" | while read -r url; do
+                echo "- $url" >> $GITHUB_STEP_SUMMARY
+              done
+            fi
+          fi
 
       # ----------------------------------------------------------------
       # STEP 8: Report unfixable alerts for human review
