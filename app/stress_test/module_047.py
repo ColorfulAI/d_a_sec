@@ -11,6 +11,7 @@ from markupsafe import escape
 app = Flask(__name__)
 
 SAFE_READ_DIR = "/var/data"
+ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
 ALLOWED_URLS = {
     "example": "https://example.com",
     "api": "https://api.example.com/data",
@@ -65,7 +66,9 @@ def load_data_47_5():
 @app.route("/proc_47_6")
 def process_47_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_47_7")
