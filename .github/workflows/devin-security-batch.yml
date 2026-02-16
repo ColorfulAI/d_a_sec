@@ -60,6 +60,8 @@ jobs:
       pr_url: ${{ steps.create-pr.outputs.pr_url }}
       fixed_count: ${{ steps.collect-results.outputs.fixed_count }}
       failed_count: ${{ steps.collect-results.outputs.failed_count }}
+      fixed_alert_ids: ${{ steps.collect-results.outputs.fixed_alert_ids }}
+      unfixable_alert_ids: ${{ steps.collect-results.outputs.unfixable_alert_ids }}
       result_json: ${{ steps.collect-results.outputs.result_json }}
 
     steps:
@@ -448,64 +450,92 @@ jobs:
           SESSION_URL="${{ steps.create-session.outputs.session_url }}"
           SESSION_ID="${{ steps.create-session.outputs.session_id }}"
 
-          # Check which alerts are now fixed by re-querying CodeQL
-          # This is more accurate than counting commits (1 commit != 1 fix)
-          TOTAL=$(cat /tmp/batch_details.json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
-          FIXED=0
-          FAILED=0
+          # Determine which specific alerts were fixed vs unfixable
+          # by re-querying CodeQL for each alert in this batch.
+          # This is the source of truth — not commit counting.
+          python3 << 'RESULT_EOF'
+          import json, os, subprocess, time, urllib.request
 
-          if [ -n "$BRANCH_NAME" ] && { [ "$SESSION_STATUS" = "finished" ] || [ "$SESSION_STATUS" = "stopped" ]; }; then
-            # Check if branch has commits (Devin pushed fixes)
-            BRANCH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: token $GH_PAT" \
-              "https://api.github.com/repos/$REPO/branches/$BRANCH_NAME")
-            if [ "$BRANCH_CHECK" = "200" ]; then
-              # Count commits as rough estimate (each alert = 1 commit per prompt instructions)
-              COMMITS=$(curl -s -L \
-                -H "Authorization: token $GH_PAT" \
-                "https://api.github.com/repos/$REPO/compare/main...$BRANCH_NAME" 2>/dev/null)
-              COMMIT_COUNT=$(echo "$COMMITS" | jq '.commits | length // 0' 2>/dev/null || echo "0")
-              # Cap at total alerts (Devin can't fix more than we asked)
-              if [ "$COMMIT_COUNT" -gt "$TOTAL" ]; then
-                FIXED=$TOTAL
-              else
-                FIXED=$COMMIT_COUNT
-              fi
-            fi
-          fi
+          repo = os.environ.get("REPO", "")
+          gh_pat = os.environ.get("GH_PAT", "")
+          session_status = os.environ.get("SESSION_STATUS", "")
+          session_id = os.environ.get("SESSION_ID", "")
+          session_url = os.environ.get("SESSION_URL", "")
+          pr_number = os.environ.get("PR_NUMBER", "")
+          pr_url = os.environ.get("PR_URL", "")
+          branch_name = os.environ.get("BRANCH_NAME", "")
+          batch_id = os.environ.get("BATCH_ID", "")
+          alert_ids_str = os.environ.get("ALERT_IDS", "")
 
-          FAILED=$((TOTAL - FIXED))
-          if [ "$FAILED" -lt 0 ]; then
-            FAILED=0
-          fi
+          batch_alert_ids = [int(x.strip()) for x in alert_ids_str.split(",") if x.strip()]
+          total = len(batch_alert_ids)
 
-          echo "fixed_count=$FIXED" >> $GITHUB_OUTPUT
-          echo "failed_count=$FAILED" >> $GITHUB_OUTPUT
+          fixed_ids = []
+          unfixable_ids = []
 
-          # Build result JSON
-          python3 << RESULT_EOF
-          import json, os
+          if session_status in ("finished", "stopped") and branch_name:
+              print(f"Verifying {total} alerts against CodeQL API...")
+              headers = {
+                  "Authorization": f"token {gh_pat}",
+                  "Accept": "application/vnd.github+json"
+              }
+              for aid in batch_alert_ids:
+                  try:
+                      url = f"https://api.github.com/repos/{repo}/code-scanning/alerts/{aid}"
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req) as resp:
+                          alert = json.loads(resp.read())
+                      state = alert.get("state", "unknown")
+                      if state == "fixed":
+                          fixed_ids.append(aid)
+                          print(f"  Alert #{aid}: FIXED")
+                      elif state == "dismissed":
+                          fixed_ids.append(aid)
+                          print(f"  Alert #{aid}: DISMISSED (counts as resolved)")
+                      else:
+                          unfixable_ids.append(aid)
+                          print(f"  Alert #{aid}: STILL OPEN (state={state}) — marking unfixable")
+                  except Exception as e:
+                      print(f"  Alert #{aid}: ERROR checking ({e}) — marking unfixable")
+                      unfixable_ids.append(aid)
+                  time.sleep(0.5)  # rate limit courtesy
+          elif session_status in ("failed", "error"):
+              print(f"Session {session_status} — all {total} alerts marked unfixable")
+              unfixable_ids = list(batch_alert_ids)
+          else:
+              print(f"Session status={session_status}, branch={branch_name} — all alerts unresolved")
+              unfixable_ids = list(batch_alert_ids)
+
+          fixed_count = len(fixed_ids)
+          failed_count = len(unfixable_ids)
+
+          print(f"\nResults: {fixed_count} fixed, {failed_count} unfixable out of {total} total")
 
           result = {
-              "batch_id": os.environ.get("BATCH_ID", ""),
-              "alert_ids": os.environ.get("ALERT_IDS", "").split(","),
-              "session_id": "$SESSION_ID",
-              "session_url": "$SESSION_URL",
-              "session_status": "$SESSION_STATUS",
-              "pr_number": "$PR_NUMBER",
-              "pr_url": "$PR_URL",
-              "fixed_count": $FIXED,
-              "failed_count": $FAILED,
-              "branch_name": os.environ.get("BRANCH_NAME", "")
+              "batch_id": batch_id,
+              "alert_ids": [str(a) for a in batch_alert_ids],
+              "fixed_alert_ids": [str(a) for a in fixed_ids],
+              "unfixable_alert_ids": [str(a) for a in unfixable_ids],
+              "session_id": session_id,
+              "session_url": session_url,
+              "session_status": session_status,
+              "pr_number": pr_number,
+              "pr_url": pr_url,
+              "fixed_count": fixed_count,
+              "failed_count": failed_count,
+              "branch_name": branch_name
           }
 
           with open("/tmp/batch_result.json", "w") as f:
               json.dump(result, f, indent=2)
 
-          # Compact JSON for output
-          compact = json.dumps(result)
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
           with open(gh_out, "a") as f:
+              f.write(f"fixed_count={fixed_count}\n")
+              f.write(f"failed_count={failed_count}\n")
+              f.write(f"fixed_alert_ids={','.join(str(a) for a in fixed_ids)}\n")
+              f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
+              compact = json.dumps(result)
               f.write(f"result_json={compact}\n")
 
           print(json.dumps(result, indent=2))
@@ -529,4 +559,15 @@ jobs:
           echo "- **Status**: ${{ steps.poll-session.outputs.status }}" >> $GITHUB_STEP_SUMMARY
           echo "- **PR**: ${{ steps.create-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Fixed**: ${{ steps.collect-results.outputs.fixed_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Failed**: ${{ steps.collect-results.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unfixable (needs human review)**: ${{ steps.collect-results.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.collect-results.outputs.unfixable_alert_ids }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Alerts Requiring Human Review" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            IFS=',' read -ra UNFIXABLE <<< "${{ steps.collect-results.outputs.unfixable_alert_ids }}"
+            for aid in "${UNFIXABLE[@]}"; do
+              if [ -n "$aid" ]; then
+                echo "- [ ] Alert [#${aid}](https://github.com/${{ github.repository }}/security/code-scanning/${aid})" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
