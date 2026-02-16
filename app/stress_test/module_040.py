@@ -42,6 +42,9 @@ def render_page_40_3():
 @app.route("/fetch_40_4")
 def fetch_url_40_4():
     url = request.args.get("url")
+    ALLOWED_PREFIXES = ["https://api.example.com/"]
+    if not any(url.startswith(prefix) for prefix in ALLOWED_PREFIXES):
+        return "Forbidden URL", 403
     resp = urllib.request.urlopen(url)
     return resp.read()
 
