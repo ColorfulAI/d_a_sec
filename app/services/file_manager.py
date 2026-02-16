@@ -14,7 +14,7 @@ def read_file():
         abort(403)
     with open(full_path, "r") as f:
         content = f.read()
-    return {"content": content}
+    return jsonify(content=content)
 
 @app.route("/api/files/download")
 def download_file():
