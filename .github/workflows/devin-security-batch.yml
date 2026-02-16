@@ -298,24 +298,40 @@ jobs:
               fi
 
               STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
-              echo "Poll $POLL/$MAX_POLLS: status=$STATUS"
+              STATUS_ENUM=$(echo "$RESP" | jq -r '.status_enum // "unknown"')
+              echo "Poll $POLL/$MAX_POLLS: status=$STATUS status_enum=$STATUS_ENUM"
 
-              case "$STATUS" in
+              # Check status_enum first (well-defined API enum), then fall back to status (free-form string).
+              # Devin API status_enum values: working, blocked, expired, finished,
+              # suspend_requested, suspend_requested_frontend, resume_requested,
+              # resume_requested_frontend, resumed
+              EFFECTIVE_STATUS="$STATUS_ENUM"
+              if [ "$EFFECTIVE_STATUS" = "unknown" ] || [ "$EFFECTIVE_STATUS" = "null" ]; then
+                EFFECTIVE_STATUS="$STATUS"
+              fi
+
+              case "$EFFECTIVE_STATUS" in
                 finished|stopped)
-                  echo "Session completed with status=$STATUS"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                  echo "Session completed with status=$STATUS status_enum=$STATUS_ENUM"
+                  echo "status=finished" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
-                blocked|suspended)
-                  echo "::warning::Session is $STATUS — may need manual intervention"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                expired)
+                  echo "::warning::Session expired (status=$STATUS status_enum=$STATUS_ENUM)"
+                  echo "status=expired" >> $GITHUB_OUTPUT
+                  echo "completed=true" >> $GITHUB_OUTPUT
+                  exit 0
+                  ;;
+                blocked|suspended|suspend_requested|suspend_requested_frontend)
+                  echo "::warning::Session is $EFFECTIVE_STATUS — may need manual intervention"
+                  echo "status=$EFFECTIVE_STATUS" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
                 failed|error)
-                  echo "::error::Session failed with status=$STATUS"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                  echo "::error::Session failed with status=$STATUS status_enum=$STATUS_ENUM"
+                  echo "status=failed" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
@@ -335,7 +351,7 @@ jobs:
       # ----------------------------------------------------------------
       - name: Create PR for batch fixes
         id: create-pr
-        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended'
+        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended' || steps.poll-session.outputs.status == 'suspend_requested' || steps.poll-session.outputs.status == 'suspend_requested_frontend' || steps.poll-session.outputs.status == 'expired'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -476,7 +492,7 @@ jobs:
           fixed_ids = []
           unfixable_ids = []
 
-          if session_status in ("finished", "stopped") and branch_name:
+          if session_status in ("finished", "stopped", "expired") and branch_name:
               print(f"Verifying {total} alerts against CodeQL API...")
               headers = {
                   "Authorization": f"token {gh_pat}",
@@ -502,7 +518,7 @@ jobs:
                       print(f"  Alert #{aid}: ERROR checking ({e}) — marking unfixable")
                       unfixable_ids.append(aid)
                   time.sleep(0.5)  # rate limit courtesy
-          elif session_status in ("failed", "error"):
+          elif session_status in ("failed", "error", "timeout"):
               print(f"Session {session_status} — all {total} alerts marked unfixable")
               unfixable_ids = list(batch_alert_ids)
           else:
