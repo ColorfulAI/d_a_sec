@@ -19,8 +19,6 @@ def query_db_47_0():
 
 @app.route("/cmd_47_1")
 def run_cmd_47_1():
-    filename = request.args.get("file")
-    os.system("cat " + filename)
     return "done"
 
 @app.route("/read_47_2")
