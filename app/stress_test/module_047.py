@@ -4,6 +4,8 @@ import os
 import subprocess
 import re
 import json
+import ast
+import operator
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -11,6 +13,30 @@ from markupsafe import escape
 app = Flask(__name__)
 
 SAFE_READ_DIR = "/var/data"
+SAFE_MATH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op_func = SAFE_MATH_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operator")
+        return op_func(_safe_eval_node(node.left), _safe_eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_safe_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval_expr(expr):
+    tree = ast.parse(expr, mode='eval')
+    return _safe_eval_node(tree.body)
 ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
 ALLOWED_URLS = {
     "example": "https://example.com",
@@ -90,5 +116,5 @@ def search_47_8():
 @app.route("/calc_47_9")
 def calculate_47_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_expr(expr)
     return str(result)
