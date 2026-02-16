@@ -517,7 +517,11 @@ jobs:
               )
               try:
                   resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
-                  return json.loads(resp.read()), resp.status
+                  body = resp.read()
+                  status_code = resp.status
+                  if not body or status_code == 204:
+                      return {}, status_code
+                  return json.loads(body), status_code
               except urllib.error.HTTPError as e:
                   body = e.read().decode()[:500]
                   return {"error": body, "status": e.code}, e.code
@@ -642,6 +646,29 @@ jobs:
               time.sleep(poll_interval)
               poll_count += 1
               print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
+
+              # Re-dispatch pending batches if slots are free (Bug #13 fix)
+              if pending_batches and len(active_children) < max_concurrent:
+                  active_sessions = check_active_devin_sessions()
+                  if active_sessions < max_concurrent:
+                      batch = pending_batches.pop(0)
+                      dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                      print(f"  Re-dispatch: Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+                      if dispatch_child(batch):
+                          time.sleep(5)
+                          active_children[f"batch_{batch['batch_id']}"] = {
+                              "batch": batch,
+                              "dispatched_at": time.time(),
+                              "dispatch_time_str": dispatch_time,
+                              "run_id": None,
+                              "status": "dispatched"
+                          }
+                          print(f"  Re-dispatched successfully")
+                      else:
+                          print(f"  Re-dispatch failed — will retry next poll")
+                          pending_batches.insert(0, batch)
+                  else:
+                      print(f"  Waiting for session slots ({active_sessions} active >= {max_concurrent} limit)")
 
               # Resolve run IDs for newly dispatched children
               # NOTE: workflow_dispatch runs always show head_branch="main" and
