@@ -22,7 +22,7 @@ def search_users():
     cursor.execute("SELECT * FROM users WHERE name LIKE ?", ("%" + term + "%",))
     results = cursor.fetchall()
     conn.close()
-    return {"results": results}
+    return jsonify({"results": results})
 
 @app.route("/api/run-report")
 def run_report():
