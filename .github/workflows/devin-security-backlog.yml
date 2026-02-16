@@ -1009,7 +1009,7 @@ jobs:
           completed_batches = []
           failed_batches = []
           start_time = time.time()
-          sessions_created = 0
+          _counters = {"sessions_created": 0}
 
           if dry_run:
               print("\n=== DRY RUN MODE ===")
@@ -1024,7 +1024,6 @@ jobs:
 
           def create_and_dispatch(batch):
               """Batch mode: create Devin session first, then dispatch child with session_id."""
-              nonlocal sessions_created
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
               print(f"[BATCH] Creating session + dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
@@ -1035,7 +1034,7 @@ jobs:
                   session_id = None
                   session_url = None
               else:
-                  sessions_created += 1
+                  _counters["sessions_created"] += 1
 
               success = dispatch_child(batch, session_id=session_id, session_url=session_url)
 
@@ -1065,7 +1064,7 @@ jobs:
                   pending_batches.insert(0, batch)
                   time.sleep(10)
 
-          print(f"\n=== Initial wave dispatched: {len(active_children)} children, {sessions_created} sessions created in batch ===\n")
+          print(f"\n=== Initial wave dispatched: {len(active_children)} children, {_counters['sessions_created']} sessions created in batch ===\n")
 
           # Poll loop
           poll_count = 0
@@ -1078,7 +1077,7 @@ jobs:
 
               time.sleep(poll_interval)
               poll_count += 1
-              print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}, sessions_created: {sessions_created}) ---")
+              print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}, sessions_created: {_counters['sessions_created']}) ---")
 
               # Backfill: create session + dispatch for freed slots
               if pending_batches and len(active_children) < max_concurrent:
@@ -1261,7 +1260,7 @@ jobs:
           print(f"Orchestrator complete (BATCH MODE)")
           print(f"{'='*60}")
           print(f"  Mode: Batch session creation (sessions created up-front by orchestrator)")
-          print(f"  Sessions created in batch: {sessions_created}")
+          print(f"  Sessions created in batch: {_counters['sessions_created']}")
           print(f"  Total time: {total_time}s ({total_time//60} min)")
           print(f"  Batches completed: {len(completed_batches)}")
           print(f"  Batches failed: {len(failed_batches)}")
