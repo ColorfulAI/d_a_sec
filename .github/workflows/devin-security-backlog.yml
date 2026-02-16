@@ -602,14 +602,13 @@ jobs:
           print(f"Starting orchestrator loop")
           print(f"{'='*60}\n")
 
-          # Initial fill: dispatch up to max_concurrent
+          # Initial fill: dispatch up to max_concurrent children
+          # NOTE (Bug #14 fix): We no longer gate on check_active_devin_sessions().
+          # The Devin API session count includes sessions from ALL workflows on the
+          # account (PR reviews, other repos, etc.), which blocks dispatch even when
+          # we have capacity. Instead, we control concurrency by tracking our own
+          # active children. Child workflows handle Devin API 429 rate limits internally.
           while len(active_children) < max_concurrent and pending_batches:
-              # Check session reservation: don't use all 5 Devin slots
-              active_sessions = check_active_devin_sessions()
-              if active_sessions >= max_concurrent:
-                  print(f"  Session reservation: {active_sessions} active sessions >= {max_concurrent} limit. Waiting...")
-                  break
-
               batch = pending_batches.pop(0)
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
@@ -647,28 +646,24 @@ jobs:
               poll_count += 1
               print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
 
-              # Re-dispatch pending batches if slots are free (Bug #13 fix)
+              # Re-dispatch pending batches if child slots are free (Bug #13 + #14 fix)
               if pending_batches and len(active_children) < max_concurrent:
-                  active_sessions = check_active_devin_sessions()
-                  if active_sessions < max_concurrent:
-                      batch = pending_batches.pop(0)
-                      dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                      print(f"  Re-dispatch: Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
-                      if dispatch_child(batch):
-                          time.sleep(5)
-                          active_children[f"batch_{batch['batch_id']}"] = {
-                              "batch": batch,
-                              "dispatched_at": time.time(),
-                              "dispatch_time_str": dispatch_time,
-                              "run_id": None,
-                              "status": "dispatched"
-                          }
-                          print(f"  Re-dispatched successfully")
-                      else:
-                          print(f"  Re-dispatch failed — will retry next poll")
-                          pending_batches.insert(0, batch)
+                  batch = pending_batches.pop(0)
+                  dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                  print(f"  Re-dispatch: Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+                  if dispatch_child(batch):
+                      time.sleep(5)
+                      active_children[f"batch_{batch['batch_id']}"] = {
+                          "batch": batch,
+                          "dispatched_at": time.time(),
+                          "dispatch_time_str": dispatch_time,
+                          "run_id": None,
+                          "status": "dispatched"
+                      }
+                      print(f"  Re-dispatched successfully")
                   else:
-                      print(f"  Waiting for session slots ({active_sessions} active >= {max_concurrent} limit)")
+                      print(f"  Re-dispatch failed — will retry next poll")
+                      pending_batches.insert(0, batch)
 
               # Resolve run IDs for newly dispatched children
               # NOTE: workflow_dispatch runs always show head_branch="main" and
