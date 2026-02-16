@@ -1,7 +1,7 @@
 import re
 import sqlite3
 import subprocess
-from flask import request, Flask
+from flask import request, Flask, jsonify
 
 app = Flask(__name__)
 
@@ -13,7 +13,7 @@ def get_user():
     cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
     results = cursor.fetchall()
     conn.close()
-    return {"users": results}
+    return jsonify({"users": results})
 
 @app.route("/api/users/search")
 def search_users():
