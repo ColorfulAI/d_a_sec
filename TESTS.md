@@ -995,3 +995,39 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: Same as Bug #14 — the organization uses Devin for multiple repos. The initial fill dispatches correctly (Bug #14 fix), but after the first wave completes, backfill is blocked by external sessions. For a 34-batch backlog with max_concurrent=3, only batches 1-3 complete. Batches 4-34 are never dispatched. The orchestrator reports "31 batches remaining" and exits. The next cron run picks them up, but then the same thing happens again.
 
 **Worry**: With the session reservation gate fully removed from both initial fill AND backfill, there's no protection against overwhelming the Devin API. If max_concurrent=5 and the organization already has 5 sessions running, the orchestrator dispatches 5 children that all fail to create Devin sessions (429). The children retry with backoff, but if the organization's session usage doesn't decrease, all children eventually timeout. Consider adding a soft warning (log only, no blocking) when external session count is high.
+
+### TC-BL-REG-20: Collect-Results False Unfixable Classification (Bug #18a)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`. Let the child batch workflow create a Devin session. Wait for Devin to push fixes and the batch workflow to create a PR. Inspect the collect-results step output BEFORE the PR is merged.
+
+**Expected**:
+1. The collect-results step checks which files were modified in the branch vs main (not CodeQL alert state on main)
+2. For each alert whose file was modified in the branch → marked as `attempted` (not `unfixable`)
+3. For each alert whose file was NOT modified → marked as `unfixable`
+4. The batch result artifact contains `attempted_alert_ids` (new field) separate from `unfixable_alert_ids`
+5. The orchestrator stores attempted alerts in `cursor.attempted_alert_ids` (not in `unfixable_alert_ids`)
+6. The human review notification only fires for truly unfixable alerts (file not modified), NOT for attempted ones
+
+**Validates**: Bug #18a — the collect-results step previously queried `GET /repos/{owner}/{repo}/code-scanning/alerts/{id}` which returns alert state on the default branch (main). Since the fix PR hasn't been merged, ALL alerts show `state=open` and ALL are marked unfixable. This means every batch run reports 0 fixed, N unfixable — even when Devin's fixes are valid.
+
+**Production scenario**: A Fortune 500 company runs the nightly backlog sweep. Devin successfully fixes 18 of 20 alerts and pushes PRs. But the collect-results step marks all 20 as "unfixable" because it checks CodeQL on main before the PRs are merged. The security team gets a notification: "20 alerts require human review." They spend 2 hours reviewing and find that 18 were actually fixed by Devin. Trust in the system erodes — the team starts ignoring the notifications, which means the 2 genuinely unfixable alerts also get ignored.
+
+**Worry**: The file-modification heuristic (checking if the branch modified the alert's file) is imprecise. Devin could modify a file without actually fixing the specific alert (e.g., fixing one alert in a file with 3 alerts). The `attempted` classification is conservative — it means "Devin tried, pending verification" rather than "confirmed fixed." The definitive verification only happens after PR merge + CodeQL re-run.
+
+### TC-BL-REG-21: Unfixable Alert Re-Verification on Subsequent Runs (Bug #18b)
+
+**Setup**: Run the orchestrator once (Run A). Let it mark some alerts as "unfixable" in the cursor. Then merge the fix PR that Devin created. Wait for CodeQL to re-run on main and confirm the alerts are now `state=fixed`. Run the orchestrator again (Run B) WITHOUT resetting the cursor.
+
+**Expected**:
+1. Run B's step 5 (Filter and batch) re-queries CodeQL for each alert in `unfixable_alert_ids`
+2. Alerts that are now `state=fixed` on main → removed from `unfixable_alert_ids`, added to `processed_alert_ids`
+3. Alerts that are still `state=open` → remain in `unfixable_alert_ids`
+4. The cursor is updated with the corrected counts
+5. The human review notification on Run B only includes the truly still-unfixable alerts
+6. The `unfixable_alert_ids` list shrinks as PRs are merged (it doesn't grow monotonically)
+
+**Validates**: Bug #18b — the filter logic previously skipped any alert in `unfixable_alert_ids` without re-checking its current CodeQL state. After the fix PR was merged and the alert transitioned to `state=fixed`, the next orchestrator run still treated it as "unfixable" because it was in the cursor's skip list. The unfixable list grew monotonically and never shrank.
+
+**Production scenario**: Week 1: Devin fixes 100 alerts across 7 batches. All 100 are marked "unfixable" (Bug #18a). The security team merges all 7 PRs. Week 2: The orchestrator runs again. Without the Bug #18b fix, the cursor still shows 100 unfixable alerts despite all being resolved. The dashboard permanently shows "100 alerts need human review" even though zero actually do. With the fix, Run B re-verifies and finds all 100 are now "fixed" → moves them to processed → dashboard shows "100 fixed, 0 need review."
+
+**Worry**: The re-verification step queries CodeQL for every alert in `unfixable_alert_ids` on every run. For large backlogs with many unfixable alerts (e.g., 500), this adds 500 API calls per run. With rate limiting (0.5s per call), that's ~4 minutes of additional startup time. Consider batching the re-verification (e.g., `GET /repos/.../code-scanning/alerts?state=fixed`) or only re-verifying alerts whose associated PR has been merged since the last run.

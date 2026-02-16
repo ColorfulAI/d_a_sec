@@ -1331,10 +1331,21 @@ If any unfixable alerts exist after the orchestrator completes:
 
 ### Edge Cases and Worries
 
-**Worry: CodeQL API returns stale state**
+**Worry: CodeQL API returns stale state (Bug #18 — CONFIRMED)**
 After Devin pushes a fix, the CodeQL alert state might not immediately flip to "fixed" because CodeQL re-analysis needs to run on the default branch. The batch workflow queries CodeQL right after the session completes, which may be before the fix is merged.
 
-**Mitigation**: The batch workflow checks alert state on the `main` branch. Since the fix is on a PR branch (not yet merged), alerts will likely still show as "open." This means the first run may over-report unfixable alerts. On the next orchestrator run (after PRs are merged), the re-query will correctly show them as "fixed" and they'll be removed from the unfixable list. This is a conservative approach — better to over-report than under-report.
+**Original mitigation (INSUFFICIENT)**: The batch workflow checks alert state on the `main` branch. Since the fix is on a PR branch (not yet merged), alerts will likely still show as "open." This means the first run over-reports ALL alerts as unfixable. The design claimed "on the next orchestrator run, they'll be removed from the unfixable list" — but this was never implemented. The filter logic at step 5 skips any alert in `unfixable_alert_ids` without re-checking its current state. So once an alert is marked unfixable, it stays unfixable forever, even after the PR is merged and the alert is actually fixed.
+
+**Bug #18 — Two-part issue**:
+
+**Part A: False unfixable classification.** The collect-results step queries `GET /repos/{owner}/{repo}/code-scanning/alerts/{id}` which returns the alert state on the default branch (main). Since the fix PR hasn't been merged yet, ALL alerts show `state=open`, and ALL are marked unfixable. This means every batch run reports 0 fixed, N unfixable — even when Devin's fixes are valid. The human review notification fires for every alert, flooding the security team with false positives.
+
+**Part B: No re-verification on subsequent runs.** The filter logic (step 5, lines 326-338) skips alerts in `unfixable_alert_ids` without re-querying their current CodeQL state. After the fix PR is merged and the alert transitions to `state=fixed`, the next orchestrator run still treats it as "unfixable" because it's in the cursor's skip list. The `unfixable_alert_ids` list grows monotonically and never shrinks.
+
+**Solution (Bug #18 fix)**:
+1. **Collect-results**: Instead of querying alert state on main (which will always be "open" pre-merge), check if the branch has commits modifying the files containing each alert. If the file was modified → mark as `attempted` (likely fixed, pending PR merge). If the file was NOT modified → mark as `unfixable` (Devin didn't touch it).
+2. **Orchestrator re-verification**: On each run, before skipping alerts in `unfixable_alert_ids`, re-query CodeQL for each unfixable alert. If the alert is now `state=fixed` (PR was merged), remove it from `unfixable_alert_ids` and add to `processed_alert_ids`. This implements the "self-healing" behavior the design originally promised.
+3. **Three-state classification**: Alerts now have three states in the cursor: `processed` (confirmed fixed), `unfixable` (confirmed not fixed — file was not modified by Devin), and `attempted` (fix was pushed but not yet merged — pending verification).
 
 **Worry: Artifact download fails**
 If the orchestrator can't download the batch result artifact (permissions, timing, GitHub API issue), it falls back to marking all alerts as "processed" — losing the fixed/unfixable distinction.
