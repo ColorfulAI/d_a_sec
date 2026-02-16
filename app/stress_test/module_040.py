@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import re
+import ast
 import urllib.request
 from markupsafe import escape
 from flask import Flask, request, make_response
@@ -65,7 +67,6 @@ def process_40_6():
 @app.route("/ping_40_7")
 def check_status_40_7():
     host = request.args.get("host")
-    import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', host):
         return "Invalid host", 400
     result = subprocess.run(["ping", "-c", "1", host], capture_output=True, check=False)
@@ -82,7 +83,6 @@ def search_40_8():
 @app.route("/calc_40_9")
 def calculate_40_9():
     expr = request.args.get("expr")
-    import ast
     allowed = re.compile(r'^[0-9+\-*/()._ ]+$')
     if not allowed.match(expr):
         return "Invalid expression", 400
