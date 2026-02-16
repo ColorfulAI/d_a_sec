@@ -285,13 +285,16 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
           SESSION_ID: ${{ steps.create-session.outputs.session_id }}
         run: |
+          # Bug #43 fix: Per Devin API docs, "blocked" and "finished" are BOTH
+          # terminal states. The official polling example treats them equivalently:
+          #   if status_enum in ["blocked", "finished"]: return results
+          # Sessions go "blocked" when Devin completes its work and sends a final
+          # message with block_on_user=true. This is normal completion behavior,
+          # NOT an error. Previous unblock attempts (Bugs #34, #37, #41) wasted
+          # ~13 min per batch fighting against this designed behavior.
           MAX_POLLS=45
           POLL_INTERVAL=60
           POLL=0
-          UNBLOCK_ATTEMPTS=0
-          MAX_UNBLOCK_ATTEMPTS=5
-          LAST_STATUS="unknown"
-          CONSECUTIVE_BLOCKED=0
 
           echo "Polling session $SESSION_ID every ${POLL_INTERVAL}s (max ${MAX_POLLS} polls = $(( MAX_POLLS * POLL_INTERVAL / 60 )) min)..."
 
@@ -319,23 +322,10 @@ jobs:
                 EFFECTIVE_STATUS="$STATUS"
               fi
 
-              # Bug #37 fix: Reset unblock counter when session resumes working after being blocked.
-              if [ "$LAST_STATUS" = "blocked" ] && [ "$EFFECTIVE_STATUS" = "working" ]; then
-                echo "Session resumed working after unblock — resetting counters (was $UNBLOCK_ATTEMPTS/$MAX_UNBLOCK_ATTEMPTS, consecutive=$CONSECUTIVE_BLOCKED)"
-                UNBLOCK_ATTEMPTS=0
-                CONSECUTIVE_BLOCKED=0
-              fi
-              if [ "$EFFECTIVE_STATUS" = "blocked" ]; then
-                CONSECUTIVE_BLOCKED=$((CONSECUTIVE_BLOCKED + 1))
-              else
-                CONSECUTIVE_BLOCKED=0
-              fi
-              LAST_STATUS="$EFFECTIVE_STATUS"
-
               case "$EFFECTIVE_STATUS" in
-                finished|stopped)
-                  echo "Session completed with status=$STATUS status_enum=$STATUS_ENUM"
-                  echo "status=finished" >> $GITHUB_OUTPUT
+                finished|stopped|blocked)
+                  echo "Session reached terminal state: status=$STATUS status_enum=$STATUS_ENUM"
+                  echo "status=$EFFECTIVE_STATUS" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
@@ -344,42 +334,6 @@ jobs:
                   echo "status=expired" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
-                  ;;
-                blocked)
-                  if [ $UNBLOCK_ATTEMPTS -lt $MAX_UNBLOCK_ATTEMPTS ]; then
-                    UNBLOCK_ATTEMPTS=$((UNBLOCK_ATTEMPTS + 1))
-                    echo "Session blocked (consecutive=$CONSECUTIVE_BLOCKED) — sending unblock message (attempt $UNBLOCK_ATTEMPTS/$MAX_UNBLOCK_ATTEMPTS)..."
-                    if [ $UNBLOCK_ATTEMPTS -le 2 ]; then
-                      UNBLOCK_MSG="CRITICAL: You are running in an UNATTENDED CI/CD pipeline with NO human operator. You MUST continue working immediately. Do NOT use block_on_user=true. Do NOT ask questions. Do NOT wait for confirmation. Resume fixing the remaining security alerts right now. If you cannot fix an alert, skip it and move to the next one. When all alerts are done, push your changes to the branch and finish the session. Do not stop."
-                    else
-                      UNBLOCK_MSG="URGENT: This is attempt $UNBLOCK_ATTEMPTS to unblock you. You are in a fully automated pipeline. There is no human to respond. You MUST continue autonomously. If you are stuck on a particular alert, SKIP IT immediately and move to the next one. If you have finished all alerts you can fix, push your branch now and end the session. Do not wait for anything."
-                    fi
-                    MSG_JSON=$(echo "$UNBLOCK_MSG" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")
-                    MSG_RESP=$(curl -s -w "\n%{http_code}" \
-                      -X POST "https://api.devin.ai/v1/sessions/$SESSION_ID/message" \
-                      -H "Authorization: Bearer $DEVIN_API_KEY" \
-                      -H "Content-Type: application/json" \
-                      -d "{\"message\": $MSG_JSON}")
-                    MSG_HTTP=$(echo "$MSG_RESP" | tail -1)
-                    MSG_BODY=$(echo "$MSG_RESP" | sed '$d')
-                    echo "Unblock message sent (HTTP $MSG_HTTP). Response: $MSG_BODY"
-                    # Wait longer between attempts: 120s for first 2, then 180s
-                    if [ $UNBLOCK_ATTEMPTS -le 2 ]; then
-                      WAIT_TIME=120
-                    else
-                      WAIT_TIME=180
-                    fi
-                    echo "Waiting ${WAIT_TIME}s for session to process unblock message..."
-                    if [ $POLL -lt $MAX_POLLS ]; then
-                      sleep $WAIT_TIME
-                    fi
-                    continue
-                  else
-                    echo "::warning::Session blocked after $MAX_UNBLOCK_ATTEMPTS unblock attempts (consecutive blocked polls: $CONSECUTIVE_BLOCKED) — accepting as terminal"
-                    echo "status=blocked" >> $GITHUB_OUTPUT
-                    echo "completed=true" >> $GITHUB_OUTPUT
-                    exit 0
-                  fi
                   ;;
                 suspended|suspend_requested|suspend_requested_frontend)
                   echo "::warning::Session is $EFFECTIVE_STATUS — may need manual intervention"

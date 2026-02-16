@@ -1489,6 +1489,28 @@ The user observed that PRs #111 and #112 (created by the batch workflow) still f
 
 **Remaining gap**: Even with explicit instructions, Devin sessions may still skip CodeQL verification if they run out of ACU budget or encounter CodeQL installation failures. A production-grade solution would be to add a post-session CodeQL check in the batch workflow itself (Step 5c), running CodeQL on the branch and comparing results to the original alert list. This is documented as a future enhancement.
 
+**Worry: "Blocked" sessions are NOT stuck — they are COMPLETED (Bug #43 — ROOT CAUSE FOUND)**
+
+Across all 5 test cycles, every Devin session ended with `status_enum=blocked`. Bugs #34, #37, and #41 attempted increasingly aggressive mitigations (unblock messages, escalating urgency, longer waits, CRITICAL OPERATING MODE prompt). None worked — sessions always ended blocked.
+
+**Root cause**: The Devin API documentation's official polling example treats `blocked` and `finished` as **equivalent terminal states**:
+```python
+if response_json["status_enum"] in ["blocked", "finished"]:
+    return response_json["structured_output"]
+```
+Sessions go `blocked` when Devin completes its work and sends a final message with `block_on_user=true`. This is **normal completion behavior**, not an error. The `POST /v1/sessions/{session_id}/message` API successfully delivers messages (HTTP 200) but doesn't change the session's terminal state — because the session is already done.
+
+**Evidence from Cycle 5**:
+- Batch 1: Session worked 11 min (polls 2-11), modified all 3 target files, pushed branch, went blocked at poll 12. 5 unblock attempts over 13 min — all wasted.
+- Batch 2: Session worked 17 min (polls 2-18), modified all 3 target files, pushed branch, went blocked at poll 19. 5 unblock attempts over 13 min — all wasted.
+- Both sessions completed their work BEFORE blocking. The blocking was Devin saying "I'm done."
+
+**Production impact**: Critical performance — each batch wasted ~13 minutes on unnecessary unblock attempts (5 attempts × 120-180s waits). For a 34-batch backlog across 7 waves, this adds ~91 minutes of pure waste (13 min × 7 waves). A backlog that should complete in ~70 min takes ~160 min.
+
+**Solution (Bug #43 fix)**: Treat `blocked` as equivalent to `finished` in the polling loop — immediately accept as terminal success and proceed to PR creation. Removed all unblock infrastructure (UNBLOCK_ATTEMPTS, MAX_UNBLOCK_ATTEMPTS, CONSECUTIVE_BLOCKED, escalating messages, wait timers). The subsequent steps (branch check, PR creation, result classification) already handle partial work correctly via the file-modification heuristic.
+
+**This supersedes Bugs #34, #37, and #41** — those were treating a symptom (blocked status) as a problem, when it was actually the expected completion signal.
+
 ---
 
 ## Limitations and Future Work
