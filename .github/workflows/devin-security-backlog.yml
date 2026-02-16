@@ -814,7 +814,9 @@ jobs:
           def build_session_prompt(batch, alert_details_json, alert_summary):
               """Build the Devin session prompt with CodeQL config."""
               import textwrap
-              primary_lang = codeql_languages.split(",")[0]
+              # Bug #47 fix: filter out 'actions' (scans YAML only) when real code languages exist
+              code_langs = [l for l in codeql_languages.split(",") if l != "actions"]
+              primary_lang = code_langs[0] if code_langs else codeql_languages.split(",")[0]
               query_pack = f"codeql/{primary_lang}-queries:codeql-suites/{primary_lang}-{codeql_query_suite}.qls"
               threat_display = " AND ".join(codeql_threat_models.split(","))
               threat_flags = ""
