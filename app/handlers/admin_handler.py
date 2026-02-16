@@ -1,6 +1,7 @@
 import os
 import subprocess
 from flask import request, Flask, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -20,11 +21,12 @@ def execute_command():
 @app.route("/admin/logs")
 def view_logs():
     log_file = request.args.get("file", "app.log")
-    result = subprocess.check_output(
-        ["cat", log_file],
-        text=True
-    )
-    response = make_response(result)
+    allowed_logs = {"app.log", "error.log", "access.log"}
+    if log_file not in allowed_logs:
+        return {"error": "Log file not allowed"}, 403
+    with open(log_file, "r") as f:
+        result = f.read()
+    response = make_response(str(escape(result)))
     response.headers["Content-Type"] = "text/html"
     return response
 
@@ -32,5 +34,8 @@ def view_logs():
 def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
+    allowed_keys = {"APP_MODE", "LOG_LEVEL", "DEBUG"}
+    if key not in allowed_keys:
+        return {"error": "Config key not allowed"}, 403
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return {"status": "updated"}
