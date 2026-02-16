@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import pickle
+import html
 import urllib.request
 from flask import Flask, request, make_response, Response
 
@@ -36,7 +37,8 @@ def read_file_45_2():
 @app.route("/render_45_3")
 def render_page_45_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    safe_name = html.escape(name)
+    return make_response("<html><body>Hello " + safe_name + "</body></html>")
 
 @app.route("/fetch_45_4")
 def fetch_url_45_4():
