@@ -454,7 +454,10 @@ jobs:
           # by re-querying CodeQL for each alert in this batch.
           # This is the source of truth — not commit counting.
           python3 << 'RESULT_EOF'
-          import json, os, subprocess, time, urllib.request
+          import json, os, sys, subprocess, time, urllib.request
+
+          sys.stdout.reconfigure(line_buffering=True)
+          HTTP_TIMEOUT = 30
 
           repo = os.environ.get("REPO", "")
           gh_pat = os.environ.get("GH_PAT", "")
@@ -483,7 +486,7 @@ jobs:
                   try:
                       url = f"https://api.github.com/repos/{repo}/code-scanning/alerts/{aid}"
                       req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req) as resp:
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                           alert = json.loads(resp.read())
                       state = alert.get("state", "unknown")
                       if state == "fixed":
