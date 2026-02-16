@@ -690,7 +690,7 @@ jobs:
               return result.get("status", "unknown"), result.get("conclusion")
 
           def update_cursor(cursor_data):
-              nonlocal cursor_comment_id
+              global cursor_comment_id
               marker = "<!-- backlog-cursor -->"
               cursor_json = json.dumps(cursor_data, indent=2)
               body = f"{marker}\n## Backlog Sweep Cursor\n\n*Last updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}*\n\n```json\n{cursor_json}\n```\n\n---\n*Updated by [orchestrator run](https://github.com/{repo}/actions/runs/{run_id})*"
