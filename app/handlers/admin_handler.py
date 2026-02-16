@@ -1,5 +1,4 @@
 import os
-import re
 import shlex
 import subprocess
 from flask import request, Flask, jsonify, make_response
