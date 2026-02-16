@@ -1,6 +1,7 @@
-from flask import request, Flask, make_response
+import json
+
+from flask import request, Flask, jsonify, make_response
 from markupsafe import escape
-import pickle
 import base64
 import yaml
 
@@ -18,8 +19,8 @@ def render_template():
 def deserialize_data():
     encoded = request.form.get("data", "")
     decoded = base64.b64decode(encoded)
-    obj = pickle.loads(decoded)
-    return {"result": str(obj)}
+    obj = json.loads(decoded)
+    return jsonify(result=str(obj))
 
 @app.route("/api/parse-config", methods=["POST"])
 def parse_config():
