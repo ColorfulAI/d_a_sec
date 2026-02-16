@@ -20,7 +20,7 @@ def search_users():
     term = request.args.get("q", "")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE name LIKE '%" + term + "%'")
+    cursor.execute("SELECT * FROM users WHERE name LIKE ?", ("%" + term + "%",))
     results = cursor.fetchall()
     conn.close()
     return {"results": results}
