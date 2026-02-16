@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      dispatch_ref:
+        description: "Branch ref for child workflow dispatch (default: current branch)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -78,6 +83,7 @@ jobs:
       POLL_INTERVAL: 60
       MAX_CHILD_RUNTIME: 3600
       SAFETY_TIMEOUT: 19800
+      DISPATCH_REF: ${{ github.event.inputs.dispatch_ref || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -506,11 +512,13 @@ jobs:
                   print(f"  Warning: Could not check active sessions: {e}")
                   return 0
 
+          dispatch_ref = os.environ.get("DISPATCH_REF", "main")
+
           def dispatch_child(batch):
               alert_ids_str = ",".join(str(a) for a in batch["alert_ids"])
               url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/dispatches"
               data = {
-                  "ref": "main",
+                  "ref": dispatch_ref,
                   "inputs": {
                       "batch_id": str(batch["batch_id"]),
                       "alert_ids": alert_ids_str,
