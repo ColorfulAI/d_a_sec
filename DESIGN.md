@@ -1130,6 +1130,26 @@ The split can be implemented incrementally:
 
 **After** (fixed): Batch 1 gets ALL 10 alerts in `user_service.py` → PR modifies file → CodeQL finds 0 remaining → PASS
 
+### Bug #10: Orchestrator Cannot Resolve Child Workflow Run IDs
+
+**Discovered**: During iteration 2. The orchestrator (run 22053695399) ran for 56+ minutes without ever detecting that its child batch workflow (run 22053848997) had completed successfully. The orchestrator was stuck in an infinite polling loop.
+
+**Root cause**: `workflow_dispatch` runs always report `head_branch: "main"` and `display_title: "Devin Security Batch"` in their GitHub API metadata — they do NOT contain the batch branch name or batch ID anywhere. The orchestrator's run resolution logic tried to match by `batch_branch in str(run)` and `batch_id_str in run_title`, but neither ever matched because the metadata simply doesn't include this information.
+
+**Timeline**:
+1. Orchestrator dispatches child for Batch 1 at 07:22:54 UTC, records `branch_name: "devin/security-batch-test1-1771226943"`
+2. Child workflow (run 22053848997) starts at 07:29:05 UTC, runs for ~38 min, completes at 08:07:30 UTC
+3. Orchestrator polls every 60s, tries to match child run by checking if `"devin/security-batch-test1-1771226943"` appears in the run JSON
+4. GitHub API returns `head_branch: "main"` for the run — no match
+5. After 5 minutes of no match, orchestrator re-dispatches the batch → creates duplicate run (22053854689, which gets cancelled)
+6. The cycle repeats: dispatch → fail to resolve → timeout → re-dispatch
+
+**Why this is critical in production**: With 5 concurrent batch children, the orchestrator would create an infinite cascade of duplicate dispatches. Each re-dispatch creates a new Devin session (consuming a slot), and the orchestrator would eventually exhaust all session slots with duplicate work. At Fortune 500 scale, this burns through ACU budget and creates conflicting fix PRs.
+
+**Solution**: Replace content-based matching with timestamp-based matching. The orchestrator now assigns the first unmatched `workflow_dispatch` run whose `created_at >= dispatch_time`. An `already_matched` set prevents double-assignment across concurrent children.
+
+**Caveat**: If two batches are dispatched within the same second, timestamp ordering alone may swap which run is assigned to which batch. This is acceptable because: (1) dispatches are separated by `time.sleep(5)`, and (2) each child workflow is self-contained (the batch details are passed as inputs, not inferred from run metadata).
+
 ---
 
 ## Unfixable Alert → Human Review Pipeline
