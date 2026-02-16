@@ -7,8 +7,15 @@ app = Flask(__name__)
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
-    return {"output": output}
+    allowed_commands = {
+        "status": ["systemctl", "status"],
+        "health": ["echo", "healthy"],
+        "version": ["python", "--version"],
+    }
+    if cmd not in allowed_commands:
+        return {"error": "Command not allowed"}, 403
+    result = subprocess.run(allowed_commands[cmd], capture_output=True, text=True)
+    return {"output": result.stdout}
 
 @app.route("/admin/logs")
 def view_logs():
