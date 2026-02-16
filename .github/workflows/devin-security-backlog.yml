@@ -529,20 +529,6 @@ jobs:
               result, status = gh_api("POST", url, data)
               return status == 204
 
-          def find_child_run(batch_id, after_time):
-              url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=10&created=>={after_time}"
-              result, status = gh_api("GET", url)
-              if status != 200:
-                  return None
-              for run in result.get("workflow_runs", []):
-                  # Match by checking inputs in the run
-                  run_url = f"https://api.github.com/repos/{repo}/actions/runs/{run['id']}"
-                  run_detail, _ = gh_api("GET", run_url)
-                  # For workflow_dispatch runs, we can check the name/title
-                  if run.get("status") != "completed" or True:
-                      return run
-              return None
-
           def check_child_status(run_id_val):
               url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}"
               result, status = gh_api("GET", url)
@@ -632,19 +618,28 @@ jobs:
               # Resolve run IDs for newly dispatched children
               for key, child in list(active_children.items()):
                   if child["run_id"] is None:
-                      # Search for the workflow run
+                      # Search for the workflow run by matching branch_name in run jobs
                       url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch"
                       result, status = gh_api("GET", url)
                       if status == 200:
+                          already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
+                          batch_branch = child["batch"]["branch_name"]
                           for run in result.get("workflow_runs", []):
                               run_created = run.get("created_at", "")
-                              if run_created >= child["dispatch_time_str"]:
-                                  # Check if this run matches our batch
-                                  # We'll use the most recent unmatched run
-                                  run_id_val = run["id"]
-                                  if str(run_id_val) not in [str(c.get("run_id")) for c in active_children.values() if c.get("run_id")]:
+                              run_id_val = run["id"]
+                              if run_created >= child["dispatch_time_str"] and str(run_id_val) not in already_matched:
+                                  # Try to verify via run's display_title or head_branch
+                                  run_title = run.get("display_title", "")
+                                  run_branch = run.get("head_branch", "")
+                                  batch_id_str = str(child["batch"]["batch_id"])
+                                  if batch_id_str in run_title or batch_branch in str(run):
                                       child["run_id"] = run_id_val
-                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val}")
+                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (matched by content)")
+                                      break
+                                  elif len([c for c in active_children.values() if c.get("run_id") is None]) == 1:
+                                      # Only one unresolved child — safe to match
+                                      child["run_id"] = run_id_val
+                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (single unresolved)")
                                       break
 
               # Check status of active children
@@ -677,7 +672,7 @@ jobs:
                           for aid in batch["alert_ids"]:
                               if aid not in cursor["processed_alert_ids"]:
                                   cursor["processed_alert_ids"].append(aid)
-                          cursor["total_fixed"] = len(cursor["processed_alert_ids"])
+                          cursor["total_processed"] = len(cursor["processed_alert_ids"])
                       else:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
                           failed_batches.append({**batch, "conclusion": conclusion})
