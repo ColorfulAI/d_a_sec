@@ -6,6 +6,7 @@ import pickle
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
@@ -24,8 +25,10 @@ def run_cmd_47_1():
 @app.route("/read_47_2")
 def read_file_47_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_name = secure_filename(path)
+    full_path = os.path.join("/var/data", safe_name)
+    with open(full_path, "r") as f:
+        return make_response(escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_47_3")
 def render_page_47_3():
