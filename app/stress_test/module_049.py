@@ -97,7 +97,9 @@ def search_49_8():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
-    return str(cursor.fetchall())
+    resp = make_response(html.escape(str(cursor.fetchall())))
+    resp.content_type = "text/plain"
+    return resp
 
 @app.route("/calc_49_9")
 def calculate_49_9():
