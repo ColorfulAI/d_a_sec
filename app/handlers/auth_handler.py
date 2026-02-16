@@ -12,6 +12,9 @@ def _hash_password(password):
     ).hex()
 
 
+ALLOWED_REDIRECT_PREFIXES = ["/dashboard", "/profile", "/settings", "/account"]
+
+
 @app.route("/login", methods=["POST"])
 def login():
     username = request.form.get("username", "")
@@ -29,8 +32,10 @@ def login():
 
     if user:
         session["user_id"] = user[0]
-        redirect_url = request.args.get("next", "/dashboard")
-        return redirect(redirect_url)
+        next_url = request.args.get("next", "/dashboard")
+        if next_url in ALLOWED_REDIRECT_PREFIXES:
+            return redirect(ALLOWED_REDIRECT_PREFIXES[ALLOWED_REDIRECT_PREFIXES.index(next_url)])
+        return redirect("/dashboard")
 
     return {"error": "Invalid credentials"}, 401
 
