@@ -9,6 +9,7 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
 ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
 
 @app.route("/query_44_0")
@@ -63,7 +64,10 @@ def load_data_44_5():
 @app.route("/proc_44_6")
 def process_44_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        return "Command not allowed", 403
+    result = subprocess.run([safe_cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_44_7")
