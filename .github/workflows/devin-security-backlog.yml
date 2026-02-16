@@ -704,7 +704,21 @@ jobs:
               # calls PATCH instead of creating more comments)
               result, status = gh_api("POST", f"{url_base}/{issue_num}/comments", {"body": body})
               if status == 201 and result.get("id"):
-                  cursor_comment_id = str(result["id"])
+                  new_id = str(result["id"])
+                  # Bug #32 fix: Delete stale cursor comments from previous runs.
+                  # This keeps the tracking issue clean with exactly one active cursor comment.
+                  try:
+                      comments_result, c_status = gh_api("GET", f"{url_base}/{issue_num}/comments?per_page=100")
+                      if c_status == 200 and isinstance(comments_result, list):
+                          for c in comments_result:
+                              c_id = str(c.get("id", ""))
+                              if c_id != new_id and marker in c.get("body", ""):
+                                  _, del_status = gh_api("DELETE", f"{url_base}/comments/{c_id}")
+                                  if del_status == 204:
+                                      print(f"    Deleted stale cursor comment {c_id}")
+                  except Exception as e:
+                      print(f"    Warning: stale cursor cleanup failed ({e}), continuing")
+                  cursor_comment_id = new_id
                   print(f"    Created cursor comment {cursor_comment_id}")
               return status == 201
 

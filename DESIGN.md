@@ -1461,6 +1461,36 @@ The Bug #28 fix added inline Python code inside a `$(python3 -c "...")` command 
 
 **Solution (Bug #29 fix)**: Collapsed the Python code into a single-line expression: `python3 -c "import json; data=json.load(open('/tmp/orchestrator_results.json')); prs=data.get('pr_urls',[]); print('\n'.join(prs)) if prs else None" 2>/dev/null`. Error handling via `2>/dev/null` replaces the `try/except` block.
 
+**Worry: Alert state race condition between orchestrator fetch and batch fetch (Bug #30 — CONFIRMED)**
+
+The orchestrator fetches all open CodeQL alerts on main, groups them into batches, and dispatches child workflows with alert IDs. Each child workflow then re-fetches alert details by ID before creating the Devin session. Between these two fetches (~20 seconds apart), an alert's state can change (e.g., a concurrent CodeQL run closes an alert because a fix PR was merged).
+
+**Observed behavior (Cycle 2 run 22063161984)**: Alert #224 was "open" when the orchestrator fetched 23 alerts. By the time Batch 2 fetched it 20 seconds later, it was "fixed". Batch 2 correctly skipped it ("Alert #224 state=fixed — skipping") and processed 10 of 11 alerts. The orchestrator summary reported "Total alerts processed: 23" even though only 22 were actually processed by Devin.
+
+**Production impact**: Minor — the batch workflow handles this gracefully. The skipped alert doesn't cause errors. However, the count mismatch (23 dispatched vs 22 processed) could confuse enterprise teams reviewing the summary. In a Fortune 500 repo with frequent CI runs, this race condition will occur regularly.
+
+**Mitigation**: This is inherent to any system with a fetch-then-process gap. The current behavior (skip already-fixed alerts at batch level) is correct. No code fix needed — the batch workflow already handles it.
+
+**Worry: Devin sessions ending "blocked" instead of "finished" (Bug #31 — OBSERVED)**
+
+Both Devin sessions in Cycle 2 ended with `status_enum=blocked` rather than `finished`. The "blocked" status indicates the session is waiting for user input. This suggests Devin encountered something it wasn't sure about and asked a question instead of completing autonomously.
+
+**Observed behavior (Cycle 2 batch runs)**: Both batch workflows showed "Poll 15/45: status=running status_enum=blocked" after ~14 minutes. The batch workflow correctly handled this (Bug #23 fix — "blocked" sessions proceed to PR creation and result collection).
+
+**Production impact**: Sessions that end "blocked" may have incomplete fixes. The three-state classification (Bug #18 fix) correctly marks modified files as "attempted" rather than "fixed", so no data loss occurs. However, the Devin prompt may need refinement to avoid asking questions during automated batch processing (e.g., adding "Do not ask questions — if you are unsure, skip the alert and note it as unfixable").
+
+**Mitigation**: Prompt engineering improvement. Add explicit instruction to the batch session prompt: "This is an unattended automated run. Do not ask questions or wait for input. If you are unsure about a fix, skip the alert and note it as unfixable."
+
+**Worry: Stale cursor comments accumulate on tracking issue (Bug #32 — CONFIRMED)**
+
+Before Bug #26 was fixed, every orchestrator run created N+1 cursor comments (one per `update_cursor()` call). After Bug #26, each run creates exactly 1 cursor comment. However, the stale comments from previous runs remain on the tracking issue, cluttering it for enterprise teams.
+
+**Observed behavior (Cycle 2 investigation)**: Issue #108 had 15 cursor comments total — 14 stale from pre-fix runs and 1 current from Cycle 2. The stale comments contain outdated cursor state that is never read (the code always uses the latest comment).
+
+**Production impact**: Over months of scheduled runs, the tracking issue accumulates hundreds of stale cursor comments. GitHub's issue comment pagination (100 per page) could theoretically push the active cursor past page 1, though the code searches all pages. For enterprise teams monitoring the issue, the stale comments obscure the current state.
+
+**Solution (Bug #32 fix)**: When `update_cursor()` creates a new cursor comment (POST), delete any previous cursor comments on the same issue. This keeps the tracking issue clean with exactly one active cursor comment at any time.
+
 ---
 
 ## Limitations and Future Work

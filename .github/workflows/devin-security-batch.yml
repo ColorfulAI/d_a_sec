@@ -203,6 +203,7 @@ jobs:
           7. Push all commit(s) to branch '${BRANCH_NAME}'
 
           IMPORTANT:
+          - This is an UNATTENDED AUTOMATED run. Do NOT ask questions or wait for user input. If you are unsure about a fix, skip the alert and note it as unfixable.
           - Each security issue MUST be a separate commit
           - Do NOT just suppress or ignore alerts — fix the root cause
           - Keep fixes minimal and surgical — do not refactor unrelated code

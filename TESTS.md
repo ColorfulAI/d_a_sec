@@ -1260,3 +1260,74 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #29 — Multi-line Python code embedded in YAML `run: |` blocks inside `$(...)` command substitutions must either be collapsed to a single line or use a properly indented heredoc (`python3 << 'EOF'`). The multi-line `$(python3 -c "...")` pattern is a YAML footgun that is not caught by any CI check — only by attempting to dispatch.
 
 **Worry**: There is no automated CI check that validates GitHub Actions YAML files before merge. A broken YAML file can be merged to main and silently disable the workflow. In production, this means the scheduled backlog sweep stops running with no alert to the team. Consider adding a pre-merge validation step (e.g., `yamllint` or a custom action that parses all workflow files).
+
+---
+
+### TC-BL-REG-35: Alert State Race Condition (Bug #30 Regression)
+
+**Type**: Regression — Race condition between orchestrator fetch and batch fetch
+
+**Why we test this**: In a Fortune 500 repo with frequent CI runs, CodeQL may close alerts (via merged fix PRs) between the orchestrator's initial alert fetch and the child batch's per-alert fetch. The batch workflow must gracefully handle alerts that changed state mid-flight.
+
+**Setup**: 
+1. Seed a repo with 10 open CodeQL alerts
+2. Trigger the orchestrator
+3. While the orchestrator is fetching alerts, merge a fix PR that closes 2 of the 10 alerts
+4. The child batch should receive all 10 alert IDs but find only 8 still open
+
+**Expected**:
+1. The batch workflow logs "Alert #X state=fixed (skipping — may already be fixed)" for the 2 closed alerts
+2. The batch creates a Devin session with only the 8 remaining open alerts
+3. The orchestrator summary counts match reality (8 processed, not 10)
+4. No errors or workflow failures
+
+**Validates**: Bug #30 — The system must handle the inherent race condition in any fetch-then-process architecture without errors or misleading counts.
+
+**Worry**: If the batch workflow does NOT skip already-fixed alerts, Devin receives instructions to fix alerts that no longer exist. This wastes session time and could cause Devin to make unnecessary changes. The batch's per-alert re-fetch is the safety net.
+
+---
+
+### TC-BL-REG-36: Session Ends Blocked — Unattended Prompt Handling (Bug #31)
+
+**Type**: Regression — Devin sessions ending "blocked" in automated batch runs
+
+**Why we test this**: In unattended automated runs, Devin sessions should complete autonomously without waiting for human input. If a session ends "blocked", it means Devin asked a question and never got a response. The fix PR may be incomplete.
+
+**Setup**:
+1. Trigger an orchestrator run with alerts that include ambiguous vulnerability patterns (e.g., alerts in files with complex dependency chains where the "right" fix isn't obvious)
+2. Monitor the Devin session's `status_enum` field during polling
+3. Check whether the session prompt includes explicit "do not ask questions" instructions
+
+**Expected**:
+1. The Devin session prompt includes: "This is an unattended automated run. Do not ask questions or wait for input."
+2. The session ends with `status_enum=finished` (not `blocked`)
+3. If the session does end `blocked`, the batch workflow still creates a PR (Bug #23 fix) and classifies alerts correctly (Bug #18 fix)
+4. The PR body notes that the session ended blocked and some fixes may be incomplete
+
+**Validates**: Bug #31 — Sessions ending "blocked" indicate the prompt needs improvement. The workflow should handle blocked sessions gracefully, but the goal is to minimize them.
+
+**Worry**: In production, blocked sessions waste Devin API credits (the session stays active, consuming ACUs, until it times out). At scale with 5 concurrent sessions, even 1 blocked session reduces throughput by 20%.
+
+---
+
+### TC-BL-REG-37: Stale Cursor Comment Cleanup (Bug #32 Regression)
+
+**Type**: Regression — Stale cursor comments accumulate on tracking issue
+
+**Why we test this**: Before Bug #26 was fixed, each orchestrator run created multiple cursor comments. Even after the fix, stale comments from previous runs remain. For enterprise teams monitoring the tracking issue, dozens of outdated cursor comments obscure the current state.
+
+**Setup**:
+1. Run the orchestrator 3 times with `reset_cursor=true` each time (simulating pre-fix behavior)
+2. Verify multiple cursor comments exist on the tracking issue
+3. Run the orchestrator again with the Bug #32 fix (stale comment cleanup)
+4. Check the tracking issue after the run
+
+**Expected**:
+1. After the cleanup run, only 1 cursor comment remains on the tracking issue
+2. The remaining comment contains the latest cursor state
+3. The deleted comments' IDs are logged for audit trail
+4. If deletion fails (e.g., permissions), the workflow continues without error
+
+**Validates**: Bug #32 — The tracking issue must remain clean and readable. Enterprise teams should see exactly one cursor comment with the current state, not a history of 50+ stale snapshots.
+
+**Worry**: Deleting comments requires write permissions on the issue. If the `GH_PAT` token lacks `issues:write` scope, the cleanup silently fails. Also, if two orchestrator runs execute simultaneously, they could race to delete each other's cursor comments. The cleanup should only delete comments with the `<!-- backlog-cursor -->` marker.
