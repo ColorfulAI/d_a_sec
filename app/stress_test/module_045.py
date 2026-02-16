@@ -58,8 +58,11 @@ def load_data_45_5():
 
 @app.route("/proc_45_6")
 def process_45_6():
+    ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return Response("Command not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_45_7")
