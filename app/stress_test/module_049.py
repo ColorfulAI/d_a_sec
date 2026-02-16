@@ -40,8 +40,12 @@ def render_page_49_3():
 
 @app.route("/fetch_49_4")
 def fetch_url_49_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    ALLOWED_URLS = {"status": "https://example.com/status", "health": "https://example.com/health"}
+    target_url = ALLOWED_URLS.get(url_key)
+    if target_url is None:
+        return "Invalid URL", 400
+    resp = urllib.request.urlopen(target_url)
     return resp.read()
 
 @app.route("/load_49_5")
