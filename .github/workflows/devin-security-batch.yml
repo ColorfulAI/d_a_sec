@@ -125,7 +125,7 @@ jobs:
                   if "codeql-action/init" in uses:
                       with_block = step.get("with", {})
                       langs_str = with_block.get("languages", "")
-                      if langs_str and "${{" not in str(langs_str):
+                      if langs_str and ("$" + "{{") not in str(langs_str):
                           for lang in str(langs_str).split(","):
                               languages.add(lang.strip())
 
