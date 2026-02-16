@@ -494,6 +494,32 @@ Workflow marks skipped alerts as unfixable on the next run
 - The `idempotent` flag is removed — no longer needed since retries are internal
 - The workflow-level circuit breaker still works: if an alert persists after the session completes, the next workflow run increments the attempt counter and eventually marks it unfixable
 
+### REQUIREMENT: No "Pretend Fixes" — Every Fix PR Must Pass CodeQL
+
+**Core invariant**: A fix PR must never introduce new CodeQL alerts or leave existing alerts unresolved. If Devin "fixes" an alert but introduces an unused import, a new taint flow, or any other CodeQL finding, the fix is worse than useless — it creates a PR that fails CI, wastes reviewer time, and erodes trust in the system.
+
+**Why we verify internally (not just in CI)**:
+- CI catches CodeQL failures *after* the PR is created. By then, the damage is done: the PR exists, reviewers are notified, and the failure is visible. In a Fortune 500 setting, a stream of failing fix PRs destroys confidence in the tool.
+- Internal verification catches issues *before* the PR is created. If the fix doesn't pass CodeQL, it's either retried or skipped — no broken PR is ever opened.
+- The goal is: **every fix PR that gets created should pass CodeQL CI on the first try.**
+
+### Dynamic CodeQL Configuration — Portability Across Repos
+
+**Problem**: This workflow may be deployed on different repositories, each with its own CodeQL configuration (different languages, query suites, threat models). Hardcoding `python`, `security-and-quality`, and `remote+local` breaks portability.
+
+**Solution**: Step 0 of the batch workflow dynamically parses the target repo's `.github/workflows/codeql*.yml` at runtime to extract:
+- **Languages**: From the matrix strategy (e.g., `python`, `actions`, `javascript`)
+- **Query suite**: From the `codeql-action/init` step's `queries` input (e.g., `security-and-quality`)
+- **Threat models**: From the `codeql-action/init` step's `config` block (e.g., `remote`, `local`)
+
+If no CodeQL workflow is found, sensible defaults are used (`python`, `security-and-quality`, `remote+local`).
+
+These parsed values are passed to both:
+1. The Devin prompt (so Devin runs the correct CodeQL CLI commands internally)
+2. The post-session verification gate (so the pipeline verifies with the exact same config)
+
+**Edge case**: If the repo uses `${{ matrix.language }}` in the init step's `languages` input (template variable), the parser extracts the language from the matrix definition instead. This handles the common GitHub Actions pattern of matrix-based language analysis.
+
 ### Bug #42: CodeQL Internal Verification Gap
 
 **Problem discovered**: Despite the internal verification loop design above, Devin sessions were pushing fixes that still failed CodeQL CI checks (observed on PRs #111, #112, and #159). PR #159 specifically had an unused import (#228) introduced by Devin while fixing `auth_handler.py`.

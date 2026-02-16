@@ -68,6 +68,116 @@ jobs:
       - uses: actions/checkout@v4
 
       # ----------------------------------------------------------------
+      # STEP 0: Parse the repo's CodeQL configuration dynamically
+      # This makes the workflow portable — it reads the ACTUAL codeql.yml
+      # from THIS repo and extracts: languages, query suite, threat models.
+      # If no codeql.yml is found, falls back to sensible defaults.
+      # ----------------------------------------------------------------
+      - name: Parse CodeQL configuration
+        id: codeql-config
+        run: |
+          python3 -u << 'CONFIG_EOF'
+          import yaml, json, os, glob
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+
+          # Find the CodeQL workflow file
+          codeql_file = None
+          for pattern in [".github/workflows/codeql*.yml", ".github/workflows/codeql*.yaml",
+                          ".github/workflows/code-scanning*.yml", ".github/workflows/code-scanning*.yaml"]:
+              matches = glob.glob(pattern)
+              if matches:
+                  codeql_file = matches[0]
+                  break
+
+          if not codeql_file:
+              print("No CodeQL workflow found — using defaults")
+              with open(gh_out, "a") as f:
+                  f.write("languages=python\n")
+                  f.write("query_suite=security-and-quality\n")
+                  f.write("threat_models=remote,local\n")
+                  f.write("codeql_config_source=defaults\n")
+              raise SystemExit(0)
+
+          print(f"Found CodeQL workflow: {codeql_file}")
+
+          with open(codeql_file) as f:
+              workflow = yaml.safe_load(f)
+
+          # Extract languages from matrix strategy
+          languages = set()
+          for job_name, job in workflow.get("jobs", {}).items():
+              matrix = job.get("strategy", {}).get("matrix", {})
+              # Check matrix.include
+              for item in matrix.get("include", []):
+                  if "language" in item:
+                      languages.add(item["language"])
+              # Check matrix.language (direct list)
+              lang_list = matrix.get("language", [])
+              if isinstance(lang_list, list):
+                  languages.update(lang_list)
+              elif isinstance(lang_list, str):
+                  languages.add(lang_list)
+
+              # Also check steps for codeql-action/init with languages input
+              for step in job.get("steps", []):
+                  uses = step.get("uses", "")
+                  if "codeql-action/init" in uses:
+                      with_block = step.get("with", {})
+                      langs_str = with_block.get("languages", "")
+                      if langs_str and "${{" not in str(langs_str):
+                          for lang in str(langs_str).split(","):
+                              languages.add(lang.strip())
+
+          # Extract query suite and threat models from codeql-action/init
+          query_suite = ""
+          threat_models = set()
+          for job_name, job in workflow.get("jobs", {}).items():
+              for step in job.get("steps", []):
+                  uses = step.get("uses", "")
+                  if "codeql-action/init" in uses:
+                      with_block = step.get("with", {})
+                      # Query suite
+                      queries = with_block.get("queries", "")
+                      if queries:
+                          query_suite = str(queries)
+                      # Threat models from config block
+                      config_str = with_block.get("config", "")
+                      if config_str:
+                          try:
+                              config = yaml.safe_load(str(config_str))
+                              if isinstance(config, dict):
+                                  for tm in config.get("threat-models", []):
+                                      threat_models.add(str(tm))
+                          except Exception as e:
+                              print(f"  Warning: could not parse config block: {e}")
+
+          # Apply defaults for anything not found
+          if not languages:
+              languages = {"python"}
+              print("  No languages found in matrix — defaulting to python")
+          if not query_suite:
+              query_suite = "security-and-quality"
+              print("  No query suite found — defaulting to security-and-quality")
+          if not threat_models:
+              threat_models = {"remote", "local"}
+              print("  No threat models found — defaulting to remote,local")
+
+          languages_str = ",".join(sorted(languages))
+          threat_models_str = ",".join(sorted(threat_models))
+
+          print(f"  Languages: {languages_str}")
+          print(f"  Query suite: {query_suite}")
+          print(f"  Threat models: {threat_models_str}")
+
+          with open(gh_out, "a") as f:
+              f.write(f"languages={languages_str}\n")
+              f.write(f"query_suite={query_suite}\n")
+              f.write(f"threat_models={threat_models_str}\n")
+              f.write(f"codeql_config_source={codeql_file}\n")
+          CONFIG_EOF
+
+      # ----------------------------------------------------------------
       # STEP 1: Fetch alert details from CodeQL API
       # ----------------------------------------------------------------
       - name: Fetch alert details
@@ -164,10 +274,30 @@ jobs:
         if: steps.fetch-alerts.outputs.skip != 'true'
         env:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          CODEQL_LANGUAGES: ${{ steps.codeql-config.outputs.languages }}
+          CODEQL_QUERY_SUITE: ${{ steps.codeql-config.outputs.query_suite }}
+          CODEQL_THREAT_MODELS: ${{ steps.codeql-config.outputs.threat_models }}
+          CODEQL_CONFIG_SOURCE: ${{ steps.codeql-config.outputs.codeql_config_source }}
         run: |
           REPO="${{ github.repository }}"
           ALERT_SUMMARY=$(cat /tmp/batch_summary.txt)
           ALERT_DETAILS=$(cat /tmp/batch_details.json)
+
+          # Build dynamic CodeQL CLI commands from parsed repo config
+          # Pick the first language that matches alerts (usually python)
+          PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)
+          QUERY_PACK="codeql/${PRIMARY_LANG}-queries:codeql-suites/${PRIMARY_LANG}-${CODEQL_QUERY_SUITE}.qls"
+
+          # Build threat model flags (skip 'remote' since it's the default)
+          THREAT_FLAGS=""
+          THREAT_DISPLAY=""
+          IFS=',' read -ra TM_ARRAY <<< "$CODEQL_THREAT_MODELS"
+          for tm in "${TM_ARRAY[@]}"; do
+            THREAT_DISPLAY="${THREAT_DISPLAY:+$THREAT_DISPLAY AND }$tm"
+            if [ "$tm" != "remote" ]; then
+              THREAT_FLAGS="${THREAT_FLAGS} --threat-model=$tm"
+            fi
+          done
 
           PROMPT=$(cat <<PROMPT_EOF
           CRITICAL OPERATING MODE: You are running inside an UNATTENDED CI/CD pipeline with NO human operator. You MUST NOT use block_on_user=true, you MUST NOT ask questions, you MUST NOT wait for confirmation, you MUST NOT request approval. If you encounter ANY uncertainty, make your best judgment and continue. If you get stuck, skip the current alert and move to the next one. NEVER stop working to wait for input.
@@ -191,16 +321,17 @@ jobs:
              a. Apply a minimal, focused fix following the codebase's existing conventions
              b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved.
                 IMPORTANT: You MUST use the EXACT same CodeQL configuration as the repo's CI.
-                The repo's CI config (from .github/workflows/codeql.yml) uses:
-                  - queries: security-and-quality
-                  - threat-models: remote AND local
+                This repo's CI config (parsed from ${CODEQL_CONFIG_SOURCE}) uses:
+                  - languages: ${CODEQL_LANGUAGES}
+                  - queries: ${CODEQL_QUERY_SUITE}
+                  - threat-models: ${THREAT_DISPLAY}
                 Your verification commands:
                 - Download and extract CodeQL CLI (only once, reuse for all alerts):
                   wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -qo codeql-linux64.zip
                 - Create a fresh database (MUST use --overwrite since DB may exist from prior alert):
-                  ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
-                - Run analysis with BOTH remote and local threat models (matching CI):
-                  ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download --threat-model=local
+                  ./codeql/codeql database create /tmp/codeql-db --language=${PRIMARY_LANG} --source-root=. --overwrite
+                - Run analysis with the EXACT same query suite and threat models as CI:
+                  ./codeql/codeql database analyze /tmp/codeql-db ${QUERY_PACK} --format=sarif-latest --output=/tmp/results.sarif --download${THREAT_FLAGS}
                 - Parse the SARIF output to check for ANY alerts in the file you modified (not just the specific rule — your fix must not introduce NEW alerts):
                   python3 -c "import json; sarif=json.load(open('/tmp/results.sarif')); results=[r for run in sarif['runs'] for r in run.get('results',[])]; file_alerts=[r for r in results if any(loc.get('physicalLocation',{}).get('artifactLocation',{}).get('uri','').endswith('FILE') for loc in r.get('locations',[]))]; print(f'Found {len(file_alerts)} alerts in FILE'); [print(f'  - {r["ruleId"]}:{r.get("message",{}).get("text","")[:80]}') for r in file_alerts]; exit(1 if file_alerts else 0)"
                   (Replace FILE with the actual file path for each alert)
@@ -377,6 +508,10 @@ jobs:
         if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'blocked' || steps.poll-session.outputs.status == 'stopped'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          CODEQL_LANGUAGES: ${{ steps.codeql-config.outputs.languages }}
+          CODEQL_QUERY_SUITE: ${{ steps.codeql-config.outputs.query_suite }}
+          CODEQL_THREAT_MODELS: ${{ steps.codeql-config.outputs.threat_models }}
+          CODEQL_CONFIG_SOURCE: ${{ steps.codeql-config.outputs.codeql_config_source }}
         run: |
           REPO="${{ github.repository }}"
 
@@ -394,6 +529,10 @@ jobs:
           fi
 
           echo "=== CodeQL Verification (Bug #42 fix) ==="
+          echo "Config source: $CODEQL_CONFIG_SOURCE"
+          echo "Languages: $CODEQL_LANGUAGES"
+          echo "Query suite: $CODEQL_QUERY_SUITE"
+          echo "Threat models: $CODEQL_THREAT_MODELS"
           echo "Checking out branch $BRANCH_NAME for local CodeQL analysis..."
 
           # Fetch and checkout the branch Devin pushed to
@@ -405,23 +544,33 @@ jobs:
           wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip
           unzip -qo codeql-linux64.zip
 
-          # Create database with SAME config as CI
-          # CI uses: language=python, queries=security-and-quality, threat-models=remote+local
-          echo "Creating CodeQL database (language=python, threat-models=remote+local)..."
+          # Build dynamic commands from parsed repo config
+          PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)
+          QUERY_PACK="codeql/${PRIMARY_LANG}-queries:codeql-suites/${PRIMARY_LANG}-${CODEQL_QUERY_SUITE}.qls"
+
+          # Build threat model flags
+          THREAT_FLAGS=""
+          IFS=',' read -ra TM_ARRAY <<< "$CODEQL_THREAT_MODELS"
+          for tm in "${TM_ARRAY[@]}"; do
+            if [ "$tm" != "remote" ]; then
+              THREAT_FLAGS="${THREAT_FLAGS} --threat-model=$tm"
+            fi
+          done
+
+          echo "Creating CodeQL database (language=$PRIMARY_LANG)..."
           ./codeql/codeql database create /tmp/codeql-verify-db \
-            --language=python \
+            --language=$PRIMARY_LANG \
             --source-root=. \
             --overwrite \
             2>&1 || true
 
-          # Run analysis with SAME query suite and threat models as CI
-          echo "Running CodeQL analysis (security-and-quality, threat-model=local)..."
+          echo "Running CodeQL analysis ($QUERY_PACK, threat flags:$THREAT_FLAGS)..."
           ./codeql/codeql database analyze /tmp/codeql-verify-db \
-            codeql/python-queries:codeql-suites/python-security-and-quality.qls \
+            $QUERY_PACK \
             --format=sarif-latest \
             --output=/tmp/verify-results.sarif \
             --download \
-            --threat-model=local \
+            $THREAT_FLAGS \
             2>&1 || true
 
           # Parse results
