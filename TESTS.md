@@ -1896,3 +1896,52 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #58 fix — stale header comment updated to reflect current concurrency model.
 
 **Production scenario**: A new engineer joins the security team and reads the orchestrator header to understand how concurrency works. With the stale comment, they believe 2 of 5 Devin slots are reserved for PR workflows and set `max_concurrent=5` thinking only 3 will be used for backlog. In reality, all 5 slots are used for backlog batches, and if PR workflows fire simultaneously, they compete for Devin sessions.
+
+---
+
+### TC-BL-BATCH-20: Backfill Fills All Free Slots (Bug #59)
+
+**Type**: Throughput — validates that the backfill dispatches up to `max_concurrent` batches per poll cycle, not just 1
+
+**Why we test this**: Bug #59 discovered during the 722-alert stress test that the backfill only dispatched 1 batch per 60s poll cycle. With 48 pending batches and 5 free slots, it would take 48+ minutes just for dispatch. The fix changes `if` to `while` so all free slots are filled each cycle.
+
+**Setup**:
+1. Seed 500+ CodeQL alerts (50 files × 10 vulns each)
+2. Trigger orchestrator with `max_batches=0`, `max_concurrent=5`, `reset_cursor=true`
+3. Wait for wave 1 (5 children) to complete
+4. Monitor wave 2 dispatch timing
+
+**Expected**:
+1. After wave 1 completes, wave 2 dispatches up to 5 children in a single poll cycle (not 1 per cycle)
+2. The time between wave 1 completion and wave 2 dispatch is ≤ 1 poll interval (60s) + session creation time (~30s)
+3. All 5 slots are filled in wave 2, not drip-fed 1 per minute
+
+**Validates**: Bug #59 fix — backfill uses `while` loop to fill all free slots.
+
+**Production scenario**: A Fortune 500 company has 500 accumulated CodeQL alerts (34 batches). The orchestrator dispatches wave 1 (5 batches). All 5 complete in 15 minutes. Without Bug #59 fix: wave 2 dispatches 1 batch per 60s cycle, taking 29 more minutes just for dispatch (not counting session time). Total: ~5 hours. With the fix: wave 2 dispatches 5 batches immediately, wave 3 dispatches 5 more when those complete. Total: ~70 minutes (7 waves × 10 min each).
+
+**Worry**: If session creation fails for one batch in the while loop, does it block subsequent batches from being dispatched? The Bug #60 escape hatch should prevent this — after 2 consecutive failures, the loop breaks and retries on the next poll cycle.
+
+---
+
+### TC-BL-BATCH-21: Backfill Consecutive Failure Escape (Bug #60)
+
+**Type**: Resilience — validates that persistent 429 rate limits in the backfill don't burn hours in retry loops
+
+**Why we test this**: Bug #60 discovered that the poll-loop backfill had no consecutive failure escape (unlike the initial fill which has Bug #53's escape). When the Devin API returns 429 persistently, each failed attempt burns ~210s in retries (30s + 60s + 120s) before re-queuing. Without an escape, the orchestrator loops indefinitely until the 5.5-hour safety timeout.
+
+**Setup**:
+1. Trigger orchestrator with enough batches to fill all slots
+2. After wave 1, ensure the Devin API rate limit prevents new session creation (this happens naturally when 5 sessions complete but the API still counts them as active)
+3. Monitor backfill behavior — does it break out after 2 failures or loop indefinitely?
+
+**Expected**:
+1. After 2 consecutive session creation failures in the backfill, the loop prints "consecutive failures — waiting for next poll cycle" and breaks
+2. The orchestrator continues polling (checking child statuses) instead of burning time in retries
+3. On the next poll cycle (60s later), it retries the backfill — if the rate limit cleared, dispatch succeeds
+
+**Validates**: Bug #60 fix — backfill consecutive failure escape prevents infinite retry loops.
+
+**Production scenario**: The same Fortune 500 company runs the orchestrator. Wave 1's 5 sessions complete, but the Devin API takes 5-10 minutes to release the session slots. Without Bug #60 fix: the orchestrator enters a loop of (retry 210s → re-queue → poll 60s → retry 210s) for each pending batch, burning an entire GitHub Actions runner for hours. With the fix: after 2 failed attempts (~420s), it backs off and retries each poll cycle (60s), eventually succeeding when slots free up.
+
+**Worry**: The escape hatch resets each poll cycle. If the API is down for an extended period (e.g., Devin outage), the orchestrator still retries every 60s but each retry only burns ~420s (2 failures × 210s) instead of the full 270s per batch. The safety timeout (5.5 hours) provides the final backstop.
