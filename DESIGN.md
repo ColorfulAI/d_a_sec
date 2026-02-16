@@ -1461,6 +1461,34 @@ All 4 test cycles used `reset_cursor=true`, which bypasses the cursor parsing Py
 
 **Mitigation**: The next test cycle should explicitly test with `reset_cursor=false` after at least one run has created a cursor comment. This validates the full cursor load → parse → resume path.
 
+**Worry: Devin sessions consistently end "blocked" despite unblock messages (Bug #41 — INVESTIGATION COMPLETE)**
+
+Across all 4 test cycles, every Devin session ended with `status_enum=blocked` despite receiving unblock messages via `POST /v1/sessions/{session_id}/message` (all returning HTTP 200 with `null` body). The sessions work for ~10 minutes, then transition to `blocked` and never resume.
+
+**Root cause analysis**: The Devin API's `POST /message` endpoint queues the message for delivery but does not forcibly unblock the session. When Devin uses `block_on_user=true` internally (which is its default behavior when asking questions or requesting confirmation), the session enters a state that requires the message to be processed by the agent — but the agent may not process queued messages if it's in a deep blocking state. The `null` response body (instead of a `detail` field) suggests the message was accepted but not acted upon.
+
+**Three-part fix (Bug #41)**:
+1. **Prevention over cure**: Rewrote the Devin session prompt to open with `CRITICAL OPERATING MODE` that explicitly forbids `block_on_user=true`, asking questions, waiting for confirmation, or requesting approval. The instruction appears FIRST in the prompt (before any task context) to maximize compliance.
+2. **Escalating unblock messages**: Instead of a single generic unblock message, the workflow now sends escalating messages — early attempts use "CRITICAL" framing with detailed instructions, later attempts use "URGENT" framing with explicit skip-and-push directives.
+3. **More attempts with longer waits**: Increased `MAX_UNBLOCK_ATTEMPTS` from 3 to 5. Wait time between attempts increased from 90s to 120s (first 2 attempts) and 180s (subsequent attempts). Added `CONSECUTIVE_BLOCKED` counter for diagnostic visibility.
+4. **Explicit CodeQL verification commands**: The prompt now includes the exact `python3 -c` command to parse SARIF output and check if a specific rule ID still fires, reducing ambiguity in the verification step.
+
+**Production impact**: Critical — if sessions consistently block, no alerts are ever confirmed "fixed." The pipeline produces PRs but they may contain incomplete or unverified fixes.
+
+**Worry: CodeQL internal verification not matching CI configuration (Bug #42 — DOCUMENTED)**
+
+The user observed that PRs #111 and #112 (created by the batch workflow) still fail CodeQL checks in CI, despite the prompt instructing Devin to verify fixes using CodeQL CLI internally. This means either: (a) Devin is not executing the CodeQL verification step, (b) the internal CodeQL configuration differs from CI, or (c) Devin is running CodeQL but not correctly interpreting the results.
+
+**Root cause**: The original prompt's CodeQL verification instructions were high-level ("Run analysis... Check if the specific alert rule ID still appears"). The instructions did not provide the exact SARIF parsing command needed to programmatically check results. Devin may have skipped the verification or checked manually (visually scanning output) and missed residual alerts.
+
+**Fix (Bug #42)**: Updated the prompt to include:
+1. Explicit `--overwrite` flag on database creation (required when re-running for multiple alerts)
+2. The exact `python3 -c` command to parse SARIF JSON and check for specific rule ID + file combinations
+3. Explicit instruction to use the `security-and-quality` query suite with `remote+local` threat models (matching CI configuration)
+4. Clear instruction that if verification fails after 2 attempts, the alert must be SKIPPED — do NOT commit a broken fix
+
+**Remaining gap**: Even with explicit instructions, Devin sessions may still skip CodeQL verification if they run out of ACU budget or encounter CodeQL installation failures. A production-grade solution would be to add a post-session CodeQL check in the batch workflow itself (Step 5c), running CodeQL on the branch and comparing results to the original alert list. This is documented as a future enhancement.
+
 ---
 
 ## Limitations and Future Work
