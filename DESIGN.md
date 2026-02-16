@@ -1347,10 +1347,17 @@ After Devin pushes a fix, the CodeQL alert state might not immediately flip to "
 2. **Orchestrator re-verification**: On each run, before skipping alerts in `unfixable_alert_ids`, re-query CodeQL for each unfixable alert. If the alert is now `state=fixed` (PR was merged), remove it from `unfixable_alert_ids` and add to `processed_alert_ids`. This implements the "self-healing" behavior the design originally promised.
 3. **Three-state classification**: Alerts now have three states in the cursor: `processed` (confirmed fixed), `unfixable` (confirmed not fixed — file was not modified by Devin), and `attempted` (fix was pushed but not yet merged — pending verification).
 
-**Worry: Artifact download fails**
-If the orchestrator can't download the batch result artifact (permissions, timing, GitHub API issue), it falls back to marking all alerts as "processed" — losing the fixed/unfixable distinction.
+**Worry: Shell variables invisible to Python heredoc (Bug #19 — CONFIRMED)**
+The collect-results step in the batch workflow set `REPO`, `SESSION_STATUS`, `SESSION_ID`, `SESSION_URL`, `PR_NUMBER`, `PR_URL` as shell variables in the `run:` block, but the Python heredoc reads `os.environ` which only sees environment variables. Shell variables are NOT inherited by child processes (like the Python interpreter). Result: `session_status` was always empty, causing ALL batches to fall through to the `else` clause and mark all alerts as "unresolved" regardless of actual session status.
 
-**Mitigation**: The fallback is safe (alerts won't be retried), but loses granularity. The orchestrator logs a warning when this happens. Future improvement: also check child workflow outputs directly via the GitHub Actions API.
+**Solution (Bug #19 fix)**: Move all step-output-dependent variables to the step's `env:` block so they become actual environment variables visible to the Python subprocess. Also added `blocked` to the list of valid session statuses in collect-results (Devin sessions that go blocked may have done partial work — the file-modification heuristic still applies).
+
+**Worry: Artifact download 403 on redirect (Bug #20 — CONFIRMED)**
+GitHub's artifact `archive_download_url` returns a 302 redirect to Azure Blob Storage. Python's `urllib` follows the redirect and forwards the `Authorization: token <pat>` header to Azure, which rejects it with HTTP 403 ("Server failed to authenticate the request"). The pre-signed Azure URL doesn't need GitHub auth — and won't accept it.
+
+Without this fix, the orchestrator silently falls back to marking all alerts as "processed" (losing the fixed/attempted/unfixable breakdown from Bug #18). The three-state classification never reaches the cursor.
+
+**Solution (Bug #20 fix)**: Custom `NoAuthRedirectHandler` that strips the `Authorization` header when following redirects. The initial request to GitHub's API authenticates normally; only the redirect to Azure drops the token. The fallback path still exists as a safety net.
 
 ---
 

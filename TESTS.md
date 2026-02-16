@@ -1031,3 +1031,36 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: Week 1: Devin fixes 100 alerts across 7 batches. All 100 are marked "unfixable" (Bug #18a). The security team merges all 7 PRs. Week 2: The orchestrator runs again. Without the Bug #18b fix, the cursor still shows 100 unfixable alerts despite all being resolved. The dashboard permanently shows "100 alerts need human review" even though zero actually do. With the fix, Run B re-verifies and finds all 100 are now "fixed" → moves them to processed → dashboard shows "100 fixed, 0 need review."
 
 **Worry**: The re-verification step queries CodeQL for every alert in `unfixable_alert_ids` on every run. For large backlogs with many unfixable alerts (e.g., 500), this adds 500 API calls per run. With rate limiting (0.5s per call), that's ~4 minutes of additional startup time. Consider batching the re-verification (e.g., `GET /repos/.../code-scanning/alerts?state=fixed`) or only re-verifying alerts whose associated PR has been merged since the last run.
+
+### TC-BL-REG-22: Shell Variables Visible to Python Heredoc (Bug #19)
+
+**Setup**: Trigger the batch workflow with a batch of alerts. Let the Devin session complete (any terminal status: finished, blocked, expired). Observe the collect-results step logs.
+
+**Expected**:
+1. The collect-results step logs show `Session status: <actual_status>, branch: <branch_name>` (not `Session status: , branch: ...`)
+2. The Python script can read `SESSION_STATUS`, `REPO`, `SESSION_ID`, `SESSION_URL`, `PR_NUMBER`, `PR_URL` from `os.environ`
+3. The classification logic enters the correct branch based on the actual session status
+4. If session is "blocked", the file-modification heuristic still runs (blocked sessions may have done partial work)
+
+**Validates**: Bug #19 — the collect-results step previously set `REPO`, `SESSION_STATUS`, etc. as shell variables in the `run:` block, but the Python heredoc reads `os.environ` which only sees environment variables (not shell variables). Result: `session_status` was always empty string, causing ALL batches to fall through to the `else` clause ("all alerts unresolved") regardless of actual session status. This completely broke the three-state classification from Bug #18.
+
+**Production scenario**: A Fortune 500 company deploys the backlog workflow. Every batch run correctly creates Devin sessions, Devin fixes 80% of alerts, but the collect-results step always reports "Session status=, branch=... — all alerts unresolved" and marks everything unfixable. The security team sees 100% unfixable rate and concludes the system is broken. They disable it and go back to manual remediation — a $500K/year cost the workflow was supposed to eliminate.
+
+**Worry**: This is a class of bugs specific to GitHub Actions YAML workflows with inline Python heredocs. Any future step that uses `os.environ` to read values set as shell variables in the same `run:` block will have the same issue. The convention must be: all variables that Python needs must be in the step's `env:` block, not set as shell variables.
+
+### TC-BL-REG-23: Artifact Download Succeeds Without 403 (Bug #20)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`. Let the child batch complete. Observe the orchestrator logs during the artifact download phase.
+
+**Expected**:
+1. Orchestrator logs show `Found result artifact: batch-1-result`
+2. Followed by `Fixed: X, Attempted: Y, Unfixable: Z` (actual per-alert breakdown)
+3. NOT followed by `Could not fetch batch result artifact: HTTP Error 403...`
+4. The cursor is updated with the correct fixed/attempted/unfixable counts (not the fallback "mark all as processed")
+5. The summary shows non-zero attempted or unfixable counts (reflecting actual Devin behavior, not the fallback)
+
+**Validates**: Bug #20 — GitHub's artifact `archive_download_url` returns a 302 redirect to Azure Blob Storage. Python's `urllib` forwards the `Authorization: token` header to Azure, which rejects it with 403. The `NoAuthRedirectHandler` strips the auth header on redirect so Azure accepts the pre-signed URL.
+
+**Production scenario**: A company runs the backlog sweep nightly. Every night, the orchestrator successfully dispatches batches, Devin fixes alerts, but the artifact download silently fails with 403. The orchestrator falls back to marking ALL alerts as "processed" — the cursor grows but the fixed/unfixable breakdown is always empty. The security dashboard shows "500 alerts processed, 0 unfixable, 0 need review" when in reality 50 alerts were unfixable and need human attention. Those 50 vulnerabilities persist in production undetected.
+
+**Worry**: The 403 is silent — the orchestrator catches the exception, logs a warning, and continues with the fallback. In production, this means the three-state classification (Bug #18) never actually reaches the cursor. The entire unfixable-alert-marking pipeline is broken at the last mile. This is particularly insidious because the workflow completes successfully (exit code 0) and the summary looks clean.
