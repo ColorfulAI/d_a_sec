@@ -4,10 +4,15 @@
 # to process a single batch of CodeQL alerts. It:
 #   1. Receives a batch of alert IDs as input
 #   2. Fetches alert details from the CodeQL API
-#   3. Creates 1 Devin session to fix the alerts
+#   3. Uses a pre-created Devin session (batch mode) OR creates one
 #   4. Polls the session until completion (or timeout)
 #   5. Creates a PR with the fixes
 #   6. Reports results via workflow artifacts
+#
+# BATCH MODE: When the orchestrator creates Devin sessions in batch (up-front),
+# it passes session_id/session_url as inputs. The child skips session creation
+# and goes straight to polling. This enables true batch session creation —
+# all sessions start working simultaneously instead of sequentially.
 #
 # DESIGN: Each child workflow = 1 Devin session = 1 batch of alerts = 1 PR.
 # This isolation ensures that a failure in one batch doesn't affect others.
@@ -35,6 +40,16 @@ on:
         required: false
         type: string
         default: ""
+      session_id:
+        description: "Pre-created Devin session ID (batch mode — orchestrator creates sessions up-front)"
+        required: false
+        type: string
+        default: ""
+      session_url:
+        description: "Pre-created Devin session URL (batch mode)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -48,6 +63,8 @@ env:
   ALERT_IDS: ${{ github.event.inputs.alert_ids }}
   BRANCH_NAME: ${{ github.event.inputs.branch_name }}
   TRACKING_ISSUE: ${{ github.event.inputs.tracking_issue }}
+  PRE_SESSION_ID: ${{ github.event.inputs.session_id }}
+  PRE_SESSION_URL: ${{ github.event.inputs.session_url }}
 
 jobs:
   process-batch:
@@ -267,7 +284,15 @@ jobs:
           SUMMARY_EOF
 
       # ----------------------------------------------------------------
-      # STEP 2: Create Devin session for this batch
+      # STEP 2: Create Devin session for this batch (or use pre-created)
+      #
+      # BATCH MODE: If the orchestrator created the session up-front and
+      # passed session_id as input, we skip creation and go straight to
+      # polling. This enables true batch session creation — all sessions
+      # in a wave start working simultaneously instead of sequentially.
+      #
+      # STANDALONE MODE: If no session_id is provided (manual dispatch),
+      # we create the session here as before.
       # ----------------------------------------------------------------
       - name: Create Devin session
         id: create-session
@@ -279,16 +304,28 @@ jobs:
           CODEQL_THREAT_MODELS: ${{ steps.codeql-config.outputs.threat_models }}
           CODEQL_CONFIG_SOURCE: ${{ steps.codeql-config.outputs.codeql_config_source }}
         run: |
+          # ── BATCH MODE: Use pre-created session from orchestrator ──
+          if [ -n "$PRE_SESSION_ID" ]; then
+            echo "=== BATCH MODE: Using pre-created session ==="
+            echo "Session ID: $PRE_SESSION_ID"
+            echo "Session URL: $PRE_SESSION_URL"
+            echo "session_id=$PRE_SESSION_ID" >> $GITHUB_OUTPUT
+            echo "session_url=$PRE_SESSION_URL" >> $GITHUB_OUTPUT
+            echo "session_created=true" >> $GITHUB_OUTPUT
+            echo "batch_mode=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ── STANDALONE MODE: Create session here ──
+          echo "=== STANDALONE MODE: Creating new Devin session ==="
+
           REPO="${{ github.repository }}"
           ALERT_SUMMARY=$(cat /tmp/batch_summary.txt)
           ALERT_DETAILS=$(cat /tmp/batch_details.json)
 
-          # Build dynamic CodeQL CLI commands from parsed repo config
-          # Pick the first language that matches alerts (usually python)
           PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)
           QUERY_PACK="codeql/${PRIMARY_LANG}-queries:codeql-suites/${PRIMARY_LANG}-${CODEQL_QUERY_SUITE}.qls"
 
-          # Build threat model flags (skip 'remote' since it's the default)
           THREAT_FLAGS=""
           THREAT_DISPLAY=""
           IFS=',' read -ra TM_ARRAY <<< "$CODEQL_THREAT_MODELS"
@@ -372,7 +409,6 @@ jobs:
           echo "Devin API response (HTTP $HTTP_CODE):"
           echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
 
-          # Exponential backoff on rate limits (3 retries: 60s, 120s, 240s)
           RETRY_WAIT=60
           RETRY_COUNT=0
           MAX_RETRIES=3
@@ -410,6 +446,7 @@ jobs:
           echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
           echo "session_url=$SESSION_URL" >> $GITHUB_OUTPUT
           echo "session_created=true" >> $GITHUB_OUTPUT
+          echo "batch_mode=false" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------
       # STEP 3: Poll Devin session until completion

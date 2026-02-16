@@ -561,6 +561,121 @@ Each test case follows these rules:
 
 ---
 
+## Batch Session Creation (Advanced Mode) Tests
+
+### TC-BL-BATCH-1: Orchestrator Creates Sessions Up-Front (Happy Path)
+
+**Setup**: Trigger the backlog workflow with `max_batches=2` and `reset_cursor=true`. Ensure there are enough open CodeQL alerts to create 2 batches.
+
+**Expected**:
+1. Orchestrator log shows "WAVE 1: Batch-creating up to 5 sessions"
+2. For each batch, log shows "Creating Devin session for Batch N..." followed by "Session created: https://app.devin.ai/sessions/..."
+3. Child workflows receive `session_id` and `session_url` inputs (visible in workflow run inputs)
+4. Child workflow log shows "BATCH MODE: Using pre-created session" (not "STANDALONE MODE: Creating new session")
+5. Summary shows "Sessions created in batch: 2"
+
+**Validates**: The core batch session creation flow — orchestrator creates sessions, passes IDs to children, children skip creation.
+
+**Production scenario**: Normal operation with 5 concurrent slots. All 5 sessions in a wave should start working simultaneously when the orchestrator creates them up-front.
+
+**Worry**: If the orchestrator creates sessions but the child workflow doesn't recognize them (e.g., input name mismatch, empty string check fails), every batch falls back to standalone mode and we lose the parallelization benefit entirely — silently, with no error.
+
+---
+
+### TC-BL-BATCH-2: Graceful Fallback to Standalone Mode on Session Creation Failure
+
+**Setup**: Trigger the backlog workflow when 5 Devin sessions are already running (from a previous wave or external usage), causing the orchestrator's `create_devin_session()` to hit HTTP 429.
+
+**Expected**:
+1. Orchestrator log shows "Rate limited (429) — will retry later"
+2. Orchestrator dispatches child WITHOUT session_id (fallback)
+3. Child workflow log shows "STANDALONE MODE: Creating new Devin session"
+4. Child creates its own session with exponential backoff (60s, 120s, 240s)
+5. Batch still completes successfully despite the fallback
+
+**Validates**: Graceful degradation from batch mode to standalone mode when the Devin API is at capacity.
+
+**Production scenario**: A Fortune 500 client has external Devin sessions running (developers using Devin for other tasks). The backlog workflow should not fail just because it can't create sessions in batch — it should fall back to letting children handle their own session creation.
+
+**Worry**: If the fallback path is broken (e.g., `dispatch_child()` sends empty string instead of omitting `session_id`), the child might receive `session_id=""` and skip creation thinking it's batch mode, then fail because there's no actual session.
+
+---
+
+### TC-BL-BATCH-3: Mixed Batch/Standalone in Same Wave
+
+**Setup**: Trigger backlog with 3 batches. Have 3 existing Devin sessions running so the orchestrator can create 2 new sessions (hitting the 5-session limit on the 3rd).
+
+**Expected**:
+1. Batches 1-2: Created in batch mode (orchestrator creates sessions)
+2. Batch 3: Falls back to standalone mode (429 on session creation)
+3. All 3 child workflows complete successfully
+4. Summary shows "Sessions created in batch: 2" (not 3)
+5. Children 1-2 log "BATCH MODE", child 3 logs "STANDALONE MODE"
+
+**Validates**: A single wave can contain a mix of batch-mode and standalone-mode children without any coordination issues.
+
+**Production scenario**: During peak hours, the Devin session pool is partially occupied. The orchestrator should maximize batch creation for available slots and gracefully fall back for the rest.
+
+**Worry**: If the orchestrator tracks `sessions_created` incorrectly in the mixed case, the summary could report wrong numbers, misleading operators about system utilization.
+
+---
+
+### TC-BL-BATCH-4: Backfill Uses Batch Mode
+
+**Setup**: Trigger backlog with 7 batches and `max_concurrent=3`. Wait for 1 child to complete, triggering a backfill dispatch.
+
+**Expected**:
+1. Wave 1: Batches 1-3 dispatched in batch mode
+2. When batch 1 completes: backfill dispatches batch 4 in batch mode (orchestrator creates session first)
+3. Backfill log shows "[BACKFILL] Batch 4..." followed by session creation
+4. Child 4 receives pre-created session_id
+
+**Validates**: Backfill (slot refill after completion) also uses batch mode, not just the initial wave.
+
+**Production scenario**: With 35 batches and 5 slots, most batches are dispatched via backfill (only the first 5 are in the initial wave). If backfill doesn't use batch mode, 30 of 35 batches lose the parallelization benefit.
+
+**Worry**: If backfill uses the old `dispatch_child()` directly instead of `create_and_dispatch()`, backfilled batches silently run in standalone mode — the initial wave looks fast but subsequent dispatches are slow.
+
+---
+
+### TC-BL-BATCH-5: Session Created But Child Dispatch Fails
+
+**Setup**: Trigger backlog workflow, but simulate a GitHub API failure on `workflow_dispatch` (e.g., by temporarily revoking PAT permissions or hitting dispatch rate limits).
+
+**Expected**:
+1. Orchestrator creates Devin session successfully (session starts working)
+2. `dispatch_child()` returns False (HTTP error on workflow_dispatch)
+3. Batch is put back in `pending_batches` for retry
+4. On next poll cycle, `create_and_dispatch()` is called again — creates a NEW session (the old one is orphaned)
+5. The orphaned session eventually times out via `max_acu_limit`
+
+**Validates**: What happens when session creation succeeds but child dispatch fails — we don't get stuck, but we do orphan a session.
+
+**Production scenario**: GitHub Actions has occasional API blips. If the orchestrator creates a session but can't dispatch the child to poll it, the session runs unsupervised. The `max_acu_limit` is the safety net.
+
+**Worry**: If the orchestrator doesn't put the batch back in `pending_batches` on dispatch failure, that batch is permanently lost — alerts never get processed. Worse, the orphaned session might push commits to a branch that no child workflow is monitoring, creating phantom branches.
+
+---
+
+### TC-BL-BATCH-6: Batch Mode Session Prompt Contains Correct CodeQL Config
+
+**Setup**: Trigger backlog workflow with `max_batches=1`. Inspect the Devin session's prompt (via Devin dashboard or API `GET /v1/sessions/{id}`).
+
+**Expected**:
+1. Session prompt contains the repo's actual CodeQL languages (from `.github/workflows/codeql.yml`)
+2. Session prompt contains the exact query suite (e.g., `security-and-quality`)
+3. Session prompt contains all threat models (e.g., `remote AND local`)
+4. The CodeQL CLI commands in the prompt use these exact values (not defaults)
+5. `CODEQL_CONFIG_SOURCE` in logs shows the actual workflow file path, not "defaults"
+
+**Validates**: The orchestrator's `build_session_prompt()` correctly injects dynamically-parsed CodeQL config into the Devin session prompt.
+
+**Production scenario**: A Java/Kotlin monorepo has `languages: java-kotlin,javascript-typescript` with custom query packs. If the batch mode prompt hardcodes `python`, Devin runs CodeQL with the wrong config and the internal verification is meaningless.
+
+**Worry**: If `CODEQL_LANGUAGES` step output is empty (parsing failed silently), the prompt falls back to "python" and Devin's internal CodeQL verification doesn't match CI — fixes pass internal check but fail CI CodeQL. This is the exact bug that caused PRs #111 and #112 to fail.
+
+---
+
 ## Integration with PR-Triggered Tests
 
 The following test cases from [PR_triggered_tests.md](./PR_triggered_tests.md) remain relevant to the backlog workflow and should be validated in the backlog context:
