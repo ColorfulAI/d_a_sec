@@ -237,7 +237,7 @@ jobs:
 
           if [ "$RESET_CURSOR" = "true" ]; then
             echo "Cursor reset requested. Starting fresh."
-            echo '{"processed_alert_ids":[],"unfixable_alert_ids":[],"in_progress":{},"total_fixed":0,"total_unfixable":0}' > /tmp/cursor.json
+            echo '{"processed_alert_ids":[],"unfixable_alert_ids":[],"attempted_alert_ids":[],"in_progress":{},"total_fixed":0,"total_unfixable":0,"total_attempted":0}' > /tmp/cursor.json
             echo "cursor_found=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -279,16 +279,18 @@ jobs:
                           print("WARNING: Cursor JSON corrupted. Starting fresh.")
 
           if cursor is None:
-              cursor = {
-                  "processed_alert_ids": [],
-                  "unfixable_alert_ids": [],
-                  "in_progress": {},
-                  "total_fixed": 0,
-                  "total_unfixable": 0
-              }
+                  cursor = {
+                      "processed_alert_ids": [],
+                      "unfixable_alert_ids": [],
+                      "attempted_alert_ids": [],
+                      "in_progress": {},
+                      "total_fixed": 0,
+                      "total_unfixable": 0,
+                      "total_attempted": 0
+                  }
               print("No cursor found. Starting fresh scan.")
           else:
-              print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable")
+              print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable, {len(cursor.get('attempted_alert_ids', []))} attempted")
 
           with open("/tmp/cursor.json", "w") as f:
               json.dump(cursor, f, indent=2)
@@ -321,25 +323,106 @@ jobs:
 
           processed = set(cursor.get("processed_alert_ids", []))
           unfixable = set(cursor.get("unfixable_alert_ids", []))
+          attempted = set(cursor.get("attempted_alert_ids", []))
 
-          # Filter out already-processed and unfixable alerts
+          # Bug #18b fix: Re-verify unfixable alerts before skipping them.
+          # After a fix PR is merged and CodeQL re-runs, previously "unfixable"
+          # alerts may now be fixed. Re-query CodeQL to check.
+          import urllib.request, urllib.error
+          HTTP_TIMEOUT = 30
+          gh_pat = os.environ.get("GH_PAT", "")
+          repo_name = os.environ.get("GITHUB_REPOSITORY", "")
+          re_headers = {
+              "Authorization": f"token {gh_pat}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          reverified_fixed = []
+          if unfixable:
+              print(f"\nRe-verifying {len(unfixable)} unfixable alerts...")
+              for uid in list(unfixable):
+                  try:
+                      url = f"https://api.github.com/repos/{repo_name}/code-scanning/alerts/{uid}"
+                      req = urllib.request.Request(url, headers=re_headers)
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                          alert_data = json.loads(resp.read())
+                      state = alert_data.get("state", "open")
+                      if state in ("fixed", "dismissed"):
+                          reverified_fixed.append(uid)
+                          print(f"  Alert #{uid}: now {state} on main -> moving to processed")
+                      else:
+                          print(f"  Alert #{uid}: still {state} -> remains unfixable")
+                  except Exception as e:
+                      print(f"  Alert #{uid}: re-verify error ({e}) -> remains unfixable")
+                  time.sleep(0.3)
+
+          # Also re-verify attempted alerts (fix PRs may have been merged)
+          reverified_attempted = []
+          if attempted:
+              print(f"\nRe-verifying {len(attempted)} attempted alerts...")
+              for uid in list(attempted):
+                  try:
+                      url = f"https://api.github.com/repos/{repo_name}/code-scanning/alerts/{uid}"
+                      req = urllib.request.Request(url, headers=re_headers)
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                          alert_data = json.loads(resp.read())
+                      state = alert_data.get("state", "open")
+                      if state in ("fixed", "dismissed"):
+                          reverified_attempted.append(uid)
+                          print(f"  Alert #{uid}: now {state} on main -> moving to processed")
+                      else:
+                          print(f"  Alert #{uid}: still {state} -> remains attempted")
+                  except Exception as e:
+                      print(f"  Alert #{uid}: re-verify error ({e}) -> remains attempted")
+                  time.sleep(0.3)
+
+          # Apply re-verification results to cursor
+          for uid in reverified_fixed:
+              unfixable.discard(uid)
+              processed.add(uid)
+              if uid not in cursor["processed_alert_ids"]:
+                  cursor["processed_alert_ids"].append(uid)
+              if uid in cursor.get("unfixable_alert_ids", []):
+                  cursor["unfixable_alert_ids"].remove(uid)
+          for uid in reverified_attempted:
+              attempted.discard(uid)
+              processed.add(uid)
+              if uid not in cursor["processed_alert_ids"]:
+                  cursor["processed_alert_ids"].append(uid)
+              if uid in cursor.get("attempted_alert_ids", []):
+                  cursor["attempted_alert_ids"].remove(uid)
+
+          if reverified_fixed or reverified_attempted:
+              print(f"\nRe-verification results: {len(reverified_fixed)} unfixable->fixed, {len(reverified_attempted)} attempted->fixed")
+              cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
+              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
+              # Save updated cursor so orchestrator step sees re-verified state
+              with open("/tmp/cursor.json", "w") as f:
+                  json.dump(cursor, f, indent=2)
+
+          # Filter out already-processed, unfixable, and attempted alerts
           remaining = []
           skipped_processed = 0
           skipped_unfixable = 0
+          skipped_attempted = 0
 
           for a in all_alerts:
               alert_num = a.get("number")
-              if alert_num in processed or alert_num in unfixable:
-                  if alert_num in unfixable:
-                      skipped_unfixable += 1
-                  else:
-                      skipped_processed += 1
+              if alert_num in processed:
+                  skipped_processed += 1
+                  continue
+              if alert_num in unfixable:
+                  skipped_unfixable += 1
+                  continue
+              if alert_num in attempted:
+                  skipped_attempted += 1
                   continue
               remaining.append(a)
 
-          print(f"Total open alerts: {len(all_alerts)}")
-          print(f"Already processed: {skipped_processed}")
-          print(f"Unfixable (skipped): {skipped_unfixable}")
+          print(f"\nTotal open alerts: {len(all_alerts)}")
+          print(f"Already processed (confirmed fixed): {skipped_processed}")
+          print(f"Unfixable (skipped, needs human review): {skipped_unfixable}")
+          print(f"Attempted (skipped, pending PR merge): {skipped_attempted}")
           print(f"Remaining to process: {len(remaining)}")
 
           if not remaining:
@@ -719,10 +802,11 @@ jobs:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (success)")
                           completed_batches.append(batch)
 
-                          # Fetch batch result artifact to get per-alert fixed/unfixable breakdown
-                          # The child workflow outputs fixed_alert_ids and unfixable_alert_ids
+                          # Fetch batch result artifact to get per-alert breakdown
+                          # Bug #18 fix: Now includes attempted_alert_ids (file modified but not yet merged)
                           batch_unfixable = []
                           batch_fixed = []
+                          batch_attempted = []
                           try:
                               run_id_val = child["run_id"]
                               artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}/artifacts"
@@ -732,7 +816,6 @@ jobs:
                               for artifact in artifacts.get("artifacts", []):
                                   if artifact["name"].startswith(f"batch-{batch['batch_id']}-"):
                                       print(f"    Found result artifact: {artifact['name']}")
-                                      # Download and parse the artifact
                                       dl_url = artifact["archive_download_url"]
                                       req2 = urllib.request.Request(dl_url, headers=headers)
                                       with urllib.request.urlopen(req2, timeout=HTTP_TIMEOUT) as resp2:
@@ -742,22 +825,27 @@ jobs:
                                               if name.endswith(".json"):
                                                   result_data = json.loads(z.read(name))
                                                   batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
+                                                  batch_attempted = [int(x) for x in result_data.get("attempted_alert_ids", [])]
                                                   batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
-                                                  print(f"    Fixed: {len(batch_fixed)}, Unfixable: {len(batch_unfixable)}")
+                                                  print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}")
                                           z.close()
                           except Exception as e:
                               print(f"    Could not fetch batch result artifact: {e}")
                               print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as processed")
 
-                          # Update cursor with per-alert granularity
-                          if batch_fixed or batch_unfixable:
+                          # Update cursor with three-state classification (Bug #18 fix)
+                          if batch_fixed or batch_attempted or batch_unfixable:
                               for aid in batch_fixed:
                                   if aid not in cursor["processed_alert_ids"]:
                                       cursor["processed_alert_ids"].append(aid)
+                              for aid in batch_attempted:
+                                  if aid not in cursor.get("attempted_alert_ids", []):
+                                      cursor.setdefault("attempted_alert_ids", []).append(aid)
                               for aid in batch_unfixable:
                                   if aid not in cursor.get("unfixable_alert_ids", []):
                                       cursor.setdefault("unfixable_alert_ids", []).append(aid)
                               cursor["total_fixed"] = cursor.get("total_fixed", 0) + len(batch_fixed)
+                              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                               cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
                           else:
                               # Fallback: no artifact data, mark all as processed
@@ -812,6 +900,7 @@ jobs:
           # Summary
           total_time = int(time.time() - start_time)
           unfixable_ids = cursor.get("unfixable_alert_ids", [])
+          attempted_ids = cursor.get("attempted_alert_ids", [])
           print(f"\n{'='*60}")
           print(f"Orchestrator complete")
           print(f"{'='*60}")
@@ -821,8 +910,11 @@ jobs:
           print(f"  Batches remaining: {len(pending_batches)}")
           print(f"  Total alerts processed: {sum(b['alert_count'] for b in completed_batches)}")
           print(f"  Total alerts failed: {sum(b['alert_count'] for b in failed_batches)}")
-          print(f"  Alerts fixed: {cursor.get('total_fixed', 0)}")
+          print(f"  Alerts fixed (confirmed): {cursor.get('total_fixed', 0)}")
+          print(f"  Alerts attempted (pending PR merge): {len(attempted_ids)}")
           print(f"  Alerts unfixable (human review): {len(unfixable_ids)}")
+          if attempted_ids:
+              print(f"  Attempted alert IDs: {attempted_ids}")
           if unfixable_ids:
               print(f"  Unfixable alert IDs: {unfixable_ids}")
 
@@ -833,6 +925,8 @@ jobs:
               f.write(f"failed_count={len(failed_batches)}\n")
               f.write(f"remaining_count={len(pending_batches)}\n")
               f.write(f"total_time={total_time}\n")
+              f.write(f"attempted_count={len(attempted_ids)}\n")
+              f.write(f"attempted_alert_ids={','.join(str(a) for a in attempted_ids)}\n")
               f.write(f"unfixable_count={len(unfixable_ids)}\n")
               f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
 
@@ -841,6 +935,7 @@ jobs:
               "completed": [{"batch_id": b["batch_id"], "alert_ids": b["alert_ids"]} for b in completed_batches],
               "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion")} for b in failed_batches],
               "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches],
+              "attempted_alert_ids": attempted_ids,
               "unfixable_alert_ids": unfixable_ids
           }
           with open("/tmp/orchestrator_results.json", "w") as f:
@@ -861,6 +956,7 @@ jobs:
           echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alerts attempted (pending PR merge)**: ${{ steps.orchestrate.outputs.attempted_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
           echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
@@ -881,7 +977,7 @@ jobs:
 
           # Build the human review comment body
           BODY="## :warning: Alerts Requiring Human Review\n\n"
-          BODY+="**${UNFIXABLE_COUNT} alert(s)** could not be automatically fixed by Devin after internal CodeQL verification (2 attempts per alert inside the session).\n\n"
+          BODY+="**${UNFIXABLE_COUNT} alert(s)** could not be automatically fixed by Devin. The files containing these alerts were not modified by the Devin session, indicating the fix was not attempted or was too complex for automated resolution.\n\n"
           BODY+="These alerts need manual investigation by a security engineer.\n\n"
           BODY+="| Alert | Link | Action Needed |\n"
           BODY+="|-------|------|---------------|\n"
