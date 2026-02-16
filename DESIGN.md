@@ -1686,6 +1686,40 @@ Sessions go `blocked` when Devin completes its work and sends a final message wi
 
 ---
 
+### Bug #53: Initial Wave Fill Loop Has No Escape Hatch for Persistent Failures
+
+**Problem discovered**: The orchestrator's initial wave fill loop (`while len(active_children) < max_concurrent and pending_batches`) retries indefinitely when `create_and_dispatch()` fails. Each failure re-inserts the batch at position 0 and sleeps 10s before retrying the same batch. If the Devin API is completely down (not just rate-limited), this loop never exits. Each retry takes ~3.5 min (3 retries × exponential backoff inside `create_devin_session()`), so the loop runs for hours until the 6-hour GitHub Actions timeout kills the job.
+
+**Impact**: If the Devin API has an outage during the initial wave dispatch, the orchestrator burns the entire 6-hour Actions timeout on retry loops, never entering the poll loop or processing any batches. For a Fortune 500 company running daily backlog sweeps, a single API outage means 6 hours of wasted compute per run. The safety timeout (330 min) only applies inside the poll loop, which is never reached.
+
+**Root cause**: The initial fill loop had no maximum retry counter or time-based escape hatch. The `while` condition only checks `len(active_children) < max_concurrent` and `pending_batches` — both remain true when failures re-queue the batch.
+
+**Fix**: Added a consecutive failure counter (`max_consecutive_failures = 3`). After 3 consecutive failures in the initial fill, the loop breaks and the orchestrator enters the poll loop with whatever children were successfully dispatched (even zero). The poll loop has the safety timeout and can retry backfill on each cycle. A successful dispatch resets the counter, so transient failures don't prematurely stop the fill.
+
+---
+
+### Bug #54: Dead Code — `check_active_devin_sessions()` Defined but Never Called
+
+**Problem discovered**: The `check_active_devin_sessions()` function (queries Devin API for active session count) was defined in the orchestrator but never called anywhere. It was part of the original session reservation gate design (removed in Bug #14). The function definition survived the removal but all call sites were deleted.
+
+**Impact**: Dead code that adds confusion for developers reading the orchestrator. A new contributor might assume session count checking is active (it's not), or try to call this function expecting it to influence concurrency decisions. In a 1400-line workflow file with 50+ bug fixes, unnecessary code increases cognitive load and maintenance burden.
+
+**Fix**: Removed the function entirely. Session concurrency is managed by counting active child workflows (`len(active_children) < max_concurrent`), not by querying the Devin API for session counts.
+
+---
+
+### Bug #55: Suspended Sessions Mark All Alerts Unfixable Instead of Checking Branch
+
+**Problem discovered**: The batch workflow's collect-results step classifies alerts by checking if the session's branch modified the alert's file. But the classification condition only included `finished`, `stopped`, `expired`, and `blocked` statuses — NOT `suspended`, `suspend_requested`, or `suspend_requested_frontend`. A suspended session (e.g., hit ACU limit) could have pushed partial fixes to the branch before being suspended. By excluding suspended states, ALL alerts were marked unfixable even when some files were successfully modified.
+
+**Impact**: If a Devin session processes 10 alerts, successfully fixes 7, and then gets suspended (ACU limit), all 10 alerts are marked unfixable. The orchestrator's cursor records them as needing human review, even though 7 were actually fixed. The next run won't retry them (they're in the unfixable set), so valid fixes are lost until manual re-verification.
+
+**Root cause**: The collect-results step's `if` condition was an incomplete copy of the poll step's terminal state list. The poll step correctly handles suspended states (lines 516-520), but the collect-results step didn't include them.
+
+**Fix**: Added `suspended`, `suspend_requested`, and `suspend_requested_frontend` to the collect-results classification condition. Suspended sessions now get the same file-modification check as finished/blocked sessions, correctly classifying alerts as attempted (file modified) vs unfixable (file not modified).
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations

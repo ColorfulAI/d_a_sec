@@ -1745,3 +1745,80 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #52 fix — consistent return type eliminates fragile type-checking code.
 
 **Production scenario**: During a large backlog sweep, the GitHub API occasionally returns 500 errors (server-side issues). With the old code, if someone refactored the caller to remove the `isinstance()` check (not realizing it was needed), the orchestrator would crash with `ValueError: too many values to unpack`. With consistent tuple returns, this class of bug is impossible.
+
+---
+
+### TC-BL-BATCH-14: Initial Wave Fill Breaks Out After Consecutive Failures (Bug #53)
+
+**Type**: Resilience — validates orchestrator doesn't hang forever when Devin API is down
+
+**Why we test this**: The initial wave fill loop creates Devin sessions and dispatches children up to max_concurrent. If the Devin API is completely down (not just rate-limited), every `create_and_dispatch()` call fails. Before Bug #53, the loop retried the same batch indefinitely — each retry taking ~3.5 min (exponential backoff in session creation). The orchestrator would burn the entire 6-hour GitHub Actions timeout without ever entering the poll loop or processing any batches.
+
+**Setup**:
+1. Trigger the orchestrator with `max_batches=3` and enough open alerts to fill 3 batches
+2. Ensure the Devin API is unreachable or returns persistent errors (e.g., invalid API key, API outage)
+3. Monitor the orchestrator logs for the initial wave fill behavior
+
+**Expected**:
+1. The orchestrator attempts to create sessions for up to 3 batches
+2. After 3 consecutive failures, the log shows: `3 consecutive failures in initial fill — breaking out to poll loop`
+3. The orchestrator enters the poll loop (even with 0 active children)
+4. The poll loop hits the safety timeout and exits cleanly
+5. Total runtime is bounded by safety_timeout (~330 min), NOT the 6-hour Actions timeout
+6. A successful dispatch between failures resets the consecutive failure counter
+
+**Validates**: Bug #53 fix — consecutive failure counter prevents infinite retry loop in initial fill.
+
+**Production scenario**: A Fortune 500 company schedules nightly backlog sweeps. During a Devin API maintenance window (e.g., 2-4 AM), the orchestrator starts and can't create sessions. Before Bug #53, it would burn 6 hours of GitHub Actions compute retrying. After Bug #53, it fails fast (3 attempts × ~3.5 min = ~10.5 min), enters the poll loop, hits safety timeout, and exits — freeing the Actions runner for other jobs.
+
+**Worry**: The max consecutive failures (3) is hardcoded. If transient network glitches cause exactly 3 consecutive failures (unlikely but possible), the orchestrator breaks out prematurely even though the API is actually available. A successful dispatch resets the counter, which mitigates this, but a slow startup with intermittent failures could still cause premature breakout.
+
+---
+
+### TC-BL-BATCH-15: Dead Code Removal — check_active_devin_sessions (Bug #54)
+
+**Type**: Code quality — validates dead code was removed
+
+**Why we test this**: The `check_active_devin_sessions()` function was part of the original session reservation gate (Bug #14 removed the gate). The function definition survived but all call sites were deleted. Dead code in a 1400-line workflow file increases cognitive load and can mislead developers.
+
+**Setup**:
+1. Search the orchestrator workflow file for `check_active_devin_sessions`
+2. Verify the function definition does not exist
+3. Verify no references to the function exist anywhere in the codebase
+
+**Expected**:
+1. No function definition for `check_active_devin_sessions` in the orchestrator
+2. No call sites referencing `check_active_devin_sessions` anywhere
+3. Session concurrency is managed purely by `len(active_children) < max_concurrent`
+
+**Validates**: Bug #54 fix — dead code removed, reducing confusion and maintenance burden.
+
+**Production scenario**: A new engineer joins the security team and reads the orchestrator code to understand concurrency management. With the dead function present, they might assume session count is being tracked via API and try to modify the function — not realizing it's never called and has no effect on behavior.
+
+---
+
+### TC-BL-BATCH-16: Suspended Sessions Correctly Classify Alerts (Bug #55)
+
+**Type**: Correctness — validates suspended sessions check branch modifications instead of marking all unfixable
+
+**Why we test this**: When a Devin session hits its ACU limit, it's suspended — but it may have already pushed partial fixes for some alerts. The collect-results step should check which files were modified (like it does for finished/blocked sessions) and classify alerts as attempted vs unfixable. Before Bug #55, suspended sessions fell through to the `else` clause and ALL alerts were marked unfixable, losing valid partial fixes.
+
+**Setup**:
+1. Trigger a batch workflow with a batch containing alerts in multiple files (e.g., 10 alerts across 5 files)
+2. Set `max_acu_limit` low enough that the Devin session is likely to be suspended before completing all fixes
+3. Verify the session pushes partial fixes (some files modified, some not) before being suspended
+4. Check the collect-results step output
+
+**Expected**:
+1. The poll step detects `suspended` status and outputs `status=suspended`
+2. The collect-results step enters the branch-check path (NOT the `else` clause)
+3. Alerts in modified files are classified as `attempted` (pending PR merge)
+4. Alerts in unmodified files are classified as `unfixable` (Devin didn't reach them)
+5. The artifact JSON correctly reflects the partial fix breakdown
+6. The orchestrator cursor marks attempted alerts for re-verification, not permanent unfixable status
+
+**Validates**: Bug #55 fix — suspended states included in collect-results classification condition.
+
+**Production scenario**: A Fortune 500 company with strict ACU budgets sets `max_acu_limit=5` per session to control costs. A batch of 15 alerts in 8 files triggers a Devin session. Devin fixes 10 alerts across 5 files before hitting the ACU limit (session suspended). Before Bug #55, all 15 alerts are marked unfixable — 10 valid fixes are lost and flagged for human review unnecessarily. After Bug #55, 10 are marked attempted and 5 are marked unfixable, correctly reflecting reality.
+
+**Worry**: If a suspended session pushed a branch but the branch is incomplete (e.g., only half a commit was pushed), the file-modification check might incorrectly classify alerts as attempted when the fix is actually broken. The CodeQL verification step should catch this (it runs for suspended sessions per Bug #50), but if verification also fails, the PR could contain partial/broken fixes.

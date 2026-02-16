@@ -720,23 +720,7 @@ jobs:
               except Exception as e:
                   return {"error": str(e)}, 0
 
-          def check_active_devin_sessions():
-              try:
-                  req = urllib.request.Request(
-                      "https://api.devin.ai/v1/sessions?status_in=running,started",
-                      headers={"Authorization": f"Bearer {devin_key}"}
-                  )
-                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
-                  data = json.loads(resp.read())
-                  sessions = data.get("sessions", [])
-                  count = len(sessions)
-                  print(f"  Active Devin sessions: {count}")
-                  return count
-              except Exception as e:
-                  print(f"  Warning: Could not check active sessions: {e}")
-                  return 0
-
-          # Shared headers for direct urllib requests (artifact download, etc.)
+          # Shared headersfor direct urllib requests (artifact download, etc.)
           # gh_api() has its own internal headers, but artifact download uses urllib directly.
           headers = {
               "Authorization": f"token {gh_pat}",
@@ -1072,12 +1056,23 @@ jobs:
                   return False
 
           # Initial fill: create sessions + dispatch up to max_concurrent children
+          # Bug #53 fix: cap consecutive failures to avoid infinite loop when API is down.
+          # Without this, persistent failures (API down, bad auth, malformed prompt) would
+          # retry forever until the 6-hour GitHub Actions timeout kills the job.
           print(f"=== WAVE 1: Batch-creating up to {max_concurrent} sessions ===\n")
+          consecutive_failures = 0
+          max_consecutive_failures = 3
           while len(active_children) < max_concurrent and pending_batches:
               batch = pending_batches.pop(0)
               if not create_and_dispatch(batch):
                   pending_batches.insert(0, batch)
+                  consecutive_failures += 1
+                  if consecutive_failures >= max_consecutive_failures:
+                      print(f"  {max_consecutive_failures} consecutive failures in initial fill — breaking out to poll loop")
+                      break
                   time.sleep(10)
+              else:
+                  consecutive_failures = 0
 
           print(f"\n=== Initial wave dispatched: {len(active_children)} children, {_counters['sessions_created']} sessions created in batch ===\n")
 
