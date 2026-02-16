@@ -1331,3 +1331,26 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #32 — The tracking issue must remain clean and readable. Enterprise teams should see exactly one cursor comment with the current state, not a history of 50+ stale snapshots.
 
 **Worry**: Deleting comments requires write permissions on the issue. If the `GH_PAT` token lacks `issues:write` scope, the cleanup silently fails. Also, if two orchestrator runs execute simultaneously, they could race to delete each other's cursor comments. The cleanup should only delete comments with the `<!-- backlog-cursor -->` marker.
+
+---
+
+### TC-BL-REG-38: Cursor Parsing IndentationError on Default Runs (Bug #33 Regression)
+
+**Type**: Regression — Python IndentationError crashes orchestrator on default (non-reset) runs
+
+**Why we test this**: The cursor parsing Python heredoc had an indentation error that only manifested when `reset_cursor=false` (the default for scheduled cron runs). All previous test runs used `reset_cursor=true`, hiding the bug. In production, the 6-hour cron schedule runs with default settings — if this code path crashes, the backlog sweep silently stops.
+
+**Setup**:
+1. Ensure the tracking issue (#108) has at least one cursor comment from a previous run
+2. Trigger the orchestrator with default settings (no `reset_cursor` input, or `reset_cursor=false`)
+3. Observe the cursor parsing step
+
+**Expected**:
+1. The cursor parsing Python heredoc executes without `IndentationError`
+2. The cursor is loaded from the tracking issue comment
+3. The orchestrator proceeds to filter alerts and dispatch batches
+4. The log shows "Cursor loaded: N processed, M unfixable, K attempted"
+
+**Validates**: Bug #33 — Python code inside YAML heredocs must have consistent indentation. The `if cursor is None:` block body must be at the same indent level throughout.
+
+**Worry**: This class of bug (Python indentation errors inside YAML heredocs) is invisible to YAML linters, Python linters (which don't see the heredoc content), and CI checks. The only way to catch it is to exercise the specific code path at runtime. In production, the default code path (`reset_cursor=false`) is the one that runs on schedule — if it's broken, no one notices until they check why the backlog isn't being processed.

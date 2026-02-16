@@ -1491,6 +1491,18 @@ Before Bug #26 was fixed, every orchestrator run created N+1 cursor comments (on
 
 **Solution (Bug #32 fix)**: When `update_cursor()` creates a new cursor comment (POST), delete any previous cursor comments on the same issue. This keeps the tracking issue clean with exactly one active cursor comment at any time.
 
+**Worry: Python IndentationError in cursor parsing heredoc (Bug #33 — CONFIRMED)**
+
+The cursor parsing step uses a Python heredoc (`python3 << 'CURSOR_PARSE_EOF'`) inside a YAML `run: |` block. The `if cursor is None:` block had its body (`cursor = { ... }`) indented at 8 spaces relative to the `if`, while the subsequent `print("No cursor found...")` was at 4 spaces. Python requires consistent indentation within a block, so this caused an `IndentationError` at runtime.
+
+**Observed behavior (run 22063246534)**: The first scheduled (non-reset) run after merging the Bug #26-#28 fixes crashed immediately with `IndentationError: unindent does not match any outer indentation level`. The orchestrator failed before dispatching any batches.
+
+**Why this was hidden**: All test runs used `reset_cursor=true`, which exits the cursor parsing step early (line 242: `exit 0`) before the Python heredoc executes. The indentation error only manifests when `reset_cursor=false` (the default for scheduled/cron runs), which exercises the Python cursor parsing code.
+
+**Production impact**: Critical — every scheduled cron run (every 6 hours) would crash immediately without processing any alerts. Only manual runs with `reset_cursor=true` would work. In production, this means the backlog sweep silently stops working on its default schedule.
+
+**Solution (Bug #33 fix)**: Aligned the `cursor = { ... }` dict and `print(...)` to the same indentation level (4 spaces relative to the `if`), matching Python's requirement for consistent block indentation.
+
 ---
 
 ## Limitations and Future Work
