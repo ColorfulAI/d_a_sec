@@ -1,574 +1,637 @@
-# Pipeline Test Suite
+# Backlog Security Sweep — Test Specifications
 
-Systematic tests for the Devin Security Review closed-loop pipeline.
-Run these periodically to validate the pipeline works end-to-end.
+Tests for the backlog workflow (`devin-security-backlog.yml`) and its child batch workflow (`devin-security-batch.yml`). These test cases validate the orchestrator fan-out pattern, streaming PR creation, wave-based processing, cursor-based stateless pickup, session lifecycle management, and all edge cases documented in DESIGN.md.
 
----
-
-## Test Categories
-
-1. **Alert Detection** — Does CodeQL find the vulnerabilities?
-2. **Alert Classification** — Are alerts correctly split into new-in-PR vs pre-existing?
-3. **Devin Session Creation** — Are sessions created with correct prompts?
-4. **Fix Quality** — Did Devin actually fix the issues? Did CodeQL confirm?
-5. **Fix Granularity** — Did Devin make 1 commit per alert as instructed?
-6. **PR Comment UX** — Is the PR comment informative and actionable?
-7. **Non-blocking** — Does the workflow exit quickly without waiting for Devin?
-8. **Batching** — Are pre-existing alerts batched correctly?
-9. **Edge Cases** — Zero alerts, huge alert counts, mixed severity
+For PR-triggered workflow tests (TC-A through TC-S), see [PR_triggered_tests.md](./PR_triggered_tests.md).
 
 ---
 
-## Test Results Log
+## Test Design Principles
 
-### Run 1 — 2026-02-15 (PR #3, commit 2881be7)
-
-#### T1: Alert Detection
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| CodeQL detects py/sql-injection | Yes | Yes (server.py:16) | PASS |
-| CodeQL detects py/command-line-injection | Yes | Yes (server.py:23) | PASS |
-| CodeQL detects py/flask-debug | Yes | Yes (server.py:32) | PASS |
-| CodeQL detects py/reflective-xss | Yes | Yes (server.py:18) | PASS |
-| CodeQL detects py/url-redirection | Yes | Yes (server.py:29) | PASS |
-| CodeQL detects actions/code-injection | Yes | No (fixed by workflow rewrite) | N/A |
-
-**Notes**: All 5 Python vulnerabilities in `server.py` detected. The `actions/code-injection` alert was present in earlier workflow versions but resolved by the rewrite.
-
-#### T2: Alert Classification
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Python alerts classified as new-in-PR | 5 | 5 | PASS |
-| Pre-existing alerts (from main) | 0 Python (main has no Python) | 0 | PASS |
-| actions/missing-workflow-permissions on main | 1 | 1 (correctly excluded from new-in-PR) | PASS |
-
-**Notes**: Classification correctly identifies that all Python alerts are new (since main has no Python code). The `actions/missing-workflow-permissions` alert on main is correctly excluded from the new-in-PR set.
-
-#### T3: Devin Session Creation
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Session created for new-in-PR alerts | Yes | Yes (session devin-58cbe98f) | PASS |
-| Session URL in PR comment | Yes | Yes | PASS |
-| Session prompt includes all 5 alerts | Yes | Yes (verified in Devin UI) | PASS |
-| Session prompt includes PR branch name | Yes | Yes | PASS |
-| No pre-existing sessions (0 pre-existing alerts) | 0 sessions | 0 sessions | PASS |
-
-#### T4: Fix Quality
-
-| Alert | Fixed? | CodeQL Confirms? | Fix Description |
-|-------|--------|-----------------|-----------------|
-| py/sql-injection | YES | YES (state=fixed) | Parameterized query with `?` placeholder |
-| py/command-line-injection | YES | YES (state=fixed) | Allowlist + shlex.split + shell=False |
-| py/flask-debug | YES | YES (state=fixed) | Changed debug=True to debug=False |
-| py/reflective-xss | YES | YES (state=fixed) | Changed return dict to jsonify() |
-| py/url-redirection | PARTIAL | NO (1 still open at line 44) | Multiple fix attempts but CodeQL still flags redirect(safe_path) |
-
-**Notes**:
-- 4 out of 5 alerts fully resolved and confirmed by CodeQL
-- `py/url-redirection` remains open at line 44: `return redirect(safe_path)` where `safe_path` comes from `parsed.path`. CodeQL traces taint from `request.args.get("url")` through `urlparse()` to `redirect()`. The fix adds validation (scheme/netloc checks, path prefix checks) but CodeQL still considers `parsed.path` tainted.
-- **Root cause of residual alert**: CodeQL's taint tracking follows data through `urlparse()` — the parsed path is still considered user-controlled. A fully clean fix would need to use a hardcoded allowlist of paths or validate against a known set of internal routes.
-
-**Score: 4/5 alerts fully fixed (80%)**
-
-#### T5: Fix Granularity (1 commit per alert)
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Each alert gets its own commit | 5 separate commits | 1 combined commit (25575e4) + 2 follow-up redirect fixes | FAIL |
-
-**Details**: Devin combined all 5 fixes into one commit:
-```
-25575e4 Fix CodeQL security alerts: py/sql-injection, py/command-line-injection, py/flask-debug, py/reflective-xss, py/url-redirection
-3a70e52 Fix py/url-redirection: prevent open redirect bypasses
-147e2eb Fix CodeQL py/url-redirection: use parsed path instead of raw user input in redirect
-```
-
-**Root cause**: This run used the OLD prompt (before the "1 commit per alert" instruction was added). The updated prompt now explicitly says "Fix each alert ONE AT A TIME" and "Each security issue MUST be a separate commit." This needs re-testing after the prompt update.
-
-#### T6: PR Comment UX
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Comment posted on PR | Yes | Yes | PASS |
-| Total alert count shown | Yes | Yes ("Total CodeQL Alerts: 5") | PASS |
-| New-in-PR section with alert list | Yes | Yes (all 5 listed with severity) | PASS |
-| Alerts sorted by severity | critical > high > medium | Yes | PASS |
-| Devin session URL included | Yes | Yes | PASS |
-| Pre-existing section (when 0) | Should be absent | Absent | PASS |
-| Links to commits/files tabs | Yes | No (not in this run — added after) | FAIL* |
-
-*Note: The "links to commits/files tabs" test fails for this run because the UX improvement was committed after this workflow run. Will pass on next run.
-
-#### T7: Non-blocking
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Workflow completes without waiting for Devin | Yes | Yes (~3 min total) | PASS |
-| PR not blocked by security review | Yes | Yes (PR mergeable during review) | PASS |
-
-#### T8: Batching
-
-Not testable on this run (0 pre-existing alerts). Needs a test case where main has existing vulnerabilities.
-
-#### T9: Edge Cases
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Devin session blocked/failed | Graceful handling | Session status=blocked, but PR comment still posted | PASS |
-| Multiple workflow runs on same PR | Each posts its own comment | Yes (6 comments from various runs) | PASS |
-
-### Run 2 — 2026-02-15 (PR #3, commit b298d59, full thread analysis)
-
-**Context**: 12 total PR comments, 7 Devin sessions created across multiple workflow runs, 18 commits on the branch.
-
-#### T1: Alert Detection (re-run)
-
-| Test | Expected | Actual | Pass? |
-|------|----------|--------|-------|
-| Total alerts detected across all runs | 5 original + derivatives | 10 total (1 open, 9 fixed) | PASS |
-
-#### T4: Fix Quality (re-run)
-
-| Alert | Fixed? | CodeQL Confirms? |
-|-------|--------|-----------------|
-| py/sql-injection | YES | YES (state=fixed) |
-| py/command-line-injection | YES | YES (state=fixed) |
-| py/flask-debug | YES | YES (state=fixed) |
-| py/reflective-xss | YES | YES (state=fixed) |
-| py/url-redirection (original line 29) | YES | YES (state=fixed) |
-| py/url-redirection (line 39, 41, 44) | YES | YES (3 variants fixed) |
-| py/url-redirection (line 42) | NO | NO — still open | 
-| actions/code-injection | YES | YES (state=fixed) |
-
-**Score: 9/10 alert instances fixed. 1 residual url-redirection remains.**
-
-The url-redirection alert has been fixed and re-introduced 4 times as Devin's successive fix attempts shift the tainted line number. This is a significant DX finding (see DX Analysis below).
-
-#### T3: Devin Session Status
-
-| Session ID | Status | Created by run |
-|-----------|--------|----------------|
-| devin-4e325fb3 | blocked | Run 1 (1 alert, actions only) |
-| devin-2e5a1c5e | finished | Run 2 (1 alert, actions only) |
-| devin-f0093722 | finished | Run 3 (6 alerts, first Python) |
-| devin-f209b6eb | blocked | Run 4 (6 alerts, duplicate) |
-| devin-58cbe98f | blocked | Run 5 (5 alerts, classified) |
-| devin-fc4f5bad | blocked | Run 6 (1 url-redir residual) |
-| devin-7f966e17 | working | Run 7 (1 url-redir residual) |
-
-**3/7 sessions blocked (43%). Only 2 finished. 1 still working.**
-
-#### T9: Cascade/Loop Problem (NEW FINDING)
-
-The PR has **12 comments** from the security review workflow. Here's the cascade:
-
-```
-Comment 1:  1 alert  (actions only)          → Devin session created
-Comment 2:  1 alert  (actions only, re-run)  → Devin session created
-Comment 3:  6 alerts (Python detected)       → Devin session created
-Comment 4:  6 alerts (duplicate run)         → Devin session created
-Comment 5:  5 alerts (classified, improved)  → Devin session created → Devin pushes fixes
-Comment 6:  1 alert  (url-redir residual)    → Devin session created → Devin pushes fix
-Comment 7:  1 alert  (url-redir residual)    → Devin session created
-Comment 8:  1 alert  (url-redir residual)    → no session (API issue?)
-Comment 9:  1 alert  (url-redir residual)    → no session
-Comment 10: 1 alert  (url-redir residual)    → no session
-Comment 11: 1 alert  (url-redir residual)    → no session
-Comment 12: 1 alert  (url-redir residual)    → no session
-```
-
-**Critical finding**: Each Devin fix push triggers a new workflow run, which finds the residual alert, posts another comment, and creates another session. This is a **feedback loop that doesn't converge** when an alert can't be fully resolved.
+Each test case follows these rules:
+1. **Creates the actual situation** — not a mock, not a description. Push real code, trigger real workflows.
+2. **States WHY we are testing** — maps to a specific worry or edge case in DESIGN.md.
+3. **States what behavior we WANT** — explicit pass/fail criteria.
+4. **Calls out what we are MOST WORRIED about** — the failure mode that would be worst in production.
+5. **Enterprise-ready bar** — every output must be professional and trustworthy for Fortune 500 clients.
 
 ---
 
-## Developer Experience Analysis
+## Test Cases
 
-### What a developer sees on PR #3 right now
+### TC-BL-A: Orchestrator Dispatches Child Workflows (Happy Path)
 
-A developer opening PR #3 sees:
-- **12 bot comments** from the security review workflow, most saying the same thing
-- **18 commits**, many of which are merge commits and automated fixes
-- No clear summary of "what was fixed and what wasn't"
-- Multiple Devin session links, most of which are blocked/unhelpful
-- No way to know which comment is the "current" one without reading all 12
+**Setup**: Seed main with 30 open CodeQL alerts across 3 files. Trigger the backlog workflow manually via `workflow_dispatch`.
 
-### Developer needs vs. current state
+**Expected**:
+1. Orchestrator fetches all 30 alerts from the CodeQL API
+2. Groups alerts into 2 batches (15 each, grouped by file)
+3. Dispatches 2 child workflows via `workflow_dispatch` (one per batch)
+4. Each child workflow creates exactly 1 Devin session
+5. Each child workflow appears as a separate run in GitHub Actions UI
+6. Orchestrator polls child statuses every 60s
+7. As each child completes, orchestrator creates a PR for that batch
+8. 2 PRs created total, each with its own branch (`devin/security-batch-{N}-{timestamp}`)
+9. Cursor updated with all 30 alert IDs as processed
 
-| What developers want | Current state | Gap |
-|---------------------|---------------|-----|
-| **"What vulns does my PR have?"** | Listed in comment, sorted by severity | OK |
-| **"Are they being fixed?"** | "Devin is pushing fixes" — but which ones? When? | Missing: no status updates after initial comment |
-| **"What did Devin actually change?"** | Must dig through commits tab | Missing: no diff summary in the comment |
-| **"Is the fix done?"** | Must click Devin session URL and check | Missing: no completion notification |
-| **"Did the fix actually work?"** | Must re-check CodeQL alerts manually | Missing: no re-scan result posted |
-| **"Can I merge now?"** | Unknown — is Devin still working? | Missing: clear "safe to merge" signal |
-| **"Stop spamming my PR"** | 12 comments, most repetitive | CRITICAL: comment flood from feedback loop |
-| **"I only care about MY code"** | Pre-existing alerts mixed in | OK (classified) but pre-existing noise still visible |
-| **"Don't touch my branch without asking"** | Devin pushes directly | RISK: some devs prefer review before auto-push |
+**Validates**: Core orchestrator fan-out — the fundamental architecture works end-to-end.
 
-### Critical DX Issues (Priority Order)
+**Production scenario**: Security team onboards a new repo with 30 known vulnerabilities. They trigger the backlog workflow manually and expect it to process everything in one run.
 
-**DX-1: Comment flood / infinite loop (CRITICAL)**
-Each Devin fix push triggers a new workflow run → new comment → possibly new session. If an alert can't be fully fixed (like url-redirection), this creates an infinite loop of comments. PR #3 has 12 comments, 7 of which are repetitive.
-
-**Fix**: 
-- Edit the existing comment instead of posting a new one (find by marker text)
-- Add a max-runs-per-PR guard (e.g., skip if >3 security review comments already exist)
-- Skip alerts that were already reported in a previous comment on the same PR
-- Add a `[security-review-skip]` label or commit message flag to stop the loop
-
-**DX-2: No completion notification (HIGH)**
-Developer has no idea when Devin is done. The initial comment says "Devin is working" but there's no follow-up saying "Devin finished, here's what changed."
-
-**Fix**:
-- After Devin session completes, use Devin API webhook or polling to post a follow-up comment with: files changed, commit SHAs, which alerts were resolved, which remain
-- Or: add a lightweight "status check" workflow that polls the Devin session and updates the PR comment
-
-**DX-3: No diff visibility in comment (HIGH)**
-The comment lists alerts but not what Devin actually changed. Developer must navigate to commits tab.
-
-**Fix**:
-- Include a brief code diff or file list in the completion comment
-- At minimum: "Fixed in commit `abc1234`: parameterized SQL query in server.py:16"
-
-**DX-4: Blocked sessions waste resources (MEDIUM)**
-43% of sessions (3/7) are blocked — likely repo access permissions. These sessions are created but never do useful work.
-
-**Fix**:
-- Pre-validate Devin API connectivity before creating sessions
-- If the first session gets blocked, don't create more
-- Document required Devin service user permissions in DESIGN.md
-
-**DX-5: Merge commits clutter history (MEDIUM)**
-The branch has multiple merge commits from concurrent Devin pushes and our pushes happening at the same time. The commit history is noisy.
-
-**Fix**:
-- Devin sessions should pull before pushing to keep history linear
-- Or accept this as a trade-off of async non-blocking design
-
-**DX-6: No "safe to merge" signal (LOW)**
-Developer doesn't know when all fixes are applied and verified.
-
-**Fix**:
-- After all sessions complete, post a final summary comment: "All fixable alerts resolved. 1 alert remains (url-redirection — requires manual review). Safe to merge."
-- Or set a PR check status (pass/fail) based on remaining alerts
+**Worry**: If child dispatch fails silently (GitHub API 422, wrong workflow file name, missing inputs), the orchestrator thinks it dispatched work but nothing happens. Alerts are marked "in progress" in the cursor but no session ever runs.
 
 ---
 
-## Test Cases for Future Runs
+### TC-BL-B: Streaming PR Creation — First PR Before Last Batch Completes
 
-### TC-A: Pre-existing Alert Batching
-**Setup**: Merge vulnerable code to main first, then open a new PR with additional vulnerable code.
-**Expected**: New-in-PR alerts fixed on PR branch; pre-existing alerts batched into separate sessions.
-**Validates**: T2 classification, T8 batching, cross-linking.
+**Setup**: Seed main with 75 alerts (5 batches of 15). Trigger backlog workflow. Monitor PR creation timestamps.
 
-### TC-B: Commit Granularity
-**Setup**: Open PR with 3+ distinct vulnerabilities in different files.
-**Expected**: Devin creates 1 commit per alert with descriptive message like `fix: [rule_id] description (file:line)`.
-**Validates**: T5 granularity with updated prompt.
-
-### TC-C: Large Batch (>15 alerts)
-**Setup**: Add 20+ vulnerabilities across multiple files to main.
-**Expected**: Alerts batched into sessions of <=15, with backfill from other files.
-**Validates**: T8 batching algorithm, concurrency control.
-
-### TC-D: Zero Alerts
-**Setup**: Open a clean PR with no vulnerabilities.
-**Expected**: Workflow detects 0 alerts, posts no comment, exits cleanly.
-**Validates**: Edge case handling.
-
-### TC-E: Fix Verification Loop
-**Setup**: Introduce a vulnerability that requires multiple fix attempts.
-**Expected**: Devin attempts fix, re-runs CodeQL, revises if alert persists.
-**Validates**: T4 fix quality, verification loop.
-
-### TC-F: Session Failure Recovery
-**Setup**: Trigger workflow with invalid DEVIN_API_KEY.
-**Expected**: Workflow handles API error gracefully, posts comment noting failure.
-**Validates**: Error handling, graceful degradation.
-
-### TC-G: Internal Retry — Devin Fixes Alert on First CodeQL Attempt
-**Setup**: Push a simple, clearly fixable vulnerability (e.g., `py/sql-injection` with string concatenation).
 **Expected**:
-1. Workflow creates exactly 1 Devin session (not 2+)
-2. Devin fixes the alert, runs CodeQL locally, confirms it's resolved on attempt 1
-3. Devin commits the fix and pushes
-4. Next workflow run sees the alert as fixed — no new session created
-5. No `idempotent` flag in the API call (verify in workflow logs)
-**Validates**: Single-session design works for the happy path. No wasted sessions.
+1. Orchestrator dispatches 5 child workflows simultaneously (fills all 5 slots)
+2. Child 1 completes first (~8 min) → PR #1 created immediately
+3. Child 3 completes next (~10 min) → PR #3 created immediately
+4. Remaining children complete over next 5-10 min → PRs created as each finishes
+5. **Time to first PR: ~8-10 minutes** (not waiting for all 5 to finish)
+6. All 5 PRs created within ~20 minutes
+7. PRs are numbered and titled descriptively: `fix(security): Batch {N} — {count} CodeQL alerts in {files}`
 
-### TC-H: Internal Retry — Devin Needs 2nd Attempt Inside Session
-**Setup**: Push a vulnerability where the "obvious" fix doesn't satisfy CodeQL (e.g., `py/url-redirection` where `urlparse().path` is still tainted, or `py/reflective-xss` where escaping alone isn't sufficient).
-**Expected**:
-1. Workflow creates exactly 1 Devin session
-2. Inside the session, Devin applies fix attempt 1 → runs CodeQL → alert still present
-3. Devin revises the fix (attempt 2) → runs CodeQL → alert resolved (or skipped)
-4. Only 1 session created across the entire flow (verify via Devin API / workflow logs)
-5. If attempt 2 also fails, Devin skips the alert (does NOT commit a broken fix)
-**Validates**: Internal retry loop works. Devin gets 2 real attempts per alert within 1 session.
-**Key check**: Confirm the Devin session log shows 2 CodeQL runs for the stubborn alert.
+**Validates**: Streaming PR creation — the key design choice that provides faster developer feedback.
 
-### TC-I: Internal Retry — Alert Unfixable After 2 Internal Attempts
-**Setup**: Push a vulnerability that CodeQL cannot be satisfied on (e.g., a taint flow through `urlparse()` that CodeQL always flags regardless of validation).
-**Expected**:
-1. Workflow creates 1 Devin session
-2. Devin tries fix attempt 1 → CodeQL still flags → attempt 2 → still flags → Devin skips
-3. Devin does NOT commit a broken fix for this alert
-4. Devin pushes fixes for any other alerts in the batch that were resolved
-5. Next workflow run: the skipped alert is still open in CodeQL → attempt counter increments → marked unfixable
-6. PR comment shows "Needs Manual Fix" for the unfixable alert
-7. Subsequent workflow runs do NOT create new sessions for this alert
-**Validates**: Full circuit breaker lifecycle with internal retry. Broken fixes are never committed.
+**Production scenario**: Security team kicks off backlog sweep at 9 AM. With streaming, the first batch PR is available for review by 9:10 AM. Without streaming, they'd wait until 9:20+ AM to see anything.
 
-### TC-J: No Duplicate Sessions on Re-trigger (Idempotent Removal Regression)
-**Setup**: Push vulnerable code → workflow runs → Devin session created → Devin pushes fix → fix triggers new workflow run.
-**Expected**:
-1. Run A: Creates 1 session, Devin fixes alert
-2. Run B (triggered by Devin's push): If alert is fixed, no session created (0 actionable alerts). If alert persists, creates a NEW session (not a reuse of the old one) since `idempotent` is removed
-3. No `is_new_session: false` responses from the Devin API
-4. The workflow's own circuit breaker (attempt counter) prevents infinite loops, NOT the API's idempotent dedup
-**Validates**: Removing `idempotent: true` doesn't cause runaway session creation. The workflow-level circuit breaker is the safety net.
-**Regression risk**: Without `idempotent`, each workflow run with actionable alerts WILL create a new session. The circuit breaker (max 2 attempts) must reliably prevent more than 2 sessions for the same alert.
+**Worry**: If PRs are only created after ALL batches complete, a crash at batch 4 means 0 PRs created despite batches 1-3 being fully fixed. Streaming prevents this data loss.
 
-### TC-K: Batch Alert — Mixed Fix Results Inside Single Session
-**Setup**: Push 3 vulnerabilities: 1 easily fixable, 1 that needs 2 attempts, 1 that's unfixable.
-**Expected**:
-1. Workflow creates 1 Devin session for all 3 alerts
-2. Inside the session:
-   - Alert 1: fixed on attempt 1 → committed
-   - Alert 2: attempt 1 fails CodeQL → attempt 2 succeeds → committed
-   - Alert 3: attempt 1 fails → attempt 2 fails → SKIPPED (not committed)
-3. Only 2 fix commits pushed (alerts 1 and 2)
-4. Next workflow run: alert 3 still open → marked unfixable
-5. PR comment shows mixed state: 2 fixed, 1 needs manual review
-**Validates**: Batch handling with mixed outcomes inside a single session.
+---
 
-### TC-L: Label Creation Idempotency
-**Setup**: Run the workflow twice with unfixable alerts present.
-**Expected**:
-1. First run: Label `devin:manual-review-needed` created (HTTP 201) and added to PR
-2. Second run: Label existence check returns 200 → creation skipped → label still on PR
-3. No 422 errors in workflow logs on the second run
-4. When all alerts are fixed: label removed from PR
-**Validates**: Label creation check-before-create logic. No wasted API calls.
+### TC-BL-C: Rolling Window — More Batches Than Concurrent Slots
 
-### TC-M: Exit Code Isolation — Pre-existing Batch Failure Must Not Fail PR Check
-**Setup**: Open a clean PR. Push code that introduces 1 new-in-PR alert (fixable) alongside a codebase that has pre-existing alerts on main. Simulate a scenario where the pre-existing batch Devin session fails but the new-in-PR session succeeds.
-**Expected**:
-1. Workflow exit code is `0` (success) — the PR check passes
-2. The `session_failed` output is only checked for the new-in-PR session, not pre-existing
-3. PR comment shows new-in-PR alert as fixed
-4. Pre-existing alerts shown separately with their own status
-5. No `devin:manual-review-needed` label applied (because no NEW-IN-PR unfixable alerts)
-**Validates**: EC-1 batch isolation. A developer's PR is not blocked by tech debt they didn't create.
-**Production scenario**: Fortune 500 repo with 200+ pre-existing alerts. New developer opens their first PR — it should pass if their code is clean.
+**Setup**: Seed main with 105 alerts (7 batches of 15). Trigger backlog workflow. The Devin API concurrent session limit is 5.
 
-### TC-N: Banner Misattribution — Pre-existing Unfixable Must Not Show "REQUIRES MANUAL REVIEW"
-**Setup**: Open a clean PR on a codebase where main has unfixable alerts. Push clean code that introduces NO new vulnerabilities, or only fixable ones.
 **Expected**:
-1. PR comment does NOT show "REQUIRES MANUAL REVIEW" banner (because no NEW-IN-PR unfixable)
-2. PR comment shows a softer "Note: N pre-existing alert(s) on main also need manual attention (not introduced by this PR)"
-3. `devin:manual-review-needed` label is NOT applied to the PR
-4. If both new-in-PR AND pre-existing unfixable exist, banner says "N alert(s) introduced by this PR" (not total)
-**Validates**: EC-2 banner/label misattribution. PR author is not blamed for inherited tech debt.
-**Production scenario**: Enterprise security team rolls out CodeQL on a legacy codebase with hundreds of known issues. Every new PR would get a scary red banner — devs would quickly learn to ignore it.
+1. Orchestrator dispatches batches 1-5 (fills all 5 slots)
+2. Batch 1 completes → PR created → batch 6 dispatched into freed slot
+3. Batch 3 completes → PR created → batch 7 dispatched into freed slot
+4. Remaining batches complete → PRs created
+5. **At no point are more than 5 children active simultaneously**
+6. All 7 batches processed in a single orchestrator run
+7. Total time: ~2 waves × ~10 min = ~20 min (not 7 × 10 min = 70 min sequential)
 
-### TC-O: Label Attribution — Label Only for New-in-PR Unfixable
-**Setup**: Open a PR where all new-in-PR alerts are fixable, but pre-existing alerts are unfixable.
-**Expected**:
-1. `devin:manual-review-needed` label is NOT applied (all new-in-PR alerts fixed)
-2. Pre-existing unfixable alerts shown with "Note" callout, not "REQUIRES MANUAL REVIEW"
-3. If a subsequent push introduces an unfixable new-in-PR alert, label IS applied
-4. If that alert is later fixed, label is removed
-**Validates**: Label lifecycle tied to new-in-PR unfixable count, not total unfixable count.
+**Validates**: Rolling window concurrency — the orchestrator correctly manages the 5-slot limit with backfill.
 
-### TC-P: Comment Race Condition — Overlapping Workflow Runs
-**Setup**: Push code to trigger workflow run A. Before A completes, push again to trigger run B. Both runs will try to PATCH the same PR comment.
-**Expected**:
-1. Both runs complete without error
-2. The final PR comment reflects the latest state (run B's data)
-3. No attempt history is lost (attempt counters are monotonically increasing)
-4. No duplicate entries in the alert table
-**Validates**: EC-3 comment race condition. In high-volume repos, overlapping runs are common.
-**Production scenario**: Developer pushes code, gets a review comment, pushes a fix 30 seconds later. Both workflow runs overlap.
+**Production scenario**: Fortune 500 repo with 100+ alerts. The orchestrator must process all of them without hitting the Devin API concurrent session limit or needing a second workflow run.
 
-### TC-Q: Alert Explosion — Many Alerts in Single PR
-**Setup**: Push code that creates 10+ vulnerabilities across multiple files in a single commit.
-**Expected**:
-1. Workflow handles all alerts without crashing
-2. PR comment renders a large table without exceeding GitHub's 65536 char limit
-3. Alerts are sorted by severity (critical → high → medium → low)
-4. Session creation respects the cap (max 20 sessions, 15 alerts per batch)
-5. Debug log shows all alerts processed
-**Validates**: EC-4 alert explosion. Mature codebases can have hundreds of alerts.
+**Worry**: If the orchestrator dispatches all 7 children at once, children 6-7 get HTTP 429 from the Devin API. The child workflow fails, the session is never created, and those 30 alerts are lost until the next run.
 
-### TC-R: Stress Test — Mass PR Creation (~100 PRs)
-**Setup**: Create ~100 branches, each with a unique vulnerability, and open PRs for all of them in rapid succession.
-**Expected**:
-1. Each PR gets its own independent workflow run
-2. No cross-PR contamination (PR #10's alerts don't appear in PR #11's comment)
-3. GitHub Actions concurrency limits are hit gracefully (queued, not failed)
-4. Devin API rate limits (429) are handled with retry logic
-5. GitHub REST API rate limits (5000 req/hr) are not exhausted
-6. All PRs eventually get their security review comment
-**Validates**: EC-6 stress test. Fortune 500 companies can have spikes of 50-100 PRs in a release window.
-**Key metrics**: Time to first comment, API error rate, session creation success rate.
-**Actual results (99 PRs, Feb 2026)**:
-- 99/100 PRs created successfully (1 transient git 500)
-- 11/~30 completed Devin Security Review runs failed — all HTTP 429 (concurrent session limit)
-- CodeQL: 100% success rate under load
-- CI: 100% success rate under load
-- No cross-PR contamination detected
-- GitHub REST API rate limits NOT exhausted
-- GitHub Actions queued gracefully (242 queued at peak)
-- **BUG #9 discovered**: Single 60s retry insufficient for rate limiting under load
+---
 
-### TC-S: Rate Limit Resilience — Exponential Backoff Under Concurrent Load
-**Setup**: Open 10+ PRs with vulnerabilities within 2 minutes. This will exceed the Devin API concurrent session limit (5 sessions).
-**Expected**:
-1. First 5 PRs create sessions successfully
-2. Remaining PRs get HTTP 429 on first attempt
-3. Workflow retries with exponential backoff (60s → 120s → 240s)
-4. As earlier sessions complete, retries succeed
-5. After 3 failed retries, workflow marks session as failed but does NOT permanently block the PR
-6. PR comment shows "Devin API was temporarily at capacity" instead of a generic error
-**Validates**: EC-7 rate limit resilience. The workflow must gracefully handle Devin API capacity limits without permanently failing PRs.
-**Production scenario**: Monday morning at a Fortune 500 — 30 developers push code within 15 minutes. Only 5 Devin sessions can run concurrently. The workflow must queue and retry, not fail.
-**Worry**: Without proper backoff, a PR burst will cause cascading failures where 80%+ of security reviews fail even though the issue is purely transient capacity.
+### TC-BL-D: Session Reservation — Backlog Doesn't Starve PR Workflows
 
-### TC-T: Split-Trigger — PR Workflow Only Creates Sessions for New-in-PR Alerts
-**Setup**: Merge vulnerable code to main (creating pre-existing alerts). Open a new PR that introduces 1 new vulnerability. Trigger the PR workflow.
-**Expected**:
-1. PR workflow detects both new-in-PR alerts and pre-existing alerts
-2. PR workflow creates exactly 1 Devin session — ONLY for the new-in-PR alert
-3. PR workflow does NOT create any sessions for pre-existing alerts
-4. PR comment shows new-in-PR alert table with Devin session link
-5. PR comment shows a "Note" section: "N pre-existing alerts on main are handled separately by the scheduled backlog workflow"
-6. PR workflow completes in <60 seconds (no time spent on pre-existing batch work)
-7. PR exit code is `0` if the new-in-PR session was created successfully
-**Validates**: Split-trigger Phase 1 — PR workflow is fast and scoped.
-**Production scenario**: Developer pushes a 2-line fix. Under the current architecture, the workflow spends 7+ minutes creating sessions for 100 pre-existing alerts. After the split, the workflow completes in seconds.
-**Worry**: If the PR workflow still processes pre-existing alerts, every concurrent PR creates redundant sessions for the same tech debt, causing session explosion and rate limit cascades (stress test showed 41% failure rate with 99 PRs).
+**Setup**: Trigger backlog workflow (processing 45 alerts = 3 batches). While the backlog is running, push vulnerable code to a PR to trigger the PR workflow.
 
-### TC-U: Split-Trigger — Backlog Workflow Incremental Progress (Cursor Pickup)
-**Setup**: Seed main with 30+ open CodeQL alerts. Run the backlog workflow once (processes first batch of 15). Run it again.
 **Expected**:
-1. Run 1: Reads cursor (empty/initial), fetches 30 alerts, picks first 15, creates 1 Devin session, updates cursor with processed alert IDs and offset
-2. Run 2: Reads cursor (offset=15), fetches remaining alerts, picks next 15, creates 1 session, updates cursor
-3. Run 2 does NOT re-process the alerts from Run 1
-4. If Run 1's Devin session is still running when Run 2 starts, Run 2 skips those alerts (checks session status)
-5. Cursor survives between runs (stored in GitHub issue comment or repo variable)
-**Validates**: Stateless pickup — the backlog workflow resumes from where it left off.
-**Production scenario**: Fortune 500 repo with 500 pre-existing alerts. The backlog workflow runs every 6 hours. After 7 runs (42 hours), the full backlog is processed. Without cursor pickup, each run would re-process the same alerts and never make progress.
-**Worry**: If the cursor is lost or corrupted, the backlog workflow re-processes everything from scratch, creating duplicate sessions and wasting resources. The compare-and-set pattern on cursor update prevents this.
-
-### TC-V: Split-Trigger — Backlog Does Not Block PR Workflows (Session Reservation)
-**Setup**: Start a backlog workflow run that creates 3 sessions (using 3 of 5 concurrent slots). While the backlog is running, push code to a PR to trigger the PR workflow.
-**Expected**:
-1. Backlog workflow creates 3 sessions (3/5 slots used)
-2. PR workflow triggers, needs 1 session (would use 4/5 slots)
+1. Orchestrator dispatches 3 children (uses 3 of 5 Devin session slots)
+2. PR workflow triggers, needs 1 session (would use 4 of 5 slots)
 3. PR workflow creates its session successfully (slot available)
-4. If the backlog had used all 5 slots, the PR workflow's exponential backoff would handle the 429 gracefully
-5. Backlog workflow should self-limit to 3 concurrent sessions, reserving 2 slots for PR workflows
-**Validates**: Concurrency management — backlog never starves PR workflows.
+4. Orchestrator's session reservation check (`active >= 3 → pause`) prevents it from using all 5 slots
+5. If the orchestrator had used all 5 slots, the PR workflow would have gotten HTTP 429
+6. PR workflow completes in <60 seconds
+7. Backlog workflow completes normally after PR workflow finishes
+
+**Validates**: Session reservation — the orchestrator self-limits to 3 concurrent children, reserving 2 slots for PR workflows.
+
 **Production scenario**: The backlog runs overnight processing 200 alerts. A developer pushes an urgent hotfix at 3 AM. The PR workflow must not be blocked by the backlog's batch work.
+
 **Worry**: If both workflows compete for the same 5 session slots without coordination, PR workflows get 429s and developers see "security review failed" on their urgent hotfix — destroying trust in the system.
 
-### TC-W: Split-Trigger — Concurrent PRs No Longer Cause Session Explosion
-**Setup**: Open 20 PRs simultaneously, each introducing 1 new vulnerability. All PRs also see the same 50 pre-existing alerts on main.
-**Expected**:
-1. Each PR workflow creates exactly 1 session (20 total session attempts)
-2. NO sessions created for pre-existing alerts by any PR workflow
-3. With exponential backoff, all 20 PRs eventually get their session (within ~7 minutes as sessions complete)
-4. Compare to current architecture: 20 PRs × 4 pre-existing sessions = 80+ session attempts → massive 429 cascade
-5. The backlog workflow (running separately on its own schedule) handles the 50 pre-existing alerts in a single run
-**Validates**: Session explosion prevention under concurrent PR load.
-**Production scenario**: Release day — 20 developers merge feature branches within 30 minutes. Under the current architecture, this creates 400+ session attempts. After the split, it creates 20 + ~4 (backlog) = 24 total.
-**Worry**: Without the split, the stress test showed 41% workflow failure rate with 99 PRs. The split should reduce this to near 0% for PR workflows (only 1 session each) while the backlog processes pre-existing alerts at its own pace.
+---
 
-### TC-X: Split-Trigger — Backlog Workflow Handles Crashed/Stuck Sessions
-**Setup**: Run the backlog workflow. Simulate a Devin session that times out or fails (wait for a session to reach `max_acu_limit` timeout). Run the backlog workflow again.
+### TC-BL-E: Cursor-Based Stateless Pickup
+
+**Setup**: Seed main with 60 alerts. Run the backlog workflow. It processes all 60 alerts (4 batches). Merge 10 new vulnerabilities to main. Run the backlog workflow again.
+
 **Expected**:
-1. Run 1: Creates session for alerts A, B, C. Session starts running. Cursor updated with session ID.
-2. Session times out or fails (status = `failed` or `timed_out`)
-3. Run 2: Reads cursor, checks session status → detects failure
-4. Run 2: Marks alerts A, B, C as retryable (unless they've already hit max attempts)
-5. Run 2: Creates new session for A, B, C (retry) plus picks up next batch D, E, F
-6. If session has been "in progress" for >1 hour, Run 2 assumes it failed and retries
-**Validates**: Fault tolerance — the backlog workflow recovers from session failures without human intervention.
-**Production scenario**: A Devin session hangs due to a complex codebase that takes too long to clone. The next backlog run detects this and retries the alerts in a new session. No alerts are permanently lost.
+1. Run 1: Reads cursor (empty/initial), fetches 60 alerts, creates 4 batches, dispatches children, creates 4 PRs, updates cursor with 60 processed alert IDs
+2. Run 2: Reads cursor (60 processed IDs), fetches all open alerts, filters out the 60 already-processed, finds 10 new alerts, creates 1 batch, dispatches 1 child, creates 1 PR
+3. Run 2 does NOT re-process any of the 60 alerts from Run 1
+4. Cursor after Run 2 shows 70 total processed alert IDs
+
+**Validates**: Stateless pickup — the backlog workflow resumes from where it left off without re-processing.
+
+**Production scenario**: Fortune 500 repo where new vulnerabilities are introduced weekly. Each backlog run should only process NEW alerts, not re-scan the entire history.
+
+**Worry**: If the cursor is lost or not read correctly, the backlog workflow re-processes all 60 alerts, creating duplicate Devin sessions and duplicate PRs for already-fixed issues. This wastes resources and confuses reviewers.
+
+---
+
+### TC-BL-F: Cursor Corruption Recovery
+
+**Setup**: Run the backlog workflow. Manually corrupt the cursor (edit the GitHub issue comment to contain invalid JSON). Run the backlog workflow again.
+
+**Expected**:
+1. Run 2 reads cursor → JSON parse fails
+2. Orchestrator falls back to "fresh start" mode: fetches ALL open alerts, treats nothing as processed
+3. Orchestrator logs a warning: "Cursor corrupted, starting fresh scan"
+4. Alerts that were already fixed (closed in CodeQL) are naturally skipped (they won't appear in `state=open` query)
+5. Alerts that were fixed but not yet merged (open PRs from Run 1) may be re-processed — this is acceptable as the duplicate session will produce the same fix
+6. Cursor is rebuilt from scratch after this run
+
+**Validates**: Fault tolerance — cursor corruption doesn't permanently break the workflow.
+
+**Production scenario**: A misconfigured bot or manual edit corrupts the state comment. The next backlog run must recover gracefully, not crash or loop infinitely.
+
+**Worry**: If cursor corruption causes the orchestrator to enter an infinite loop (e.g., trying to parse, failing, retrying), the workflow runs for 6 hours doing nothing, consuming GitHub Actions minutes.
+
+---
+
+### TC-BL-G: Child Workflow Failure — Devin Session Fails
+
+**Setup**: Seed main with 30 alerts. Trigger backlog workflow. One of the child workflows' Devin sessions fails (e.g., Devin hits `max_acu_limit` timeout before completing fixes).
+
+**Expected**:
+1. Orchestrator dispatches 2 children
+2. Child 1 completes successfully → PR created
+3. Child 2's Devin session fails (`status=failed` or `status=timed_out`)
+4. Orchestrator detects child 2 failure via workflow run status check
+5. Orchestrator marks child 2's 15 alerts as "retryable" in cursor (unless they've hit max attempts)
+6. Orchestrator does NOT create a PR for child 2 (no fixes to show)
+7. Next backlog run: reads cursor, sees 15 retryable alerts, creates new batch, dispatches new child
+8. If alerts have been retried 2+ times and still fail, they are marked "unfixable" in cursor
+
+**Validates**: Fault tolerance — failed sessions are retried, not permanently lost.
+
+**Production scenario**: A complex codebase causes Devin to exceed its compute budget. The alerts from that batch must be retried in a subsequent run, not silently dropped.
+
 **Worry**: If failed sessions are never retried, the backlog accumulates "stuck" alerts that are neither fixed nor marked unfixable — a silent data loss that only surfaces during an audit.
 
-### TC-Y: Split-Trigger — Backlog Concurrency Guard (Only 1 Run at a Time)
-**Setup**: Trigger the backlog workflow manually. Before it completes, trigger it again (via `workflow_dispatch` or cron).
+---
+
+### TC-BL-H: Child Workflow Failure — Stuck Session (>1 Hour)
+
+**Setup**: Trigger backlog workflow. Simulate a child workflow that hangs (Devin session stays in `running` state for >1 hour).
+
 **Expected**:
-1. Run 1 starts processing backlog
+1. Orchestrator dispatches child, records `dispatched_at` timestamp in cursor
+2. Orchestrator polls every 60s — child still running
+3. After 60 minutes: orchestrator evicts the stale child from the active set
+4. Orchestrator marks that batch's alerts as retryable
+5. Orchestrator backfills the freed slot with the next pending batch
+6. Cursor updated: stale child's batch moved from "in_progress" to "retryable"
+
+**Validates**: Stale session eviction — the orchestrator doesn't wait forever for a stuck child.
+
+**Production scenario**: A Devin session hangs because the repo is too large to clone, or a network issue prevents the session from progressing. The orchestrator must detect this and move on.
+
+**Worry**: If the orchestrator waits indefinitely for a stuck child, it blocks all subsequent batches. A single stuck session could prevent the entire backlog from being processed.
+
+---
+
+### TC-BL-I: Batching Strategy — Group by File, Cap 15, Backfill
+
+**Setup**: Seed main with alerts distributed across files:
+- `auth.py`: 8 alerts
+- `api.py`: 6 alerts
+- `utils.py`: 4 alerts
+- `db.py`: 3 alerts
+- `config.py`: 2 alerts
+
+**Expected**:
+1. Batch 1: `auth.py` (8) + `api.py` (6) + `utils.py` (1) = 15 alerts
+   - Prefer same-file grouping, backfill to reach cap
+2. Batch 2: `utils.py` (3) + `db.py` (3) + `config.py` (2) = 8 alerts
+   - Remaining alerts in a smaller final batch
+3. Each batch gets its own Devin session and PR
+4. PR title mentions the primary files: `fix(security): Batch 1 — 15 alerts in auth.py, api.py`
+
+**Validates**: Batching logic — alerts are grouped intelligently for efficient Devin sessions.
+
+**Production scenario**: Enterprise codebase where security debt is concentrated in a few critical files. Grouping by file helps Devin understand the context (one file's patterns) rather than jumping between unrelated files.
+
+**Worry**: If alerts are randomly distributed across batches, Devin spends more time context-switching between files, reducing fix quality. If batches are too small (1-2 alerts), session creation overhead dominates.
+
+---
+
+### TC-BL-J: Concurrency Guard — Only 1 Orchestrator Run at a Time
+
+**Setup**: Trigger the backlog workflow manually. Before it completes, trigger it again (via `workflow_dispatch` or cron).
+
+**Expected**:
+1. Run 1 starts processing backlog (dispatching children, polling)
 2. Run 2 is queued (NOT cancelling Run 1) due to `concurrency` group with `cancel-in-progress: false`
 3. Run 1 completes, updates cursor
 4. Run 2 starts, reads updated cursor, continues from where Run 1 left off
-5. No duplicate sessions created (Run 2 sees Run 1's processed alerts in the cursor)
-**Validates**: Concurrency group prevents overlapping backlog runs.
-**Production scenario**: Cron fires every 6 hours. A previous run is slow (processing 200 alerts with rate limit backoff). The next cron fires while it's still running. Without the concurrency guard, both runs process the same alerts → duplicate sessions → wasted resources → potential merge conflicts.
-**Worry**: If `cancel-in-progress: true` were used instead of `false`, the second run would cancel the first, potentially losing in-progress work and leaving the cursor in an inconsistent state.
+5. No duplicate batches created (Run 2 sees Run 1's processed alerts in the cursor)
+6. No duplicate PRs created
 
-### TC-Z: Split-Trigger — PR Comment Cross-Links to Backlog PR
-**Setup**: Open a PR on a codebase with pre-existing alerts. Ensure the backlog workflow has created a backlog fix PR.
-**Expected**:
-1. PR workflow detects pre-existing alerts but does NOT create sessions for them
-2. PR comment includes: "N pre-existing alerts on main are handled separately. See [Security Backlog Fixes PR #X] for progress."
-3. The link points to the actual backlog PR (not a dead link)
-4. If no backlog PR exists yet, the comment says: "These will be addressed by the next scheduled backlog run."
-**Validates**: Developer experience — clear communication about what's being handled and where.
-**Production scenario**: Developer opens a PR, sees "50 pre-existing alerts on main" in the comment. Without the cross-link, they think "this tool found 50 issues and isn't doing anything about them." With the cross-link, they see the backlog PR with 30 of those already fixed.
-**Worry**: If the PR comment just says "pre-existing alerts exist" without context on how they're being handled, developers lose confidence in the security workflow and start ignoring it entirely.
+**Validates**: Concurrency group prevents overlapping orchestrator runs.
+
+**Production scenario**: Cron fires every 6 hours. A previous run is slow (processing 500 alerts with many batches). The next cron fires while it's still running. Without the concurrency guard, both runs process the same alerts → duplicate sessions → duplicate PRs → merge conflicts.
+
+**Worry**: If `cancel-in-progress: true` were used instead of `false`, the second run would cancel the first, potentially abandoning in-progress children. Those children's Devin sessions would finish but their results would never be collected — wasted compute and lost fixes.
 
 ---
 
-## Known Issues
+### TC-BL-K: Internal Retry — Devin Gets 2 Attempts Per Alert Inside Session
 
-### KI-1: py/url-redirection residual alert
-**Severity**: Medium
-**Description**: CodeQL still flags `redirect(safe_path)` even after extensive validation. The taint flows through `urlparse()` and CodeQL considers `parsed.path` user-controlled.
-**Potential fixes**:
-- Use `flask.url_for()` with a route name instead of raw path
-- Maintain an allowlist of valid redirect paths
-- Use `werkzeug.utils.safe_join()` for path validation
+**Setup**: Seed main with an alert where the first fix attempt won't satisfy CodeQL (e.g., a taint flow through `urlparse()` that requires a non-obvious fix pattern).
 
-### KI-2: Devin session blocked
-**Severity**: Low
-**Description**: Session `devin-58cbe98f` is in `blocked` state. Previous sessions (from earlier runs) successfully pushed fixes, but this session could not proceed.
-**Potential cause**: Repository access permissions for the Devin service user.
+**Expected**:
+1. Child workflow creates 1 Devin session for the batch
+2. Inside the session, Devin:
+   a. Applies fix attempt 1
+   b. Runs CodeQL CLI locally → alert still present
+   c. Revises fix (attempt 2)
+   d. Runs CodeQL CLI → alert resolved (or skipped if still present)
+3. Only 1 session created for this batch (not 2 separate sessions)
+4. If attempt 2 also fails, Devin skips the alert (does NOT commit a broken fix)
+5. The child workflow reports which alerts were fixed and which were skipped
 
-### KI-3: Duplicate PR comments
-**Severity**: Low
-**Description**: Each workflow run posts a new comment. Multiple pushes to the same PR result in multiple comments. Could be improved by editing the existing comment instead of creating a new one.
+**Validates**: Internal retry loop works inside the session. Devin gets 2 real attempts per alert within 1 session. No excessive session creation.
+
+**Worry**: Without internal retry, a failed fix requires a new session (expensive) or a new workflow run (slow). The internal retry gives Devin a second chance immediately, within the same context.
+
+---
+
+### TC-BL-L: Unfixable Alerts — Circuit Breaker Across Runs
+
+**Setup**: Seed main with an alert that CodeQL will always flag regardless of fix attempts (e.g., a fundamental taint flow pattern). Run backlog workflow twice.
+
+**Expected**:
+1. Run 1: Child session tries to fix alert → attempt 1 fails → attempt 2 fails → alert skipped
+2. Run 1 cursor: alert marked as "attempt 1 complete, skipped"
+3. Run 2: Reads cursor, sees alert was skipped once before, creates new session
+4. Run 2 child: attempt 1 fails → attempt 2 fails → alert skipped again
+5. Run 2 cursor: alert moved to `unfixable_alert_ids` (2 session-level failures = unfixable)
+6. Run 3: Reads cursor, skips this alert entirely (it's in unfixable set)
+7. No further sessions ever created for this alert
+
+**Validates**: Cross-run circuit breaker — unfixable alerts are eventually catalogued and excluded from future processing.
+
+**Production scenario**: Enterprise codebase has 20 alerts that are architectural issues (e.g., custom auth patterns that CodeQL always flags). After 2 backlog runs, these are permanently marked unfixable and reported for manual review. They never waste Devin sessions again.
+
+**Worry**: Without the circuit breaker, every backlog run creates new sessions for the same unfixable alerts, burning compute credits indefinitely.
+
+---
+
+### TC-BL-M: PR per Batch — Independent Review and Merge
+
+**Setup**: Seed main with 45 alerts (3 batches). Trigger backlog workflow. All 3 batches succeed.
+
+**Expected**:
+1. 3 PRs created, each on its own branch:
+   - `devin/security-batch-1-{timestamp}`
+   - `devin/security-batch-2-{timestamp}`
+   - `devin/security-batch-3-{timestamp}`
+2. Each PR has:
+   - Alert table showing which alerts were fixed
+   - Devin session link
+   - Files changed (scoped to that batch's files)
+3. PRs can be reviewed and merged independently
+4. Merging PR #1 does not cause merge conflicts in PR #2 (different files)
+5. If same file appears in 2 batches (edge case), merge order matters but each PR is still valid
+
+**Validates**: 1 PR per batch — the client's explicit requirement ("create a PR for each batch").
+
+**Production scenario**: Security team wants to review and approve fixes incrementally. Critical-severity batch can be fast-tracked while lower-severity batches go through normal review.
+
+**Worry**: If all fixes go into 1 PR, a single bad fix blocks all other fixes from being merged. With 1 PR per batch, a bad fix in batch 3 doesn't block batches 1 and 2.
+
+---
+
+### TC-BL-N: Large Backlog — 500 Alerts in Single Run
+
+**Setup**: Seed main with 500 open CodeQL alerts across 50 files. Trigger backlog workflow.
+
+**Expected**:
+1. Orchestrator groups into 34 batches (15 alerts each, last batch has 5)
+2. Dispatches 5 children initially (fills slots)
+3. Rolling window processes all 34 batches over ~7 waves
+4. Total time: ~70 minutes (34 ÷ 5 = 7 waves × 10 min)
+5. 34 PRs created (streamed as each batch completes)
+6. First PR available at ~10 min, last PR at ~70 min
+7. Orchestrator stays well within 6-hour GitHub Actions timeout
+8. Cursor updated with all 500 alert IDs
+
+**Validates**: Scale — the system handles a large backlog in a single run.
+
+**Production scenario**: Fortune 500 company enables CodeQL on a legacy codebase for the first time. 500+ alerts surface immediately. The backlog workflow must handle all of them without manual intervention.
+
+**Worry**: At 34 batches, the orchestrator makes ~34 dispatch API calls + ~240 status polling calls (34 batches × ~7 polls each). Must stay within GitHub API rate limits (5000 req/hr for PATs, 1000 req/hr for workflow dispatch).
+
+---
+
+### TC-BL-O: Massive Backlog — 1000+ Alerts with Safety Valve
+
+**Setup**: Seed main with 1000+ open CodeQL alerts. Trigger backlog workflow. Monitor for timeout safety valve.
+
+**Expected**:
+1. Orchestrator groups into ~67 batches
+2. Processes via rolling window (5 slots, ~10 min each)
+3. Total time: ~140 minutes (67 ÷ 5 = 14 waves × 10 min)
+4. Still within 6-hour limit — no safety valve triggered
+5. If processing is slower than expected (15 min/batch), total would be ~200 min — still safe
+6. If approaching 5.5 hours, orchestrator saves cursor and exits cleanly
+7. Next cron run picks up from where it left off
+
+**Validates**: Safety valve — the orchestrator doesn't exceed GitHub Actions timeout even for massive backlogs.
+
+**Production scenario**: Monorepo with 20+ services and thousands of accumulated alerts. One run might not finish, but the system recovers gracefully.
+
+**Worry**: If the orchestrator exceeds 6 hours, GitHub kills the job. Any in-progress children continue running but their results are never collected. The cursor is not updated. The next run re-processes everything, creating duplicate sessions for already-dispatched batches.
+
+---
+
+### TC-BL-P: Concurrent PRs + Backlog — No Session Explosion
+
+**Setup**: Open 20 PRs simultaneously (each introducing 1 new vulnerability). While all 20 PR workflows are running, also trigger the backlog workflow.
+
+**Expected**:
+1. Each PR workflow creates exactly 1 session (20 total session attempts for PR workflows)
+2. PR workflows do NOT create sessions for pre-existing alerts
+3. Backlog orchestrator self-limits to 3 concurrent children (reserving 2 slots for PR workflows)
+4. Total concurrent Devin sessions: ≤5 at any time (3 backlog + 2 PR, or 5 PR with backlog paused)
+5. With exponential backoff, all 20 PRs eventually get their session
+6. Compare to old architecture: 20 PRs × 4 pre-existing sessions = 80+ attempts → 41% failure rate
+
+**Validates**: The split-trigger architecture eliminates session explosion under concurrent load.
+
+**Production scenario**: Release day — 20 developers merge feature branches within 30 minutes. Under the old architecture, this created 400+ session attempts. With the split, it creates 20 + ~3 (backlog) = 23 total.
+
+**Worry**: Without the split, the stress test showed 41% workflow failure rate with 99 PRs. The split should reduce this to near 0% for PR workflows while the backlog processes pre-existing alerts at its own pace.
+
+---
+
+### TC-BL-Q: Sub-Workflow Dispatch Failure — GitHub API Error
+
+**Setup**: Trigger backlog workflow. Simulate a GitHub API failure on child dispatch (e.g., by temporarily revoking workflow dispatch permissions or hitting the workflow dispatch rate limit).
+
+**Expected**:
+1. Orchestrator tries to dispatch child workflow → API returns 4xx/5xx
+2. Orchestrator retries with exponential backoff (3 attempts)
+3. If all retries fail, batch stays in `pending_batches`
+4. Orchestrator continues dispatching other batches
+5. Cursor updated: failed batch marked as "dispatch_failed"
+6. Next backlog run picks up the failed batch and retries dispatch
+
+**Validates**: Dispatch failure resilience — the orchestrator handles GitHub API errors gracefully.
+
+**Production scenario**: GitHub has a brief API outage (happens a few times per year). The backlog workflow must not permanently lose batches because of a transient GitHub API issue.
+
+**Worry**: If dispatch failure causes the orchestrator to crash (unhandled exception), all subsequent batches are lost. The orchestrator must catch dispatch errors and continue.
+
+---
+
+### TC-BL-R: Rate Limiting Under Load — Exponential Backoff
+
+**Setup**: Trigger backlog workflow with 75 alerts (5 batches). Simultaneously trigger 5 PR workflows. The Devin API concurrent session limit (5) will be fully occupied by PR sessions.
+
+**Expected**:
+1. PR workflows take all 5 session slots
+2. Backlog orchestrator tries to dispatch children → children get HTTP 429 from Devin API
+3. Orchestrator's session reservation check detects 5 active sessions → waits 120s
+4. After PR sessions complete, orchestrator dispatches children into freed slots
+5. Exponential backoff: 120s → 240s → 480s (3 retries)
+6. All 5 batches eventually process successfully
+7. No permanent failure — just delayed start
+
+**Validates**: Rate limiting resilience with the backlog workflow deferring to PR workflows.
+
+**Production scenario**: Monday morning — 10 developers push code within 15 minutes. All PR workflows fire. The backlog cron also fires. The backlog must gracefully defer to PR workflows.
+
+**Worry**: If the backlog workflow and PR workflows compete aggressively for sessions, PR developers see "security review failed" errors. The backlog must always yield to PR workflows.
+
+---
+
+### TC-BL-S: PR Comment Cross-Links to Backlog PRs
+
+**Setup**: Open a PR on a codebase with 50 pre-existing alerts. Run the backlog workflow so it creates batch fix PRs. Then check the PR workflow's comment.
+
+**Expected**:
+1. PR workflow detects pre-existing alerts but does NOT create sessions for them
+2. PR comment includes: "50 pre-existing alerts on main are handled separately. See Security Backlog PRs for progress: [Batch 1 PR #X], [Batch 2 PR #Y], ..."
+3. Links point to actual backlog PRs (not dead links)
+4. If no backlog PRs exist yet, the comment says: "These will be addressed by the next scheduled backlog run."
+5. As backlog PRs are merged and alerts are fixed, the count in subsequent PR comments decreases
+
+**Validates**: Developer experience — clear communication about what's being handled and where.
+
+**Production scenario**: Developer opens a PR, sees "50 pre-existing alerts on main" in the comment. Without cross-links, they think the tool found 50 issues and isn't doing anything about them. With cross-links, they see the backlog PRs with 30 already fixed.
+
+**Worry**: If the PR comment just says "pre-existing alerts exist" without context, developers lose confidence in the security workflow and start ignoring it entirely.
+
+---
+
+### TC-BL-T: Orchestrator Crash Recovery — Mid-Run Failure
+
+**Setup**: Trigger backlog workflow. After 3 of 7 batches have been dispatched and 1 has completed (1 PR created), kill the orchestrator (cancel the GitHub Actions run manually).
+
+**Expected**:
+1. The 1 completed batch already has its PR created (streaming — no data loss)
+2. The 2 in-progress children continue running (they're independent workflow runs)
+3. Cursor has state from last successful update (shows 3 dispatched, 1 completed)
+4. Next backlog run: reads cursor, checks in-progress children's status, collects results, creates PRs for completed children, dispatches remaining batches
+5. No duplicate PRs for the batch that already had a PR
+6. No duplicate sessions for batches that already ran
+
+**Validates**: Crash recovery — the streaming + cursor design means partial progress is never lost.
+
+**Production scenario**: GitHub Actions runner dies mid-execution (infrastructure issue). The next cron run must seamlessly recover without duplicating work.
+
+**Worry**: Without streaming, a crash at batch 4 means 0 PRs created despite batches 1-3 being fully fixed. With streaming, 1-3 already have their PRs. Without cursor, the next run re-processes everything from scratch.
+
+---
+
+### TC-BL-U: PR Naming and Content Quality
+
+**Setup**: Seed main with 15 alerts: 5 `py/sql-injection` in `db.py`, 5 `py/reflective-xss` in `api.py`, 5 `py/command-line-injection` in `cli.py`. Trigger backlog workflow.
+
+**Expected**:
+1. Batch 1 PR:
+   - Branch: `devin/security-batch-1-{timestamp}`
+   - Title: `fix(security): Batch 1 — 15 CodeQL alerts in db.py, api.py, cli.py`
+   - Body contains:
+     - Alert table: rule ID, file, line, status (fixed/skipped)
+     - Devin session link
+     - Which CodeQL rules were addressed
+     - Commit-per-alert granularity (5 commits for db.py alerts, 5 for api.py, etc.)
+2. PR is reviewable by a security engineer without additional context
+3. Each commit message references the specific alert: `fix(security): [py/sql-injection] parameterize query in db.py:42`
+
+**Validates**: PR quality — the output is enterprise-ready and professionally formatted.
+
+**Production scenario**: Security team reviews batch PRs. Each PR must be self-contained with enough context to understand what was fixed and why.
+
+**Worry**: If PR descriptions are vague ("fixed security issues") or commits are squashed into one giant commit, reviewers can't assess individual fixes. A bad fix buried in a 15-file commit is hard to identify.
+
+---
+
+### TC-BL-V: Devin Session Lifecycle — No Session Reuse After Completion
+
+**Setup**: Run backlog workflow. Batch 1 completes. Batch 6 is dispatched to the freed slot. Verify that batch 6 creates a NEW Devin session, not reusing batch 1's completed session.
+
+**Expected**:
+1. Batch 1 child creates session `sess_aaa`, completes
+2. Batch 6 child creates session `sess_bbb` (new session, new ID)
+3. `sess_aaa` is never referenced again after completion
+4. No `POST /v1/sessions/{sess_aaa}/message` calls after `sess_aaa` status is `finished`
+5. `sess_bbb` gets its own fresh environment (new clone, new context)
+
+**Validates**: Session lifecycle — completed sessions are never reused. This is how the Devin API is designed.
+
+**Production scenario**: If we accidentally tried to reuse a completed session (e.g., send a message to it), the API would either error or silently succeed with no effect — both bad outcomes.
+
+**Worry**: Session reuse would mean batch 6's fixes are applied in batch 1's environment, which has batch 1's changes already committed. This could cause incorrect diffs, wrong base branches, or conflicting changes.
+
+---
+
+### TC-BL-W: Backlog Workflow Trigger Modes (Cron + Manual)
+
+**Setup**: Configure the backlog workflow with `schedule: cron('0 */6 * * *')` (every 6 hours) and `workflow_dispatch` (manual). Verify both trigger modes work.
+
+**Expected**:
+1. Manual trigger via `workflow_dispatch`: Orchestrator starts, processes backlog, creates PRs
+2. Cron trigger: Same behavior, fired automatically at scheduled time
+3. `workflow_dispatch` accepts optional inputs: `max_batches` (limit processing), `dry_run` (log what would be done without dispatching children)
+4. Both triggers use the same cursor (shared state)
+5. Manual trigger during a cron run: queued due to concurrency group, runs after cron completes
+
+**Validates**: Both trigger modes work correctly with shared state.
+
+**Production scenario**: Security team wants to run the backlog on-demand after enabling CodeQL on a new repo (manual), and also on a regular schedule for ongoing maintenance (cron).
+
+**Worry**: If `workflow_dispatch` uses a different code path than `schedule`, manual runs might skip cursor reading or use different batching logic, causing inconsistent behavior.
+
+---
+
+### TC-BL-X: PR Review Load Management — Many PRs from Large Backlog
+
+**Setup**: Seed main with 500 alerts (34 batches). Trigger backlog workflow. All batches succeed.
+
+**Expected**:
+1. 34 PRs created over ~70 minutes
+2. PRs are labeled with severity: `security-critical`, `security-high`, `security-medium`
+3. PR titles include batch number and primary rule: `fix(security): Batch 3 — py/sql-injection in db.py`
+4. PRs can be filtered and prioritized by label
+5. Team can merge critical PRs first, defer medium PRs
+
+**Validates**: Review load management — 34 PRs is a lot, but they're organized for efficient triage.
+
+**Production scenario**: Security team enables CodeQL on a legacy monorepo. 34 PRs appear. Without labels and clear titles, this is overwhelming. With proper organization, the team can triage: "merge all critical PRs today, review high PRs this week, defer medium PRs."
+
+**Worry**: If all 34 PRs have generic titles ("security fix"), the team can't prioritize. If PRs lack context, reviewers waste time understanding what each PR does.
+
+---
+
+### TC-BL-Y: Edge Case — Zero Alerts on Main
+
+**Setup**: Trigger backlog workflow on a repo with 0 open CodeQL alerts.
+
+**Expected**:
+1. Orchestrator fetches alerts → 0 results
+2. No batches created, no children dispatched
+3. Cursor updated: `total_backlog: 0`
+4. Workflow completes successfully with a log message: "No open alerts to process"
+5. No PRs created
+6. Exit code: 0
+
+**Validates**: Clean exit when there's nothing to do.
+
+**Production scenario**: After the backlog is fully cleared, the cron keeps running. It should complete instantly without errors, not crash because it expected at least 1 alert.
+
+**Worry**: If the orchestrator doesn't handle the empty case, it might crash on "divide by zero" (0 alerts ÷ 15 per batch), or try to dispatch a batch with 0 alerts.
+
+---
+
+### TC-BL-Z: Edge Case — All Alerts Already Unfixable
+
+**Setup**: Run the backlog workflow multiple times until all remaining alerts are marked unfixable (each has been retried 2+ times). Run the backlog workflow one more time.
+
+**Expected**:
+1. Orchestrator reads cursor → all alert IDs are in `unfixable_alert_ids`
+2. Fetches open alerts → filters out all unfixable ones → 0 remaining
+3. No batches created, no children dispatched
+4. Cursor unchanged (no new work done)
+5. Log message: "All 15 open alerts are marked unfixable. No new work to dispatch."
+6. The PR comment from the PR workflow (if applicable) shows: "15 pre-existing alerts on main require manual review. See unfixable alerts report."
+
+**Validates**: The system gracefully stops when all remaining work requires human intervention.
+
+**Production scenario**: After clearing 485 of 500 alerts, the remaining 15 are architectural issues that CodeQL always flags. The backlog workflow should recognize this and stop wasting compute on them.
+
+**Worry**: Without the unfixable check, the backlog creates infinite sessions for the same 15 unfixable alerts, burning Devin credits every 6 hours forever.
+
+---
+
+## Integration with PR-Triggered Tests
+
+The following test cases from [PR_triggered_tests.md](./PR_triggered_tests.md) remain relevant to the backlog workflow and should be validated in the backlog context:
+
+| PR Test | Backlog Relevance | Adaptation |
+|---------|-------------------|------------|
+| TC-G (Happy Path Fix) | Core fix quality applies to batch sessions too | Validate Devin produces correct fixes inside batch sessions |
+| TC-H (Internal Retry) | Same internal retry loop inside batch sessions | Verify 2-attempt CodeQL loop works for backlog alerts |
+| TC-I (Unfixable After 2 Attempts) | Circuit breaker feeds into cursor's unfixable set | Verify skipped alerts are correctly marked in cursor |
+| TC-K (Mixed Fix Results) | Batches will have mixed outcomes | Verify partial fixes are committed, skipped alerts tracked |
+| TC-L (Label Creation) | Backlog PRs may need labels too | Verify batch PRs get severity labels |
+| TC-R (Stress Test) | Session explosion prevention | Verify backlog + 99 PRs doesn't cause 429 cascade |
+| TC-S (Rate Limit Resilience) | Backlog must handle 429s gracefully | Verify orchestrator's session reservation prevents 429s |
+
+---
+
+## Known Limitations
+
+### KL-1: Child Workflow Output Collection
+GitHub Actions `workflow_dispatch` does not natively return outputs to the caller. The orchestrator must poll the child's workflow run artifacts or check results via the GitHub API. This adds latency to result collection.
+
+### KL-2: Maximum Workflow Dispatch Rate
+GitHub limits `workflow_dispatch` calls. For very large backlogs (100+ batches), dispatch calls may be throttled. The orchestrator should batch dispatch calls with small delays between them.
+
+### KL-3: Cursor Size Limits
+GitHub issue comment bodies have a 65536 character limit. With 1000+ processed alert IDs, the cursor JSON could exceed this limit. For large backlogs, consider using a repository variable or splitting the cursor across multiple comments.
 
 ---
 
 ## How to Run Tests
 
-### Manual validation after a workflow run:
+### Triggering the backlog workflow:
 
 ```bash
-# 1. Check open alerts on PR merge ref
-curl -s -L -H "Authorization: token $GH_PAT" \
-  "https://api.github.com/repos/OWNER/REPO/code-scanning/alerts?ref=refs/pull/N/merge&state=open"
+# Manual trigger via workflow_dispatch
+curl -s -X POST \
+  -H "Authorization: token $GH_PAT" \
+  -H "Accept: application/vnd.github.v3+json" \
+  "https://api.github.com/repos/$REPO/actions/workflows/devin-security-backlog.yml/dispatches" \
+  -d '{"ref": "main"}'
 
-# 2. Check fixed alerts
-curl -s -L -H "Authorization: token $GH_PAT" \
-  "https://api.github.com/repos/OWNER/REPO/code-scanning/alerts?ref=refs/pull/N/merge&state=fixed"
+# Check workflow run status
+curl -s -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/$REPO/actions/runs?workflow_id=devin-security-backlog.yml&per_page=5"
+```
 
-# 3. Check Devin session status
+### Checking cursor state:
+
+```bash
+# Read the backlog state from the tracking issue
+curl -s -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/$REPO/issues/$TRACKING_ISSUE/comments" \
+  | jq '.[] | select(.body | contains("backlog-cursor"))'
+```
+
+### Checking Devin session status:
+
+```bash
+# Check a specific session
 curl -s -H "Authorization: Bearer $DEVIN_API_KEY" \
-  "https://api.devin.ai/v1/session/SESSION_ID"
+  "https://api.devin.ai/v1/session/$SESSION_ID"
 
-# 4. Check PR comments
-curl -s -L -H "Authorization: token $GH_PAT" \
-  "https://api.github.com/repos/OWNER/REPO/issues/N/comments"
+# List active sessions
+curl -s -H "Authorization: Bearer $DEVIN_API_KEY" \
+  "https://api.devin.ai/v1/sessions?status=running"
+```
 
-# 5. Check commit history for fix granularity
-git log --oneline ORIGINAL_COMMIT..HEAD -- path/to/file.py
+### Checking batch PRs:
+
+```bash
+# List all security batch PRs
+curl -s -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/$REPO/pulls?state=open&head=devin/security-batch"
 ```
