@@ -189,19 +189,24 @@ jobs:
           3. For each alert, read the surrounding code and understand the full context
           4. Fix each alert ONE AT A TIME. For each alert:
              a. Apply a minimal, focused fix following the codebase's existing conventions
-             b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved:
-                - Download and extract CodeQL CLI:
+             b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved.
+                IMPORTANT: You MUST use the EXACT same CodeQL configuration as the repo's CI.
+                The repo's CI config (from .github/workflows/codeql.yml) uses:
+                  - queries: security-and-quality
+                  - threat-models: remote AND local
+                Your verification commands:
+                - Download and extract CodeQL CLI (only once, reuse for all alerts):
                   wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -qo codeql-linux64.zip
                 - Create a fresh database (MUST use --overwrite since DB may exist from prior alert):
                   ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
-                - Run the SAME query suite the repo uses in CI (security-and-quality with remote+local threat models):
-                  ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
-                - Parse the SARIF output to check if THIS SPECIFIC rule ID still fires at the same file and line:
-                  python3 -c "import json; sarif=json.load(open('/tmp/results.sarif')); results=[r for run in sarif['runs'] for r in run.get('results',[])]; matches=[r for r in results if r['ruleId']=='RULE_ID' and any(loc['physicalLocation']['artifactLocation']['uri'].endswith('FILE') for loc in r['locations'])]; print(f'Found {len(matches)} remaining alerts for RULE_ID in FILE'); exit(1 if matches else 0)"
-                  (Replace RULE_ID and FILE with the actual values for each alert)
-             c. If the alert STILL appears after your fix, revise your approach and re-run CodeQL (max 2 attempts total)
-             d. If after 2 attempts the alert persists, SKIP this alert entirely — do NOT commit a broken fix. Note it as unfixable and move on immediately.
-             e. If the fix resolves the alert (CodeQL no longer reports it), commit with message: fix: [rule_id] description (file:line)
+                - Run analysis with BOTH remote and local threat models (matching CI):
+                  ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download --threat-model=local
+                - Parse the SARIF output to check for ANY alerts in the file you modified (not just the specific rule — your fix must not introduce NEW alerts):
+                  python3 -c "import json; sarif=json.load(open('/tmp/results.sarif')); results=[r for run in sarif['runs'] for r in run.get('results',[])]; file_alerts=[r for r in results if any(loc.get('physicalLocation',{}).get('artifactLocation',{}).get('uri','').endswith('FILE') for loc in r.get('locations',[]))]; print(f'Found {len(file_alerts)} alerts in FILE'); [print(f'  - {r["ruleId"]}:{r.get("message",{}).get("text","")[:80]}') for r in file_alerts]; exit(1 if file_alerts else 0)"
+                  (Replace FILE with the actual file path for each alert)
+             c. If ANY alert (old or new) still appears in the file after your fix, revise your approach and re-run CodeQL (max 2 attempts total)
+             d. If after 2 attempts alerts persist, SKIP this alert entirely — do NOT commit a broken fix. Note it as unfixable and move on immediately.
+             e. If the file is clean (CodeQL reports zero alerts for it), commit with message: fix: [rule_id] description (file:line)
           5. Conventions to follow:
              - If the project uses an ORM, use parameterized queries via the ORM
              - If there are existing sanitization utilities, reuse them
@@ -217,6 +222,7 @@ jobs:
           - Do NOT just suppress or ignore alerts — fix the root cause
           - Keep fixes minimal and surgical — do not refactor unrelated code
           - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it immediately
+          - Your fixes will be verified by the pipeline using the EXACT same CodeQL config as CI. If your fix introduces new alerts or does not resolve the target, the PR will be flagged.
           - When done with all alerts, push your branch and end the session. Do not block.
           PROMPT_EOF
           )
@@ -359,6 +365,157 @@ jobs:
           echo "completed=false" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------
+      # STEP 3b: Verify fixes with CodeQL (Bug #42 fix)
+      # After Devin pushes fixes, run CodeQL locally with the EXACT same
+      # configuration as CI to verify fixes before creating the PR.
+      # This catches: (1) fixes that don't resolve the target alert,
+      # (2) new alerts introduced by the fix (e.g., unused imports),
+      # (3) config mismatches between Devin's internal check and CI.
+      # ----------------------------------------------------------------
+      - name: Verify fixes with CodeQL
+        id: verify-codeql
+        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'blocked' || steps.poll-session.outputs.status == 'stopped'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          # Check if branch exists first
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/branches/$BRANCH_NAME")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Branch $BRANCH_NAME not found — skipping CodeQL verification"
+            echo "verified=skip" >> $GITHUB_OUTPUT
+            echo "new_alerts=0" >> $GITHUB_OUTPUT
+            echo "remaining_alerts=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "=== CodeQL Verification (Bug #42 fix) ==="
+          echo "Checking out branch $BRANCH_NAME for local CodeQL analysis..."
+
+          # Fetch and checkout the branch Devin pushed to
+          git fetch origin "$BRANCH_NAME"
+          git checkout "$BRANCH_NAME"
+
+          # Install CodeQL CLI
+          echo "Downloading CodeQL CLI..."
+          wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip
+          unzip -qo codeql-linux64.zip
+
+          # Create database with SAME config as CI
+          # CI uses: language=python, queries=security-and-quality, threat-models=remote+local
+          echo "Creating CodeQL database (language=python, threat-models=remote+local)..."
+          ./codeql/codeql database create /tmp/codeql-verify-db \
+            --language=python \
+            --source-root=. \
+            --overwrite \
+            2>&1 || true
+
+          # Run analysis with SAME query suite and threat models as CI
+          echo "Running CodeQL analysis (security-and-quality, threat-model=local)..."
+          ./codeql/codeql database analyze /tmp/codeql-verify-db \
+            codeql/python-queries:codeql-suites/python-security-and-quality.qls \
+            --format=sarif-latest \
+            --output=/tmp/verify-results.sarif \
+            --download \
+            --threat-model=local \
+            2>&1 || true
+
+          # Parse results
+          if [ ! -f /tmp/verify-results.sarif ]; then
+            echo "::warning::CodeQL verification could not produce SARIF output"
+            echo "verified=error" >> $GITHUB_OUTPUT
+            echo "new_alerts=0" >> $GITHUB_OUTPUT
+            echo "remaining_alerts=0" >> $GITHUB_OUTPUT
+            git checkout main 2>/dev/null || true
+            exit 0
+          fi
+
+          python3 -u << 'VERIFY_EOF'
+          import json, os
+
+          with open("/tmp/verify-results.sarif") as f:
+              sarif = json.load(f)
+
+          with open("/tmp/batch_details.json") as f:
+              batch_alerts = json.load(f)
+
+          target_files = set()
+          target_keys = set()
+          for a in batch_alerts:
+              f = a.get("file", "")
+              target_files.add(f)
+              target_keys.add(f"{a['rule_id']}:{f}:{a['start_line']}")
+
+          all_results = []
+          for run in sarif.get("runs", []):
+              for result in run.get("results", []):
+                  rule_id = result.get("ruleId", "")
+                  for loc in result.get("locations", []):
+                      phys = loc.get("physicalLocation", {})
+                      uri = phys.get("artifactLocation", {}).get("uri", "")
+                      line = phys.get("region", {}).get("startLine", 0)
+                      all_results.append({
+                          "rule_id": rule_id,
+                          "file": uri,
+                          "line": line,
+                          "message": result.get("message", {}).get("text", "")[:100]
+                      })
+
+          remaining = []
+          for r in all_results:
+              key = f"{r['rule_id']}:{r['file']}:{r['line']}"
+              if key in target_keys:
+                  remaining.append(r)
+
+          new_alerts = []
+          for r in all_results:
+              if r["file"] in target_files:
+                  key = f"{r['rule_id']}:{r['file']}:{r['line']}"
+                  if key not in target_keys:
+                      new_alerts.append(r)
+
+          print(f"\n=== CodeQL Verification Results ===")
+          print(f"Total SARIF results: {len(all_results)}")
+          print(f"Target alerts still present: {len(remaining)}")
+          print(f"New alerts in modified files: {len(new_alerts)}")
+
+          if remaining:
+              print(f"\nREMAINING target alerts (fix did not resolve):")
+              for r in remaining:
+                  print(f"  - [{r['rule_id']}] {r['file']}:{r['line']}")
+          if new_alerts:
+              print(f"\nNEW alerts introduced by fix:")
+              for r in new_alerts:
+                  print(f"  - [{r['rule_id']}] {r['file']}:{r['line']} — {r['message']}")
+
+          verified = "pass" if not remaining and not new_alerts else "fail"
+          print(f"\nVerification: {verified.upper()}")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"verified={verified}\n")
+              f.write(f"remaining_alerts={len(remaining)}\n")
+              f.write(f"new_alerts={len(new_alerts)}\n")
+              f.write(f"total_sarif_results={len(all_results)}\n")
+
+          verification = {
+              "verified": verified,
+              "remaining": remaining,
+              "new_alerts": new_alerts,
+              "total_results": len(all_results)
+          }
+          with open("/tmp/codeql_verification.json", "w") as f:
+              json.dump(verification, f, indent=2)
+          VERIFY_EOF
+
+          # Switch back to main for subsequent steps
+          git checkout main 2>/dev/null || true
+
+      # ----------------------------------------------------------------
       # STEP 4: Check if the branch exists and create PR
       # ----------------------------------------------------------------
       - name: Create PR for batch fixes
@@ -401,6 +558,20 @@ jobs:
 
           SESSION_URL="${{ steps.create-session.outputs.session_url }}"
 
+          # Build CodeQL verification section for PR body
+          VERIFY_STATUS="${{ steps.verify-codeql.outputs.verified }}"
+          VERIFY_REMAINING="${{ steps.verify-codeql.outputs.remaining_alerts }}"
+          VERIFY_NEW="${{ steps.verify-codeql.outputs.new_alerts }}"
+          if [ "$VERIFY_STATUS" = "pass" ]; then
+            VERIFY_SECTION="### CodeQL Verification: PASSED\n- Post-session CodeQL analysis confirmed all target alerts resolved\n- No new alerts introduced by fixes"
+          elif [ "$VERIFY_STATUS" = "fail" ]; then
+            VERIFY_SECTION="### CodeQL Verification: FAILED\n- Remaining unresolved alerts: ${VERIFY_REMAINING}\n- New alerts introduced by fixes: ${VERIFY_NEW}\n\n> **Action required**: Review fixes carefully — CodeQL verification detected issues."
+          elif [ "$VERIFY_STATUS" = "skip" ]; then
+            VERIFY_SECTION="### CodeQL Verification: SKIPPED\n- Branch not found — Devin may not have pushed fixes"
+          else
+            VERIFY_SECTION="### CodeQL Verification: NOT RUN\n- Verification step did not execute (session may have failed)"
+          fi
+
           PR_BODY=$(cat <<PR_BODY_EOF
           ## Security Batch Fix #${BATCH_ID}
 
@@ -410,9 +581,12 @@ jobs:
 
           ${ALERT_TABLE}
 
+          $(echo -e "$VERIFY_SECTION")
+
           ### Process
           - Each alert was fixed individually with a separate commit
-          - Fixes were verified locally using CodeQL CLI before committing
+          - Fixes verified internally by Devin using CodeQL CLI (security-and-quality, threat-models: remote+local)
+          - Post-session CodeQL verification gate run by pipeline before PR creation
           - Alerts that could not be fixed after 2 attempts were skipped
 
           ---
@@ -476,6 +650,38 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
           echo "pr_created=true" >> $GITHUB_OUTPUT
+
+          # Add label based on CodeQL verification result
+          VERIFY_STATUS="${{ steps.verify-codeql.outputs.verified }}"
+          if [ -n "$VERIFY_STATUS" ] && [ "$VERIFY_STATUS" != "skip" ] && [ -n "$PR_NUMBER" ]; then
+            if [ "$VERIFY_STATUS" = "pass" ]; then
+              LABEL="codeql-verified"
+              LABEL_COLOR="0e8a16"
+              LABEL_DESC="CodeQL post-session verification passed"
+            else
+              LABEL="codeql-verification-failed"
+              LABEL_COLOR="d93f0b"
+              LABEL_DESC="CodeQL post-session verification found issues"
+            fi
+            # Create label if it doesn't exist
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/$REPO/labels/$LABEL")
+            if [ "$HTTP_CODE" = "404" ]; then
+              curl -s -L -X POST \
+                -H "Authorization: token $GH_PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/labels" \
+                -d "{\"name\":\"$LABEL\",\"color\":\"$LABEL_COLOR\",\"description\":\"$LABEL_DESC\"}" > /dev/null 2>&1 || true
+            fi
+            # Apply label to PR
+            curl -s -L -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels" \
+              -d "{\"labels\":[\"$LABEL\"]}" > /dev/null 2>&1 || true
+            echo "Applied label '$LABEL' to PR #$PR_NUMBER"
+          fi
 
       # ----------------------------------------------------------------
       # STEP 5: Collect results and upload artifact
