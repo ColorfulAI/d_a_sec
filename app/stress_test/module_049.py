@@ -65,9 +65,13 @@ def process_49_6():
 
 @app.route("/ping_49_7")
 def check_status_49_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    host_key = request.args.get("host")
+    ALLOWED_HOSTS = {"local": "127.0.0.1", "example": "example.com"}
+    target = ALLOWED_HOSTS.get(host_key)
+    if target is None:
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", target], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_49_8")
 def search_49_8():
