@@ -1,14 +1,19 @@
 import os
+import shlex
 import subprocess
-from flask import request, Flask, make_response
+from flask import request, Flask, jsonify, make_response
 
 app = Flask(__name__)
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
+    ALLOWED_COMMANDS = {"ls", "df", "uptime", "whoami", "date"}
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
-    return {"output": output}
+    parts = shlex.split(cmd)
+    if not parts or parts[0] not in ALLOWED_COMMANDS:
+        return jsonify(error="Command not allowed"), 403
+    result = subprocess.run(parts, capture_output=True, text=True)
+    return jsonify(output=result.stdout)
 
 @app.route("/admin/logs")
 def view_logs():
