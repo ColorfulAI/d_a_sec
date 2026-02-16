@@ -1,15 +1,40 @@
 """Stress test module 46 — intentional vulnerabilities for CodeQL testing."""
-import sqlite3
-import os
-import subprocess
+import ast
 import json
+import operator
+import os
 import re
+import sqlite3
+import subprocess
 import urllib.parse
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
 app = Flask(__name__)
+
+
+def _safe_eval(expr):
+    """Safely evaluate arithmetic expressions without using eval()."""
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
+    def _eval_node(node):
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval_node(node.operand)
+        else:
+            raise ValueError("Unsupported expression")
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree)
 
 @app.route("/query_46_0")
 def query_db_46_0():
@@ -91,5 +116,5 @@ def search_46_8():
 @app.route("/calc_46_9")
 def calculate_46_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = _safe_eval(expr)
     return str(result)
