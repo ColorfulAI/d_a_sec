@@ -19,10 +19,10 @@ def deserialize_data():
     encoded = request.form.get("data", "")
     decoded = base64.b64decode(encoded)
     obj = json.loads(decoded)
-    return {"result": str(obj)}
+    return jsonify({"result": str(obj)})
 
 @app.route("/api/parse-config", methods=["POST"])
 def parse_config():
     config_text = request.form.get("config", "")
     config = yaml.safe_load(config_text)
-    return {"config": config}
+    return jsonify({"config": config})
