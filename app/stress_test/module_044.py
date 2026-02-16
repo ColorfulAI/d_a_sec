@@ -4,11 +4,33 @@ import os
 import subprocess
 import json
 import re
+import ast
+import operator
 import urllib.request
 from markupsafe import escape
 from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op = SAFE_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("Unsupported operation")
+        return op(_safe_eval_node(node.left), _safe_eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_safe_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
 
 ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
 ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
@@ -90,5 +112,6 @@ def search_44_8():
 @app.route("/calc_44_9")
 def calculate_44_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    tree = ast.parse(expr, mode='eval')
+    result = _safe_eval_node(tree.body)
     return str(result)
