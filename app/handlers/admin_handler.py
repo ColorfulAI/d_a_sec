@@ -21,10 +21,11 @@ def execute_command():
 @app.route("/admin/logs")
 def view_logs():
     log_file = request.args.get("file", "app.log")
-    allowed_logs = {"app.log", "error.log", "access.log"}
+    allowed_logs = {"app.log": "app.log", "error.log": "error.log", "access.log": "access.log"}
     if log_file not in allowed_logs:
         return {"error": "Log file not allowed"}, 403
-    with open(log_file, "r") as f:
+    safe_path = allowed_logs[log_file]
+    with open(safe_path, "r") as f:
         result = f.read()
     response = make_response(str(escape(result)))
     response.headers["Content-Type"] = "text/html"
