@@ -28,7 +28,7 @@ def search_users():
 def run_report():
     report_name = request.args.get("report", "")
     result = subprocess.run(
-        "python generate_report.py " + report_name,
-        shell=True, capture_output=True, text=True
+        ["python", "generate_report.py", report_name],
+        capture_output=True, text=True
     )
     return {"output": result.stdout}
