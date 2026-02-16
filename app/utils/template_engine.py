@@ -23,5 +23,5 @@ def deserialize_data():
 @app.route("/api/parse-config", methods=["POST"])
 def parse_config():
     config_text = request.form.get("config", "")
-    config = yaml.load(config_text)
-    return {"config": config}
+    config = yaml.safe_load(config_text)
+    return {"status": "config parsed successfully"}
