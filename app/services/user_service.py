@@ -9,8 +9,8 @@ def get_user():
     username = request.args.get("username", "")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE username = '" + username + "'"
-    cursor.execute(query)
+    query = "SELECT * FROM users WHERE username = ?"
+    cursor.execute(query, (username,))
     results = cursor.fetchall()
     conn.close()
     return {"users": results}
