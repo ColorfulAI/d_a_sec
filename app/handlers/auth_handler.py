@@ -1,7 +1,5 @@
 import hashlib
-import os
 import sqlite3
-from urllib.parse import urlparse
 from flask import request, Flask, redirect, session
 
 app = Flask(__name__)
