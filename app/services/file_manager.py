@@ -1,5 +1,5 @@
 import os
-from flask import abort, request, Flask, send_file
+from flask import abort, jsonify, request, Flask, send_file
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -16,7 +16,7 @@ def read_file():
     full_path = os.path.join(UPLOAD_DIR, safe_name)
     with open(full_path, "r") as f:
         content = f.read()
-    return {"content": content}
+    return jsonify({"content": content})
 
 @app.route("/api/files/download")
 def download_file():
