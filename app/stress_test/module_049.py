@@ -5,6 +5,7 @@ import subprocess
 import json
 import html
 import re
+import ast
 import urllib.request
 from flask import Flask, request, make_response
 
@@ -104,5 +105,5 @@ def search_49_8():
 @app.route("/calc_49_9")
 def calculate_49_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
