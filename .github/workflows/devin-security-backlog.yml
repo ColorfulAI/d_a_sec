@@ -787,22 +787,31 @@ jobs:
                       pending_batches.insert(0, batch)
 
               # Resolve run IDs for newly dispatched children
-              # NOTE: workflow_dispatch runs always show head_branch="main" and
-              # display_title="Devin Security Batch" — they do NOT contain the
-              # batch branch name or batch ID in their metadata. We must use
-              # timestamp-based matching: find the first unmatched run created
-              # after our dispatch time, then verify via the run's job logs.
-              for key, child in list(active_children.items()):
-                  if child["run_id"] is None:
-                      url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch&created=>={child['dispatch_time_str'][:10]}"
-                      result, status = gh_api("GET", url)
-                      if status == 200:
-                          already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
-                          for run in result.get("workflow_runs", []):
+              # NOTE (Bug #22 fix): workflow_dispatch runs are returned newest-first
+              # by the API. When multiple batches are dispatched close together,
+              # iterating newest-first causes cross-matching (batch 1 grabs batch 2's
+              # run). Fix: sort runs oldest-first so dispatch order matches run order.
+              # Also resolve ALL unmatched children in one pass against the same
+              # sorted run list to ensure correct 1:1 matching.
+              unresolved = [(k, c) for k, c in active_children.items() if c["run_id"] is None]
+              if unresolved:
+                  # Use the earliest dispatch date for the query
+                  earliest_date = min(c["dispatch_time_str"][:10] for _, c in unresolved)
+                  url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=30&event=workflow_dispatch&created=>={earliest_date}"
+                  result, status = gh_api("GET", url)
+                  if status == 200:
+                      already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
+                      # Sort oldest-first to match dispatch order
+                      sorted_runs = sorted(result.get("workflow_runs", []), key=lambda r: r.get("created_at", ""))
+                      # Sort unresolved children by dispatch time (oldest first)
+                      unresolved_sorted = sorted(unresolved, key=lambda x: x[1]["dispatch_time_str"])
+                      for key, child in unresolved_sorted:
+                          for run in sorted_runs:
                               run_created = run.get("created_at", "")
                               run_id_val = run["id"]
                               if run_created >= child["dispatch_time_str"] and str(run_id_val) not in already_matched:
                                   child["run_id"] = run_id_val
+                                  already_matched.add(str(run_id_val))
                                   print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (timestamp match: created={run_created} >= dispatched={child['dispatch_time_str']})")
                                   break
 
@@ -916,9 +925,17 @@ jobs:
                           print(f"  Batch {child['batch']['batch_id']}: STALE ({int(age)}s > {max_child_runtime}s) — evicting")
                           failed_batches.append({**child["batch"], "conclusion": "timeout_evicted"})
                           del active_children[key]
-                          # Don't re-dispatch stale batches immediately
                       else:
                           print(f"  Batch {child['batch']['batch_id']}: {run_status} ({int(age)}s)")
+
+                  else:
+                      # Bug #22 fix: handle unexpected status (e.g. "unknown" from API failure)
+                      age = time.time() - child["dispatched_at"]
+                      print(f"  Batch {child['batch']['batch_id']}: unexpected status '{run_status}' ({int(age)}s)")
+                      if age > max_child_runtime:
+                          print(f"  Batch {child['batch']['batch_id']}: evicting after {int(age)}s with status '{run_status}'")
+                          failed_batches.append({**child["batch"], "conclusion": f"unknown_status_{run_status}"})
+                          del active_children[key]
 
           # ============================================================
           # FINAL CURSOR UPDATE
