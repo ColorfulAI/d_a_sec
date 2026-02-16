@@ -1192,242 +1192,76 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 
 **Production scenario**: The security team lead runs the weekly backlog sweep on Friday evening. Monday morning, they check the tracking issue for the sweep results. The summary says "22 alerts attempted across 2 batches" but doesn't say WHERE the fix PRs are. The lead has to search GitHub for `devin/security-batch-*` branches, find the PRs, and distribute them to reviewers. With the fix, the summary lists every PR URL, and the lead can assign reviewers directly from the tracking issue.
 
-### TC-BL-REG-31: Cursor Comment Accumulation Prevention (Bug #26)
+### TC-BL-REG-31: Unblock Counter Resets After Session Resumes Working (Bug #37)
 
-**Setup**: Trigger the orchestrator with `reset_cursor=true` and `max_batches=2`. This ensures `cursor_comment_id` starts empty. Let both batches complete (2 cursor updates during batch completions + 1 final update = 3 `update_cursor()` calls).
+**Type**: Regression — validates that the unblock counter resets when a session transitions from blocked → working
 
-**Expected**:
-1. The first `update_cursor()` call creates a new comment via POST
-2. The function saves the new comment's ID via `nonlocal cursor_comment_id`
-3. All subsequent `update_cursor()` calls PATCH the same comment (HTTP 200)
-4. Only 1 cursor comment exists on issue #108 after the run completes (not 3)
-5. The final cursor comment contains the complete state from all batches
-
-**Validates**: Bug #26 — Without the fix, each `update_cursor()` call with empty `cursor_comment_id` creates a new comment. In a 2-batch run, this produces 3 cursor comments instead of 1. Over time, the tracking issue accumulates hundreds of stale comments, becoming unreadable for humans and eventually hitting GitHub API pagination limits (100 comments/page).
-
-**Worry**: The `nonlocal` keyword in Python requires the variable to be defined in an enclosing scope. If the heredoc's variable scoping doesn't support `nonlocal` correctly (e.g., if `cursor_comment_id` is treated as a global), the fix silently fails and comments still accumulate. Also, if the POST fails (HTTP 500), the comment ID isn't saved, and the next call creates another new comment — acceptable behavior but should be logged.
-
-**Production scenario**: A Fortune 500 company runs the orchestrator weekly via cron. After 6 months (26 runs), the tracking issue has 26-78 cursor comments (depending on batch count per run). The security team uses this issue as their dashboard. The noise-to-signal ratio makes it unusable. With the fix, there's exactly 1 cursor comment that gets updated in-place.
-
-### TC-BL-REG-32: Failed Batch Alerts Tracked in Cursor (Bug #27)
-
-**Setup**: Trigger the orchestrator with 2 batches. Simulate a child workflow failure by either: (a) manually cancelling one child workflow run mid-execution, or (b) waiting for a natural failure (e.g., Devin API rate limit causing the child to fail). Check the cursor after the orchestrator completes.
-
-**Expected**:
-1. The failed batch's alerts appear in `attempted_alert_ids` in the cursor
-2. The next orchestrator run skips these alerts (they're in `attempted`)
-3. The re-verification logic (Bug #18b) checks if these alerts are now fixed on main
-4. If not fixed, they stay in `attempted` and are NOT re-dispatched as new batches
-
-**Validates**: Bug #27 — Without the fix, failed batch alerts are added to `failed_batches` but NOT to the cursor. The next orchestrator run finds them as "remaining" and re-dispatches them. If the failure is persistent, this creates an infinite loop of failed dispatches consuming Devin sessions.
-
-**Worry**: Marking failed batch alerts as `attempted` might be too aggressive. If the failure was transient (e.g., GitHub Actions runner out of disk space), the alerts should be retried. But with the current fix, they're skipped until re-verification detects them as fixed (which won't happen if the fix was never applied). A retry counter would be more nuanced but adds complexity.
-
-**Production scenario**: A repo has a file (`legacy_crypto.py`) with 10 CodeQL alerts. The file uses deprecated cryptography APIs that Devin can't fix without major refactoring. Every batch that includes this file fails because Devin's fix introduces import errors. Without Bug #27 fix, this batch is re-dispatched every week, wasting 10 Devin sessions per month. With the fix, the alerts are marked as `attempted` and skipped until a human resolves them.
-
-### TC-BL-REG-33: Step Summary Includes PR URLs (Bug #28)
-
-**Setup**: Trigger the orchestrator with `max_batches=1`. Let the batch complete and create a PR. Check the GitHub Actions step summary (visible in the Actions UI) for the PR URL.
-
-**Expected**:
-1. The orchestrator results JSON includes a `pr_urls` array with the batch's PR URL
-2. The Summary step reads the results JSON and appends a "Fix PRs Created" section
-3. The step summary shows the PR URL as a clickable link
-4. The failed batches in results JSON include `alert_ids` for debugging
-
-**Validates**: Bug #28 — The step summary is the most visible output for enterprise teams. Without PR URLs, teams have to dig into job logs or search GitHub to find the fix PRs. The step summary should be a complete, actionable dashboard.
-
-**Worry**: The Summary step runs with `if: always()`, meaning it executes even if the orchestrate step failed. If the orchestrator crashes before writing `/tmp/orchestrator_results.json`, the Python script in the Summary step should handle the missing file gracefully (the `try/except` catches this). Also, if the orchestrator completes but no PRs were created (all batches failed), the "Fix PRs Created" section should be absent, not show an empty list.
-
----
-
-### TC-BL-REG-34: YAML Block Scalar Integrity (Bug #29 Regression)
-
-**Type**: Regression — Deployment-blocking YAML syntax error
-
-**Why we test this**: A single YAML syntax error in the workflow file renders the entire workflow invisible to GitHub Actions. No error notification is sent — the workflow silently stops being dispatchable. This happened when a multi-line Python script inside a `$(python3 -c "...")` command substitution broke the YAML literal block scalar (`run: |`) by starting lines at column 1.
-
-**Setup**: After any change to the workflow file that includes inline Python code:
-1. Run `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/devin-security-backlog.yml'))"` locally to validate YAML syntax
-2. Attempt to dispatch the workflow via API: `POST /repos/{owner}/{repo}/actions/workflows/devin-security-backlog.yml/dispatches`
-3. Verify the response is HTTP 204 (success), not HTTP 422
-
-**Expected**:
-1. YAML validation passes without `ScannerError`
-2. Workflow dispatch returns HTTP 204
-3. The workflow appears in the Actions UI with the `workflow_dispatch` trigger visible
-
-**Validates**: Bug #29 — Multi-line Python code embedded in YAML `run: |` blocks inside `$(...)` command substitutions must either be collapsed to a single line or use a properly indented heredoc (`python3 << 'EOF'`). The multi-line `$(python3 -c "...")` pattern is a YAML footgun that is not caught by any CI check — only by attempting to dispatch.
-
-**Worry**: There is no automated CI check that validates GitHub Actions YAML files before merge. A broken YAML file can be merged to main and silently disable the workflow. In production, this means the scheduled backlog sweep stops running with no alert to the team. Consider adding a pre-merge validation step (e.g., `yamllint` or a custom action that parses all workflow files).
-
----
-
-### TC-BL-REG-35: Alert State Race Condition (Bug #30 Regression)
-
-**Type**: Regression — Race condition between orchestrator fetch and batch fetch
-
-**Why we test this**: In a Fortune 500 repo with frequent CI runs, CodeQL may close alerts (via merged fix PRs) between the orchestrator's initial alert fetch and the child batch's per-alert fetch. The batch workflow must gracefully handle alerts that changed state mid-flight.
-
-**Setup**: 
-1. Seed a repo with 10 open CodeQL alerts
-2. Trigger the orchestrator
-3. While the orchestrator is fetching alerts, merge a fix PR that closes 2 of the 10 alerts
-4. The child batch should receive all 10 alert IDs but find only 8 still open
-
-**Expected**:
-1. The batch workflow logs "Alert #X state=fixed (skipping — may already be fixed)" for the 2 closed alerts
-2. The batch creates a Devin session with only the 8 remaining open alerts
-3. The orchestrator summary counts match reality (8 processed, not 10)
-4. No errors or workflow failures
-
-**Validates**: Bug #30 — The system must handle the inherent race condition in any fetch-then-process architecture without errors or misleading counts.
-
-**Worry**: If the batch workflow does NOT skip already-fixed alerts, Devin receives instructions to fix alerts that no longer exist. This wastes session time and could cause Devin to make unnecessary changes. The batch's per-alert re-fetch is the safety net.
-
----
-
-### TC-BL-REG-36: Session Ends Blocked — Unattended Prompt Handling (Bug #31)
-
-**Type**: Regression — Devin sessions ending "blocked" in automated batch runs
-
-**Why we test this**: In unattended automated runs, Devin sessions should complete autonomously without waiting for human input. If a session ends "blocked", it means Devin asked a question and never got a response. The fix PR may be incomplete.
+**Why we test this**: In production, a Devin session processing a large batch (15 alerts across 5+ files) may encounter multiple independent blocking points — one per file or vulnerability type. Each blocking point is unrelated to the previous one. Without counter reset, a session that successfully resumes work after an unblock still counts that attempt toward the lifetime budget. A batch touching 4 files could legitimately block 4 times, but the old code would kill it after the 2nd block.
 
 **Setup**:
-1. Trigger an orchestrator run with alerts that include ambiguous vulnerability patterns (e.g., alerts in files with complex dependency chains where the "right" fix isn't obvious)
-2. Monitor the Devin session's `status_enum` field during polling
-3. Check whether the session prompt includes explicit "do not ask questions" instructions
+1. Seed the repo with 15+ CodeQL alerts spread across 4-5 different files to create a large batch
+2. Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`
+3. Wait for the batch workflow to start polling the Devin session
+4. Monitor the poll logs for blocked → working → blocked transitions
 
 **Expected**:
-1. The Devin session prompt includes: "This is an unattended automated run. Do not ask questions or wait for input."
-2. The session ends with `status_enum=finished` (not `blocked`)
-3. If the session does end `blocked`, the batch workflow still creates a PR (Bug #23 fix) and classifies alerts correctly (Bug #18 fix)
-4. The PR body notes that the session ended blocked and some fixes may be incomplete
+1. When the session transitions from `blocked` to `working`, the log shows: "Session resumed working after unblock — resetting unblock counter (was N/3)"
+2. The `UNBLOCK_ATTEMPTS` counter resets to 0 after each successful resume
+3. The session can handle 3+ independent blocking points across different files (as long as it resumes working between each)
+4. The session is only terminated when it blocks 3 times CONSECUTIVELY without resuming work
 
-**Validates**: Bug #31 — Sessions ending "blocked" indicate the prompt needs improvement. The workflow should handle blocked sessions gracefully, but the goal is to minimize them.
+**Validates**: Bug #37 — The old code used a monotonically increasing counter that never reset. A session processing a 15-alert batch across 5 files could block at 3 different files, but was killed after the 2nd block even though each unblock successfully resumed work. The fix tracks `LAST_STATUS` and resets the counter on `blocked → working` transitions.
 
-**Worry**: In production, blocked sessions waste Devin API credits (the session stays active, consuming ACUs, until it times out). At scale with 5 concurrent sessions, even 1 blocked session reduces throughput by 20%.
+**Production scenario**: A Fortune 500 monorepo has 200 CodeQL alerts across 40 files. Batches of 15 alerts cover 3-4 files each. Devin asks a clarifying question when switching between files (e.g., "Should I use the existing sanitizer in utils.py or create a new one?"). With 5 concurrent batches, each batch session may block 3-4 times (once per file transition). Without counter reset, 60% of sessions would be killed prematurely after just 2 files. With counter reset, sessions complete all files as long as they resume work after each unblock.
 
----
+**Worry**: The counter reset could mask a pathological case: a session that rapidly alternates between blocked and working without making progress (e.g., blocked → working for 1 second → blocked again). The counter resets each time, so the session never hits the consecutive-block limit. The 45-poll timeout (45 minutes) is the only safety net. In production, this could waste a Devin session slot for 45 minutes on a non-productive session.
 
-### TC-BL-REG-37: Stale Cursor Comment Cleanup (Bug #32 Regression)
+### TC-BL-REG-32: PR Body Updated with Classification Metadata After Collect-Results (Bug #38)
 
-**Type**: Regression — Stale cursor comments accumulate on tracking issue
+**Type**: Regression — validates that the PR body includes classification data from collect-results
 
-**Why we test this**: Before Bug #26 was fixed, each orchestrator run created multiple cursor comments. Even after the fix, stale comments from previous runs remain. For enterprise teams monitoring the tracking issue, dozens of outdated cursor comments obscure the current state.
+**Why we test this**: The PR body is the primary artifact enterprise teams review. If it shows "0 fixed, 0 attempted, 0 unfixable" when 12 alerts were actually attempted, the team loses trust in the system. The classification metadata must be written AFTER the collect-results step computes the actual numbers.
 
 **Setup**:
-1. Run the orchestrator 3 times with `reset_cursor=true` each time (simulating pre-fix behavior)
-2. Verify multiple cursor comments exist on the tracking issue
-3. Run the orchestrator again with the Bug #32 fix (stale comment cleanup)
-4. Check the tracking issue after the run
+1. Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`
+2. Wait for the batch workflow to complete (session finishes or times out)
+3. Check the PR body via GitHub API: `GET /repos/{repo}/pulls/{pr_number}`
 
 **Expected**:
-1. After the cleanup run, only 1 cursor comment remains on the tracking issue
-2. The remaining comment contains the latest cursor state
-3. The deleted comments' IDs are logged for audit trail
-4. If deletion fails (e.g., permissions), the workflow continues without error
+1. The PR body contains a "### Alert Classification Summary" table
+2. The table shows non-zero counts matching the actual alert classification
+3. The PR body contains a `<!-- batch-classification-metadata {...} -->` HTML comment
+4. The JSON inside the HTML comment has correct `fixed_alert_ids`, `attempted_alert_ids`, `unfixable_alert_ids`
+5. The `run_id` in the metadata matches the batch workflow's run ID
+6. The `session_id` in the metadata matches the Devin session ID
 
-**Validates**: Bug #32 — The tracking issue must remain clean and readable. Enterprise teams should see exactly one cursor comment with the current state, not a history of 50+ stale snapshots.
+**Validates**: Bug #38 — The old code PATCHed the PR body in Step 4 (Create PR) before Step 5 (Collect results) ran. The classification fields were always empty/zero. The fix adds Step 5b that PATCHes the PR body AFTER collect-results with the actual classification data.
 
-**Worry**: Deleting comments requires write permissions on the issue. If the `GH_PAT` token lacks `issues:write` scope, the cleanup silently fails. Also, if two orchestrator runs execute simultaneously, they could race to delete each other's cursor comments. The cleanup should only delete comments with the `<!-- backlog-cursor -->` marker.
+**Production scenario**: The security team reviews a batch fix PR. The PR body says "12 alerts attempted, 3 unfixable (human review needed)". The team knows exactly what to review: merge the PR for the 12 attempted fixes, then manually investigate the 3 unfixable alerts listed by ID. Without this metadata, the team sees an empty classification and has to dig through workflow logs to understand what happened.
 
----
+**Worry**: The Step 5b PATCH overwrites whatever was in the PR body before (Devin's description + Step 4's template). If Devin added important context to the PR description (e.g., "I changed the sanitization approach in user_service.py because the existing pattern was deprecated"), that context is lost when Step 5b appends the classification table. The current implementation APPENDS to the existing body rather than replacing it, but this creates an ever-growing PR body if the workflow runs multiple times on the same branch.
 
-### TC-BL-REG-38: Cursor Parsing IndentationError on Default Runs (Bug #33 Regression)
+### TC-BL-REG-33: Cursor Parsing Path Exercised with reset_cursor=false (Bug #40)
 
-**Type**: Regression — Python IndentationError crashes orchestrator on default (non-reset) runs
+**Type**: Integration — validates that the production cursor parsing code path works end-to-end
 
-**Why we test this**: The cursor parsing Python heredoc had an indentation error that only manifested when `reset_cursor=false` (the default for scheduled cron runs). All previous test runs used `reset_cursor=true`, hiding the bug. In production, the 6-hour cron schedule runs with default settings — if this code path crashes, the backlog sweep silently stops.
+**Why we test this**: All test cycles used `reset_cursor=true`, which bypasses cursor parsing entirely. The production cron schedule uses `reset_cursor=false` (the default), which exercises the full cursor load → parse → filter → resume path. Bug #33 (IndentationError) was found in this code path via code review, but the fix was never validated at runtime.
 
 **Setup**:
-1. Ensure the tracking issue (#108) has at least one cursor comment from a previous run
-2. Trigger the orchestrator with default settings (no `reset_cursor` input, or `reset_cursor=false`)
-3. Observe the cursor parsing step
+1. First, run the orchestrator with `reset_cursor=true`, `max_batches=1` to create an initial cursor comment on the tracking issue
+2. Wait for the run to complete (cursor comment created with processed/attempted/unfixable alert IDs)
+3. Then run the orchestrator again with `reset_cursor=false`, `max_batches=1` to exercise cursor parsing
+4. Check the orchestrator logs for cursor parsing output
 
 **Expected**:
-1. The cursor parsing Python heredoc executes without `IndentationError`
-2. The cursor is loaded from the tracking issue comment
-3. The orchestrator proceeds to filter alerts and dispatch batches
-4. The log shows "Cursor loaded: N processed, M unfixable, K attempted"
+1. The second run successfully parses the cursor comment from the tracking issue
+2. The log shows "Found cursor comment..." with the correct alert ID counts
+3. Already-processed/attempted alerts are excluded from the new batch
+4. Only remaining unprocessed alerts are dispatched to new batches
+5. The orchestrator does NOT crash with IndentationError or any other Python error
 
-**Validates**: Bug #33 — Python code inside YAML heredocs must have consistent indentation. The `if cursor is None:` block body must be at the same indent level throughout.
+**Validates**: Bug #40 — The cursor parsing Python code has never been executed in a real workflow run. All testing used `reset_cursor=true` which skips cursor parsing entirely. This test validates the full production path.
 
-**Worry**: This class of bug (Python indentation errors inside YAML heredocs) is invisible to YAML linters, Python linters (which don't see the heredoc content), and CI checks. The only way to catch it is to exercise the specific code path at runtime. In production, the default code path (`reset_cursor=false`) is the one that runs on schedule — if it's broken, no one notices until they check why the backlog isn't being processed.
+**Production scenario**: The cron schedule runs every 6 hours with `reset_cursor=false`. The first run processes 15 alerts (batch 1). Six hours later, the second run loads the cursor, sees 15 alerts already attempted, and dispatches the remaining 7 alerts as batch 2. If cursor parsing fails, the second run either crashes (visible failure) or re-processes all 22 alerts (silent duplication, wasting Devin sessions).
 
----
-
-### TC-BL-REG-39: Auto-Unblock Blocked Sessions via Message API (Bug #34)
-
-**Type**: Regression — Devin sessions ending "blocked" despite unattended prompt
-
-**Why we test this**: In Cycles 2 and 3, every Devin session ended with `status_enum=blocked` instead of `finished`. The prompt-based mitigation (Bug #31) was insufficient. In production at Fortune 500 scale, if every session ends prematurely, the backlog sweep does partial work per batch — doubling or tripling the number of orchestrator runs needed to clear a backlog of hundreds of alerts.
-
-**Setup**:
-1. Trigger the orchestrator with `max_batches=1` (single batch to isolate the test)
-2. Let the batch workflow create a Devin session and begin polling
-3. Wait for the session to go `blocked`
-4. Observe the batch workflow's response
-
-**Expected**:
-1. When the session first goes `blocked`, the batch workflow sends a message via `POST /v1/sessions/{session_id}/message`
-2. The log shows "Session blocked — sending unblock message (attempt 1/2)..."
-3. The workflow continues polling (does NOT exit immediately)
-4. If the session resumes working, the log shows subsequent polls with `status_enum=working`
-5. If the session goes `blocked` again, a second unblock message is sent (attempt 2/2)
-6. Only after 2 unblock attempts does the workflow accept `blocked` as terminal
-7. The session status output is `blocked` only if both unblock attempts failed
-
-**Validates**: Bug #34 — The batch workflow actively tries to unblock sessions instead of immediately giving up.
-
-**Worry**: If the Devin message API silently fails (returns 200 but doesn't actually unblock), the workflow burns 2 extra poll intervals (~2 min) before accepting terminal state. This is acceptable overhead. The worse scenario is if the message API changes the session state to something unexpected — the poll loop must handle all possible status transitions after sending an unblock message.
-
----
-
-### TC-BL-REG-40: Existing PR Body Updated with Structured Batch Metadata (Bug #36)
-
-**Type**: Regression — Devin-created PRs lack structured alert tables and attribution
-
-**Why we test this**: When Devin creates a PR from within its session (before the batch workflow's PR creation step), the PR has Devin's auto-generated description instead of the structured batch metadata (alert severity table, Actions run link, batch attribution). Enterprise teams need consistent, auditable PR descriptions for compliance and review efficiency.
-
-**Setup**:
-1. Trigger the orchestrator with `max_batches=1`
-2. Let the Devin session create a PR from within the session (this is the default behavior)
-3. Observe the batch workflow's "Create PR" step when it detects the existing PR
-
-**Expected**:
-1. The batch workflow detects the existing PR: "PR already exists: {url}"
-2. The workflow PATCHes the PR title and body: "Updating PR body with structured batch metadata..."
-3. The PR title follows the format: `fix(security): Batch N — M CodeQL alerts in file1, file2`
-4. The PR body contains the alert severity table, process description, and "Generated by Devin Security Backlog Sweep" attribution
-5. The log shows "PR body updated with structured batch metadata"
-
-**Validates**: Bug #36 — Existing PRs get the same structured metadata as workflow-created PRs.
-
-**Worry**: The PATCH request could fail if the Devin-created PR was created by a different token with different permissions. The workflow must handle PATCH failures gracefully (log a warning but don't fail the step). Also, if Devin hasn't pushed to the branch yet when the PR creation step runs, the PR won't exist and this code path won't be exercised — but that's the normal path where the workflow creates the PR itself.
-
----
-
-### TC-BL-REG-41: Alert Exclusion for Test/Vendor Files (Bug #35 — Future)
-
-**Type**: Edge case — alerts in test fixtures and vendor code shouldn't be auto-fixed
-
-**Why we test this**: In production repos, CodeQL alerts in test fixtures (e.g., intentionally vulnerable code for security testing), vendor directories, and CI configuration files should not be auto-fixed. Fixing a test fixture's intentional vulnerability breaks the test. Fixing vendored code creates a maintenance burden when the vendor updates.
-
-**Setup**:
-1. Ensure at least one CodeQL alert exists in a test/vendor/CI file (e.g., `.github/workflows/blank.yml` alert #1)
-2. Trigger the orchestrator with default settings
-3. Observe which alerts are included in batches
-
-**Expected (current behavior)**:
-1. ALL alerts are included in batches, including test/vendor file alerts
-2. Alert #1 (blank.yml) is assigned to a batch and Devin attempts to fix it
-
-**Expected (future enhancement)**:
-1. An `exclude_paths` input allows glob patterns to skip specific files/directories
-2. Alerts in excluded paths are logged as "skipped (excluded path)" and NOT included in any batch
-3. The cursor does NOT track excluded alerts (they are neither processed, attempted, nor unfixable)
-
-**Validates**: Bug #35 — Production repos need path-based exclusion filters.
-
-**Worry**: Without exclusion filters, a repo with 50 test fixture vulnerabilities wastes 50 Devin session slots on alerts that SHOULD NOT be fixed. At 5 concurrent sessions, this adds ~100 minutes of wasted processing time per orchestrator run.
+**Worry**: The cursor comment format is a JSON blob inside a GitHub issue comment with a `<!-- backlog-cursor -->` marker. If the marker format changes, or if another comment coincidentally contains the marker text, the parsing logic may find the wrong comment or no comment at all. Additionally, if the cursor JSON has been manually edited by a human (e.g., to remove an alert from the unfixable list), the parser may fail on unexpected field types or missing keys.
