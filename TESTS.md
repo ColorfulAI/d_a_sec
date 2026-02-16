@@ -812,3 +812,42 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: Devin's API has a transient outage. A batch of 15 alerts gets a session that immediately fails. Without this handling, those 15 alerts are marked "processed" and never retried. With this handling, they're marked "unfixable" with a clear reason, and a human can decide to re-run after the outage is resolved.
 
 **Worry**: If session failure causes the collect-results step to also fail (cascading error), no artifact is uploaded, and the orchestrator's fallback marks everything as "processed" — losing the unfixable distinction entirely. The collect-results step must have `if: always()` to run even on prior step failures.
+
+---
+
+### TC-BL-REG-10: Orchestrator Resolves Child Run ID via Timestamp Matching
+
+**Setup**: Trigger the orchestrator with `max_batches=2` so it dispatches 2 child workflows in quick succession. Monitor the orchestrator logs for "timestamp match" messages.
+
+**Expected**:
+1. Orchestrator dispatches Batch 1, records `dispatch_time_str`
+2. Orchestrator dispatches Batch 2, records `dispatch_time_str` (5+ seconds later due to `time.sleep(5)`)
+3. On the next poll cycle, orchestrator queries batch workflow runs with `created>=` filter
+4. Each child run is matched to its batch by timestamp ordering (first unmatched run whose `created_at >= dispatch_time`)
+5. The `already_matched` set prevents the same run from being assigned to both batches
+6. Logs show `"Resolved Batch N -> run XXXXX (timestamp match: created=... >= dispatched=...)"` for each child
+7. Orchestrator correctly polls both children and processes their results
+
+**Validates**: Bug #10 fix — the orchestrator can resolve child workflow run IDs without relying on metadata that doesn't exist in `workflow_dispatch` runs.
+
+**Production scenario**: With 5 concurrent batches dispatched within seconds of each other, the orchestrator must correctly pair each dispatch to its corresponding child run. If run IDs are swapped (Batch 1 gets Batch 2's run), the orchestrator will track the wrong session status and may mark alerts as processed before they're actually done.
+
+**Worry**: If two dispatches happen within the same second (e.g., the 5s sleep is removed or GitHub Actions queues them), timestamp matching may swap which run is assigned to which batch. Since each child receives its batch details as workflow inputs (not from run metadata), the swap is functionally harmless — but it would confuse debugging because log messages would show the wrong batch-to-run mapping.
+
+---
+
+### TC-BL-REG-11: Orchestrator Handles Stale Code in Child Workflow
+
+**Setup**: Trigger the orchestrator from main. While the child workflow is running, merge a code change to the batch workflow on main. Check which version of the batch workflow code the child uses.
+
+**Expected**:
+1. Child workflow uses the code from the commit that was on main when it was dispatched (not the updated code)
+2. The orchestrator still correctly processes the child's results
+3. If the child uses old code that lacks `fixed_alert_ids`/`unfixable_alert_ids` in its result artifact, the orchestrator falls back to marking all alerts as "processed"
+4. The next orchestrator run (after the code update) will dispatch new children that use the updated code
+
+**Validates**: GitHub Actions caches workflow files at dispatch time. Code changes merged after dispatch don't affect running children.
+
+**Production scenario**: A CI/CD team deploys an updated batch workflow while a backlog sweep is in progress. The currently-running children should complete with the old code (no mid-flight changes), and only subsequent dispatches should pick up the new code.
+
+**Worry**: If the orchestrator expects fields in the batch result artifact that the old child code doesn't produce, it will crash when trying to parse the artifact. The orchestrator must handle missing fields gracefully (fallback to treating all alerts as "processed" rather than crashing).
