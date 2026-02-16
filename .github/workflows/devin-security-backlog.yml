@@ -1101,12 +1101,26 @@ jobs:
               poll_count += 1
               print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}, sessions_created: {_counters['sessions_created']}) ---")
 
-              # Backfill: create session + dispatch for freed slots
-              if pending_batches and len(active_children) < max_concurrent:
+              # Backfill: create session + dispatch for ALL freed slots (Bug #59 fix).
+              # Previously only 1 batch was dispatched per poll cycle, causing a major
+              # throughput bottleneck: with 48 pending batches and 60s poll interval,
+              # dispatch alone took 48+ minutes even when all 5 slots were free.
+              # Bug #60 fix: add consecutive failure escape to prevent infinite retry
+              # when the Devin API is persistently rate-limiting (e.g., after wave 1
+              # sessions haven't fully released). Without this, each failed attempt
+              # burns 210s (30+60+120s retries) + 60s poll = 270s per cycle indefinitely.
+              backfill_consecutive_failures = 0
+              while pending_batches and len(active_children) < max_concurrent:
                   batch = pending_batches.pop(0)
                   print(f"  [BACKFILL] Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
                   if not create_and_dispatch(batch):
                       pending_batches.insert(0, batch)
+                      backfill_consecutive_failures += 1
+                      if backfill_consecutive_failures >= 2:
+                          print(f"  [BACKFILL] {backfill_consecutive_failures} consecutive failures — waiting for next poll cycle")
+                          break
+                  else:
+                      backfill_consecutive_failures = 0
 
               # Resolve run IDs for newly dispatched children
               # NOTE (Bug #22 fix): workflow_dispatch runs are returned newest-first

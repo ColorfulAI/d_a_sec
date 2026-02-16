@@ -1763,6 +1763,32 @@ The cursor only gets updated for `completed` children (inside the `if run_status
 
 ---
 
+### Bug #59: Backfill Only Dispatches 1 Batch Per Poll Cycle (Throughput Bottleneck)
+
+**Problem discovered**: During the 722-alert stress test, the orchestrator dispatched wave 1 (5 children) successfully. All 5 completed in ~15 minutes. But wave 2 never started — the backfill code (poll loop, line 1104-1109) only dispatches **one** batch per 60-second poll cycle, even when all 5 slots are free.
+
+With 48 remaining batches and a 60s poll interval, dispatch alone would take 48+ minutes assuming every session creation succeeds. When session creation hits 429 rate limits (which it did — the Devin API was still counting recently-completed sessions), each failed attempt burns ~210s in retries (30s + 60s + 120s exponential backoff) before re-queuing. The orchestrator effectively stalled: 5 empty slots, 48 pending batches, 0 new dispatches for 15+ minutes.
+
+**Impact**: For a Fortune 500 backlog of 500+ alerts (~34 batches), the single-batch backfill turns what should be a ~70-minute job into a 5+ hour crawl. The 5-slot concurrency design is rendered meaningless because only 1 slot can be filled per poll cycle.
+
+**Root cause**: The backfill was an `if` statement (single attempt) instead of a `while` loop (fill all free slots). This was likely an oversight from the initial implementation where the focus was on getting the poll loop working, not on throughput optimization.
+
+**Fix**: Changed the backfill from `if pending_batches and len(active_children) < max_concurrent` to `while pending_batches and len(active_children) < max_concurrent`. The loop fills all free slots in a single poll cycle, dispatching up to `max_concurrent` batches per cycle.
+
+---
+
+### Bug #60: No Consecutive Failure Escape in Poll-Loop Backfill
+
+**Problem discovered**: The initial fill loop (wave 1) has Bug #53's consecutive failure escape hatch — after 3 failures, it breaks out to the poll loop. But the poll-loop backfill had no such protection. When the Devin API persistently returns 429 (e.g., recently-completed sessions still counting against limits), the backfill retries indefinitely: create session (3 retries × 210s) → fail → re-queue → next poll (60s) → repeat. Each cycle burns ~270s doing nothing productive.
+
+**Impact**: Combined with Bug #59, this creates a worst-case scenario: the orchestrator has 48 pending batches, 0 active children, and the API is returning 429. It enters an infinite retry loop that can only be broken by the 5.5-hour safety timeout. During this time, the orchestrator consumes a GitHub Actions runner doing nothing but sleeping and retrying.
+
+**Root cause**: The consecutive failure escape (Bug #53) was only added to the initial fill loop, not to the poll-loop backfill. The backfill was assumed to be a single-attempt operation, so infinite retry wasn't considered.
+
+**Fix**: Added a `backfill_consecutive_failures` counter to the backfill while-loop. After 2 consecutive failures, the loop breaks out and waits for the next poll cycle. This prevents burning 270s per failed attempt while still retrying on each poll cycle (every 60s) in case the rate limit clears.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
