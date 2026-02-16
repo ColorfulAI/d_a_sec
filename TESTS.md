@@ -1059,8 +1059,26 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 4. The cursor is updated with the correct fixed/attempted/unfixable counts (not the fallback "mark all as processed")
 5. The summary shows non-zero attempted or unfixable counts (reflecting actual Devin behavior, not the fallback)
 
-**Validates**: Bug #20 — GitHub's artifact `archive_download_url` returns a 302 redirect to Azure Blob Storage. Python's `urllib` forwards the `Authorization: token` header to Azure, which rejects it with 403. The `NoAuthRedirectHandler` strips the auth header on redirect so Azure accepts the pre-signed URL.
+**Validates**: Bugs #20 and #21 — GitHub's artifact `archive_download_url` returns a 302 redirect to Azure Blob Storage. Bug #20: Python's `urllib` forwards the `Authorization: token` header to Azure → 403. Bug #21: The custom `NoAuthRedirectHandler` fix malformed the redirect request → 400. Final fix: `curl -sL` subprocess call which natively strips auth headers on cross-domain redirects.
 
-**Production scenario**: A company runs the backlog sweep nightly. Every night, the orchestrator successfully dispatches batches, Devin fixes alerts, but the artifact download silently fails with 403. The orchestrator falls back to marking ALL alerts as "processed" — the cursor grows but the fixed/unfixable breakdown is always empty. The security dashboard shows "500 alerts processed, 0 unfixable, 0 need review" when in reality 50 alerts were unfixable and need human attention. Those 50 vulnerabilities persist in production undetected.
+**Production scenario**: A company runs the backlog sweep nightly. Every night, the orchestrator successfully dispatches batches, Devin fixes alerts, but the artifact download silently fails. The orchestrator falls back to marking ALL alerts as "processed" — the cursor grows but the fixed/unfixable breakdown is always empty. The security dashboard shows "500 alerts processed, 0 unfixable, 0 need review" when in reality 50 alerts were unfixable and need human attention. Those 50 vulnerabilities persist in production undetected.
 
-**Worry**: The 403 is silent — the orchestrator catches the exception, logs a warning, and continues with the fallback. In production, this means the three-state classification (Bug #18) never actually reaches the cursor. The entire unfixable-alert-marking pipeline is broken at the last mile. This is particularly insidious because the workflow completes successfully (exit code 0) and the summary looks clean.
+**Worry**: The download failure is silent — the orchestrator catches the exception, logs a warning, and continues with the fallback. In production, this means the three-state classification (Bug #18) never actually reaches the cursor. The entire unfixable-alert-marking pipeline is broken at the last mile. This is particularly insidious because the workflow completes successfully (exit code 0) and the summary looks clean.
+
+### TC-BL-REG-24: Artifact Download Uses curl Not urllib (Bug #21)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`. Let the child batch complete. Observe the orchestrator logs during the artifact download phase. Specifically look for evidence that curl (not urllib) is being used for the download.
+
+**Expected**:
+1. Orchestrator logs show `Found result artifact: batch-1-result`
+2. Followed by `Fixed: X, Attempted: Y, Unfixable: Z` (actual per-alert breakdown from the artifact JSON)
+3. NOT followed by `Could not fetch batch result artifact: HTTP Error 400: The request URI is invalid`
+4. NOT followed by `Could not fetch batch result artifact: HTTP Error 403...`
+5. The cursor is updated with correct attempted/unfixable counts
+6. The summary displays the three-state breakdown (not the fallback "mark all as processed")
+
+**Validates**: Bug #21 — The Bug #20 fix (custom `NoAuthRedirectHandler` in urllib) caused HTTP 400 "The request URI is invalid" from Azure Blob Storage. Root cause: Python's `urllib` redirect handler creates a malformed `Request` object — `header_items()` returns internal header representations that don't roundtrip cleanly through `add_header()`, corrupting the redirected request. The fix replaces urllib entirely with a `curl -sL` subprocess call, which natively strips `Authorization` headers on cross-domain redirects (since curl 7.58+).
+
+**Production scenario**: After deploying Bug #20's fix, a company's nightly backlog sweep still silently fails to download artifacts — but now with HTTP 400 instead of 403. The security team investigates the 403 fix, confirms `NoAuthRedirectHandler` is deployed, and concludes "artifact download is fixed." But the error has merely changed shape. The three-state classification still never reaches the cursor. Unfixable alerts are still invisible. This is a cascading fix failure — Bug #20's fix introduced Bug #21, and the fallback behavior masks both.
+
+**Worry**: Python's `urllib` redirect handling is fundamentally unreliable for GitHub's artifact download flow (GitHub API → 302 → Azure Blob Storage). Any fix that stays within urllib is fragile. The curl-based solution is the correct approach because curl's redirect handling is battle-tested and natively handles auth-stripping. But we must verify curl is available on the runner (standard on GitHub-hosted Ubuntu runners, may not be on self-hosted). If curl is missing or returns non-200, the fallback still triggers — test that the fallback path is still functional as a safety net.

@@ -1357,7 +1357,14 @@ GitHub's artifact `archive_download_url` returns a 302 redirect to Azure Blob St
 
 Without this fix, the orchestrator silently falls back to marking all alerts as "processed" (losing the fixed/attempted/unfixable breakdown from Bug #18). The three-state classification never reaches the cursor.
 
-**Solution (Bug #20 fix)**: Custom `NoAuthRedirectHandler` that strips the `Authorization` header when following redirects. The initial request to GitHub's API authenticates normally; only the redirect to Azure drops the token. The fallback path still exists as a safety net.
+**Solution (Bug #20 initial fix — superseded by Bug #21 fix)**: Custom `NoAuthRedirectHandler` that strips the `Authorization` header when following redirects. This fix was deployed but caused Bug #21.
+
+**Worry: Artifact download HTTP 400 after redirect handler fix (Bug #21 — CONFIRMED)**
+The Bug #20 fix (custom `NoAuthRedirectHandler`) caused a new failure: HTTP 400 "The request URI is invalid" from Azure Blob Storage. Root cause: Python's `urllib` redirect handler creates a malformed `Request` object when constructing the redirected request — the `header_items()` method returns internal header representations that don't roundtrip cleanly through `add_header()`, and the URL itself may be corrupted during the redirect chain.
+
+This meant the three-state classification from Bug #18 still never reached the cursor. The orchestrator fell back to marking all 12 alerts as "processed" instead of the correct "12 attempted, 0 unfixable".
+
+**Solution (Bug #21 fix)**: Replaced the entire urllib-based artifact download with a `subprocess.run(["curl", "-sL", ...])` call. `curl` natively strips `Authorization` headers on cross-domain redirects (since curl 7.58+, standard on all GitHub-hosted runners). This avoids both the 403 (Bug #20) and the 400 (Bug #21) by never touching Python's redirect handling. The function `download_artifact_zip()` writes to a temp file, reads the bytes, and cleans up. A 60-second subprocess timeout prevents hangs.
 
 ---
 
