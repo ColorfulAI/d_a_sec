@@ -1,0 +1,507 @@
+# Devin Security Batch — Child Workflow
+#
+# This workflow is dispatched by the orchestrator (devin-security-backlog.yml)
+# to process a single batch of CodeQL alerts. It:
+#   1. Receives a batch of alert IDs as input
+#   2. Fetches alert details from the CodeQL API
+#   3. Creates 1 Devin session to fix the alerts
+#   4. Polls the session until completion (or timeout)
+#   5. Creates a PR with the fixes
+#   6. Reports results via workflow artifacts
+#
+# DESIGN: Each child workflow = 1 Devin session = 1 batch of alerts = 1 PR.
+# This isolation ensures that a failure in one batch doesn't affect others.
+# See DESIGN.md "Sub-Workflow Fan-Out Architecture" for full rationale.
+
+name: Devin Security Batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: "Batch number (e.g., 1, 2, 3)"
+        required: true
+        type: string
+      alert_ids:
+        description: "Comma-separated CodeQL alert numbers to fix"
+        required: true
+        type: string
+      branch_name:
+        description: "Branch name for this batch's fixes"
+        required: true
+        type: string
+      tracking_issue:
+        description: "Issue number for cursor state tracking"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  security-events: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+env:
+  BATCH_ID: ${{ github.event.inputs.batch_id }}
+  ALERT_IDS: ${{ github.event.inputs.alert_ids }}
+  BRANCH_NAME: ${{ github.event.inputs.branch_name }}
+  TRACKING_ISSUE: ${{ github.event.inputs.tracking_issue }}
+
+jobs:
+  process-batch:
+    runs-on: ubuntu-latest
+    outputs:
+      session_id: ${{ steps.create-session.outputs.session_id }}
+      session_url: ${{ steps.create-session.outputs.session_url }}
+      session_status: ${{ steps.poll-session.outputs.status }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      pr_url: ${{ steps.create-pr.outputs.pr_url }}
+      fixed_count: ${{ steps.collect-results.outputs.fixed_count }}
+      failed_count: ${{ steps.collect-results.outputs.failed_count }}
+      result_json: ${{ steps.collect-results.outputs.result_json }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # STEP 1: Fetch alert details from CodeQL API
+      # ----------------------------------------------------------------
+      - name: Fetch alert details
+        id: fetch-alerts
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          IFS=',' read -ra IDS <<< "$ALERT_IDS"
+          echo "Fetching ${#IDS[@]} alerts for batch $BATCH_ID..."
+
+          echo '[]' > /tmp/batch_alerts.json
+          FETCHED=0
+          FAILED_FETCH=0
+
+          for ALERT_NUM in "${IDS[@]}"; do
+            ALERT_NUM=$(echo "$ALERT_NUM" | tr -d ' ')
+            if [ -z "$ALERT_NUM" ]; then
+              continue
+            fi
+
+            RESP=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts/$ALERT_NUM")
+
+            STATE=$(echo "$RESP" | jq -r '.state // "unknown"')
+            if [ "$STATE" = "open" ]; then
+              jq --argjson alert "$RESP" '. + [$alert]' /tmp/batch_alerts.json > /tmp/batch_alerts_tmp.json
+              mv /tmp/batch_alerts_tmp.json /tmp/batch_alerts.json
+              FETCHED=$((FETCHED + 1))
+            else
+              echo "Alert #$ALERT_NUM state=$STATE (skipping — may already be fixed)"
+              FAILED_FETCH=$((FAILED_FETCH + 1))
+            fi
+          done
+
+          echo "Fetched $FETCHED open alerts ($FAILED_FETCH skipped)"
+          echo "alert_count=$FETCHED" >> $GITHUB_OUTPUT
+
+          if [ "$FETCHED" -eq 0 ]; then
+            echo "::warning::No open alerts found for batch $BATCH_ID. All may have been fixed already."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+          # Build alert summary for Devin prompt
+          python3 << 'SUMMARY_EOF'
+          import json
+
+          with open("/tmp/batch_alerts.json") as f:
+              alerts = json.load(f)
+
+          summary_lines = []
+          details = []
+          for a in alerts:
+              rule_id = a.get("rule", {}).get("id", "unknown")
+              desc = a.get("rule", {}).get("description", rule_id)
+              loc = a.get("most_recent_instance", {}).get("location", {})
+              path = loc.get("path", "unknown")
+              line = loc.get("start_line", 0)
+              severity = a.get("rule", {}).get("security_severity_level", "unknown")
+              message = a.get("most_recent_instance", {}).get("message", {}).get("text", "")
+
+              summary_lines.append(f"- [{rule_id}] {desc} at {path}:{line} (severity: {severity})")
+              details.append({
+                  "number": a.get("number"),
+                  "rule_id": rule_id,
+                  "rule_description": desc,
+                  "severity": severity,
+                  "file": path,
+                  "start_line": line,
+                  "end_line": loc.get("end_line", line),
+                  "message": message,
+                  "key": f"{rule_id}:{path}:{line}"
+              })
+
+          with open("/tmp/batch_summary.txt", "w") as f:
+              f.write("\n".join(summary_lines))
+          with open("/tmp/batch_details.json", "w") as f:
+              json.dump(details, f, indent=2)
+
+          print(f"Prepared {len(details)} alerts for Devin session")
+          for s in summary_lines:
+              print(f"  {s}")
+          SUMMARY_EOF
+
+      # ----------------------------------------------------------------
+      # STEP 2: Create Devin session for this batch
+      # ----------------------------------------------------------------
+      - name: Create Devin session
+        id: create-session
+        if: steps.fetch-alerts.outputs.skip != 'true'
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          REPO="${{ github.repository }}"
+          ALERT_SUMMARY=$(cat /tmp/batch_summary.txt)
+          ALERT_DETAILS=$(cat /tmp/batch_details.json)
+
+          PROMPT=$(cat <<PROMPT_EOF
+          You are a security engineer fixing pre-existing CodeQL vulnerabilities in repository ${REPO}.
+
+          This is Batch #${BATCH_ID} of an automated backlog sweep. Fix these alerts on a new branch.
+
+          Alerts to fix:
+
+          ${ALERT_SUMMARY}
+
+          Detailed alert information:
+          ${ALERT_DETAILS}
+
+          Instructions:
+          1. Clone the repository: https://github.com/${REPO}.git
+          2. Create and checkout branch '${BRANCH_NAME}' from main
+          3. For each alert, read the surrounding code and understand the full context
+          4. Fix each alert ONE AT A TIME. For each alert:
+             a. Apply a minimal, focused fix following the codebase's existing conventions
+             b. VERIFY the fix locally using CodeQL CLI before committing:
+                - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip
+                - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite
+                - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download
+                - Check if the specific alert rule ID still appears for the same file and line
+             c. If the alert STILL appears after your fix, revise and re-run CodeQL (max 2 attempts)
+             d. If after 2 attempts the alert persists, SKIP it — do NOT commit a broken fix. Note it as unfixable.
+             e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)
+          5. Conventions to follow:
+             - If the project uses an ORM, use parameterized queries via the ORM
+             - If there are existing sanitization utilities, reuse them
+             - Do not introduce new dependencies unless absolutely necessary
+          6. If the repository has tests, run them to ensure no regressions
+          7. Push all commit(s) to branch '${BRANCH_NAME}'
+
+          IMPORTANT:
+          - Each security issue MUST be a separate commit
+          - Do NOT just suppress or ignore alerts — fix the root cause
+          - Keep fixes minimal and surgical — do not refactor unrelated code
+          - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it
+          - At the end, report which alerts were fixed and which were unfixable
+          PROMPT_EOF
+          )
+
+          PROMPT_JSON=$(echo "$PROMPT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "https://api.devin.ai/v1/sessions" \
+            -H "Authorization: Bearer $DEVIN_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Devin API response (HTTP $HTTP_CODE):"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          # Exponential backoff on rate limits (3 retries: 60s, 120s, 240s)
+          RETRY_WAIT=60
+          RETRY_COUNT=0
+          MAX_RETRIES=3
+          while [ "$HTTP_CODE" = "429" ] && [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "Rate limited (429). Retry ${RETRY_COUNT}/${MAX_RETRIES} — waiting ${RETRY_WAIT}s..."
+            sleep $RETRY_WAIT
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST "https://api.devin.ai/v1/sessions" \
+              -H "Authorization: Bearer $DEVIN_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "Retry ${RETRY_COUNT} response (HTTP $HTTP_CODE):"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+            RETRY_WAIT=$((RETRY_WAIT * 2))
+          done
+
+          SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
+          SESSION_URL=$(echo "$BODY" | jq -r '.url // empty')
+          if [ -z "$SESSION_URL" ] && [ -n "$SESSION_ID" ]; then
+            SESSION_URL="https://app.devin.ai/sessions/${SESSION_ID}"
+          fi
+
+          if [ -z "$SESSION_ID" ]; then
+            echo "::error::Failed to create Devin session for batch $BATCH_ID (HTTP $HTTP_CODE)"
+            echo "session_created=false" >> $GITHUB_OUTPUT
+            echo "session_id=" >> $GITHUB_OUTPUT
+            echo "session_url=" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Devin session created: $SESSION_URL"
+          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+          echo "session_url=$SESSION_URL" >> $GITHUB_OUTPUT
+          echo "session_created=true" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # STEP 3: Poll Devin session until completion
+      # Polls every 60s, timeout after 45 minutes (45 polls)
+      # ----------------------------------------------------------------
+      - name: Poll Devin session status
+        id: poll-session
+        if: steps.create-session.outputs.session_created == 'true'
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          SESSION_ID: ${{ steps.create-session.outputs.session_id }}
+        run: |
+          MAX_POLLS=45
+          POLL_INTERVAL=60
+          POLL=0
+
+          echo "Polling session $SESSION_ID every ${POLL_INTERVAL}s (max ${MAX_POLLS} polls = $(( MAX_POLLS * POLL_INTERVAL / 60 )) min)..."
+
+          while [ $POLL -lt $MAX_POLLS ]; do
+            POLL=$((POLL + 1))
+
+            RESP=$(curl -s \
+              -H "Authorization: Bearer $DEVIN_API_KEY" \
+              "https://api.devin.ai/v1/sessions/$SESSION_ID")
+
+            STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
+            echo "Poll $POLL/$MAX_POLLS: status=$STATUS"
+
+            case "$STATUS" in
+              finished|stopped)
+                echo "Session completed with status=$STATUS"
+                echo "status=$STATUS" >> $GITHUB_OUTPUT
+                echo "completed=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              blocked)
+                echo "::warning::Session is blocked — may need manual intervention"
+                echo "status=blocked" >> $GITHUB_OUTPUT
+                echo "completed=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              failed|error)
+                echo "::error::Session failed with status=$STATUS"
+                echo "status=$STATUS" >> $GITHUB_OUTPUT
+                echo "completed=true" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+            esac
+
+            if [ $POLL -lt $MAX_POLLS ]; then
+              sleep $POLL_INTERVAL
+            fi
+          done
+
+          echo "::warning::Session polling timed out after $(( MAX_POLLS * POLL_INTERVAL / 60 )) minutes"
+          echo "status=timeout" >> $GITHUB_OUTPUT
+          echo "completed=false" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # STEP 4: Check if the branch exists and create PR
+      # ----------------------------------------------------------------
+      - name: Create PR for batch fixes
+        id: create-pr
+        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          ALERT_COUNT=$(cat /tmp/batch_details.json | jq 'length')
+
+          # Check if branch exists
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/branches/$BRANCH_NAME")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::Branch $BRANCH_NAME not found (HTTP $HTTP_CODE). Devin may not have pushed fixes."
+            echo "pr_created=false" >> $GITHUB_OUTPUT
+            echo "pr_number=" >> $GITHUB_OUTPUT
+            echo "pr_url=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Branch $BRANCH_NAME exists. Creating PR..."
+
+          # Build alert table for PR body
+          ALERT_TABLE=$(python3 << 'TABLE_EOF'
+          import json
+
+          with open("/tmp/batch_details.json") as f:
+              alerts = json.load(f)
+
+          lines = ["| Severity | Rule | File | Line |", "|----------|------|------|------|"]
+          for a in alerts:
+              lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}` | {a['start_line']} |")
+          print("\n".join(lines))
+          TABLE_EOF
+          )
+
+          SESSION_URL="${{ steps.create-session.outputs.session_url }}"
+
+          PR_BODY=$(cat <<PR_BODY_EOF
+          ## Security Batch Fix #${BATCH_ID}
+
+          Automated security fixes for ${ALERT_COUNT} CodeQL alert(s) processed by [Devin AI](${SESSION_URL}).
+
+          ### Alerts Addressed
+
+          ${ALERT_TABLE}
+
+          ### Process
+          - Each alert was fixed individually with a separate commit
+          - Fixes were verified locally using CodeQL CLI before committing
+          - Alerts that could not be fixed after 2 attempts were skipped
+
+          ---
+          *Generated by [Devin Security Backlog Sweep](https://github.com/${REPO}/actions/runs/${{ github.run_id }})*
+          PR_BODY_EOF
+          )
+
+          # Get primary files for PR title
+          PRIMARY_FILES=$(cat /tmp/batch_details.json | jq -r '[.[].file] | unique | join(", ")' | head -c 80)
+
+          PR_BODY_JSON=$(echo "$PR_BODY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          RESP=$(curl -s -L \
+            -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls" \
+            -d "{
+              \"title\": \"fix(security): Batch ${BATCH_ID} — ${ALERT_COUNT} CodeQL alerts in ${PRIMARY_FILES}\",
+              \"body\": $PR_BODY_JSON,
+              \"head\": \"$BRANCH_NAME\",
+              \"base\": \"main\"
+            }")
+
+          PR_NUMBER=$(echo "$RESP" | jq -r '.number // empty')
+          PR_URL=$(echo "$RESP" | jq -r '.html_url // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            # PR may already exist for this branch
+            EXISTING=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/$REPO/pulls?head=${{ github.repository_owner }}:$BRANCH_NAME&state=open")
+            PR_NUMBER=$(echo "$EXISTING" | jq -r '.[0].number // empty')
+            PR_URL=$(echo "$EXISTING" | jq -r '.[0].html_url // empty')
+            if [ -n "$PR_NUMBER" ]; then
+              echo "PR already exists: $PR_URL"
+            else
+              echo "::warning::Failed to create PR for batch $BATCH_ID"
+              echo "$RESP" | jq . 2>/dev/null || echo "$RESP"
+              echo "pr_created=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "PR created: $PR_URL"
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "pr_created=true" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # STEP 5: Collect results and upload artifact
+      # ----------------------------------------------------------------
+      - name: Collect results
+        id: collect-results
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          SESSION_STATUS="${{ steps.poll-session.outputs.status }}"
+          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+          PR_URL="${{ steps.create-pr.outputs.pr_url }}"
+          SESSION_URL="${{ steps.create-session.outputs.session_url }}"
+          SESSION_ID="${{ steps.create-session.outputs.session_id }}"
+
+          # Count commits on the branch to estimate fixed alerts
+          FIXED=0
+          if [ -n "$BRANCH_NAME" ]; then
+            COMMITS=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/$REPO/compare/main...$BRANCH_NAME" 2>/dev/null)
+            FIXED=$(echo "$COMMITS" | jq '.commits | length // 0' 2>/dev/null || echo "0")
+          fi
+
+          TOTAL=$(cat /tmp/batch_details.json 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+          FAILED=$((TOTAL - FIXED))
+          if [ "$FAILED" -lt 0 ]; then
+            FAILED=0
+          fi
+
+          echo "fixed_count=$FIXED" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED" >> $GITHUB_OUTPUT
+
+          # Build result JSON
+          python3 << RESULT_EOF
+          import json, os
+
+          result = {
+              "batch_id": os.environ.get("BATCH_ID", ""),
+              "alert_ids": os.environ.get("ALERT_IDS", "").split(","),
+              "session_id": "$SESSION_ID",
+              "session_url": "$SESSION_URL",
+              "session_status": "$SESSION_STATUS",
+              "pr_number": "$PR_NUMBER",
+              "pr_url": "$PR_URL",
+              "fixed_count": $FIXED,
+              "failed_count": $FAILED,
+              "branch_name": os.environ.get("BRANCH_NAME", "")
+          }
+
+          with open("/tmp/batch_result.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          # Compact JSON for output
+          compact = json.dumps(result)
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"result_json={compact}\n")
+
+          print(json.dumps(result, indent=2))
+          RESULT_EOF
+
+      - name: Upload batch result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-${{ env.BATCH_ID }}-result
+          path: /tmp/batch_result.json
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Batch #$BATCH_ID Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alerts**: $(cat /tmp/batch_details.json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Session**: ${{ steps.create-session.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.poll-session.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR**: ${{ steps.create-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fixed**: ${{ steps.collect-results.outputs.fixed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed**: ${{ steps.collect-results.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
