@@ -14,6 +14,10 @@ ALLOWED_FILES = {
     "config": os.path.join(os.path.abspath("data"), "config.txt"),
     "log": os.path.join(os.path.abspath("data"), "log.txt"),
 }
+ALLOWED_URLS = {
+    "status": "https://api.example.com/status",
+    "health": "https://api.example.com/health",
+}
 
 @app.route("/query_42_0")
 def query_db_42_0():
@@ -48,7 +52,10 @@ def render_page_42_3():
 
 @app.route("/fetch_42_4")
 def fetch_url_42_4():
-    url = request.args.get("url")
+    key = request.args.get("url")
+    url = ALLOWED_URLS.get(key)
+    if url is None:
+        return "Unknown resource", 404
     resp = urllib.request.urlopen(url)
     return resp.read()
 
