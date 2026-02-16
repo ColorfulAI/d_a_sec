@@ -1,9 +1,10 @@
 """Stress test module 44 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
+import json
 import os
+import re
 import subprocess
-import pickle
-import urllib.request
+from markupsafe import escape
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
@@ -13,8 +14,8 @@ def query_db_44_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_44_1")
 def run_cmd_44_1():
