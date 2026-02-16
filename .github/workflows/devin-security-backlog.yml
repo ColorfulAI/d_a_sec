@@ -1041,17 +1041,25 @@ jobs:
       - name: Summary
         if: always()
         run: |
+          BATCH_COUNT="${{ steps.batch-alerts.outputs.batch_count }}"
+          BATCH_COUNT="${BATCH_COUNT:-0}"
+
           echo "## Devin Security Backlog Sweep" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total alerts on main**: ${{ steps.fetch-alerts.outputs.total_alerts }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Batches created**: ${{ steps.batch-alerts.outputs.batch_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Alerts attempted (pending PR merge)**: ${{ steps.orchestrate.outputs.attempted_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total alerts on main**: ${{ steps.fetch-alerts.outputs.total_alerts || '0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Batches created**: $BATCH_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$BATCH_COUNT" = "0" ]; then
+            echo "- **Result**: No new alerts to process (all already attempted/processed/unfixable)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Alerts attempted (pending PR merge)**: ${{ steps.orchestrate.outputs.attempted_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count || '0' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time || '0' }}s" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
 
           # Bug #28 fix: Include PR URLs in step summary so enterprise teams
           # can start reviewing immediately from the Actions UI.
