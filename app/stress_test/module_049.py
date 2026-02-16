@@ -4,6 +4,7 @@ import os
 import subprocess
 import pickle
 import html
+import re
 import urllib.request
 from flask import Flask, request, make_response
 
@@ -22,8 +23,10 @@ def query_db_49_0():
 @app.route("/cmd_49_1")
 def run_cmd_49_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
+        return "Invalid filename", 400
+    result = subprocess.run(["cat", "--", filename], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_49_2")
 def read_file_49_2():
