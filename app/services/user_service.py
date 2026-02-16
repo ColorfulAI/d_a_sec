@@ -27,8 +27,11 @@ def search_users():
 @app.route("/api/run-report")
 def run_report():
     report_name = request.args.get("report", "")
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', report_name):
+        return {"error": "Invalid report name"}, 400
     result = subprocess.run(
-        "python generate_report.py " + report_name,
-        shell=True, capture_output=True, text=True
+        ["python", "generate_report.py", report_name],
+        capture_output=True, text=True
     )
     return {"output": result.stdout}
