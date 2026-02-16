@@ -82,5 +82,15 @@ def search_40_8():
 @app.route("/calc_40_9")
 def calculate_40_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    import ast
+    allowed = re.compile(r'^[0-9+\-*/()._ ]+$')
+    if not allowed.match(expr):
+        return "Invalid expression", 400
+    tree = ast.parse(expr, mode='eval')
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num,
+                                 ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+                                 ast.USub, ast.Constant)):
+            return "Invalid expression", 400
+    result = eval(compile(tree, filename="<calc>", mode='eval'))
     return str(result)
