@@ -1664,6 +1664,28 @@ Sessions go `blocked` when Devin completes its work and sends a final message wi
 
 ---
 
+### Bug #51: Orchestrator Dispatches Child on Session Creation Failure Instead of Re-Queuing
+
+**Problem discovered**: After Bug #49 added retry logic to `create_devin_session()`, a successful retry path was covered. But when ALL retries were exhausted (e.g., persistent rate limiting), `create_and_dispatch()` still dispatched the child workflow without a session. The child would then try to create its own session via `POST /v1/sessions` — and also hit 429. The batch would end up as a failed child run, never retried.
+
+**Impact**: During sustained rate limiting (e.g., 5 long-running sessions), the orchestrator would waste child workflow runs on batches that can't get sessions. Each failed child costs ~5 min of GitHub Actions compute (setup + 3 retries × 60s). For a 34-batch backlog with 29 batches waiting, this could waste ~145 min of compute on doomed runs.
+
+**Root cause**: `create_and_dispatch()` treated session creation failure as "dispatch in standalone mode" rather than "wait and retry later." The standalone fallback made sense when the orchestrator had no retry logic (pre-Bug #49), but after Bug #49 adds 3 retries with ~3.5 min total wait, exhausting all retries means the rate limit is genuinely persistent and the child would fail too.
+
+**Fix**: If `create_devin_session()` returns `(None, None)` after all retries, `create_and_dispatch()` now returns `False` immediately (without dispatching). The caller puts the batch back in the pending queue. The orchestrator loop will try again on the next poll when a child completes and frees a slot.
+
+---
+
+### Bug #52: `check_child_status()` Returns Inconsistent Types
+
+**Problem discovered**: The `check_child_status()` function returned a bare string `"unknown"` on API failure but a tuple `(status, conclusion)` on success. The caller had to use `isinstance(status_tuple, tuple)` to handle both cases — fragile code that could break silently if the function was modified without updating the caller.
+
+**Impact**: Not a runtime bug (the `isinstance()` check worked), but a maintenance hazard. Any future modification to `check_child_status()` or its caller could introduce a subtle unpacking error. In a production system with 50+ bugs fixed across multiple sessions, code clarity matters for long-term maintainability.
+
+**Fix**: Changed `check_child_status()` to always return a tuple `("unknown", None)` on API failure. Simplified the caller to `run_status, conclusion = check_child_status(run_id_val)` — no more `isinstance()` branching.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
