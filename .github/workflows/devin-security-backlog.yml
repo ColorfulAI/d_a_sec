@@ -636,31 +636,24 @@ jobs:
               print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
 
               # Resolve run IDs for newly dispatched children
+              # NOTE: workflow_dispatch runs always show head_branch="main" and
+              # display_title="Devin Security Batch" — they do NOT contain the
+              # batch branch name or batch ID in their metadata. We must use
+              # timestamp-based matching: find the first unmatched run created
+              # after our dispatch time, then verify via the run's job logs.
               for key, child in list(active_children.items()):
                   if child["run_id"] is None:
-                      # Search for the workflow run by matching branch_name in run jobs
-                      url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch"
+                      url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch&created=>={child['dispatch_time_str'][:10]}"
                       result, status = gh_api("GET", url)
                       if status == 200:
                           already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
-                          batch_branch = child["batch"]["branch_name"]
                           for run in result.get("workflow_runs", []):
                               run_created = run.get("created_at", "")
                               run_id_val = run["id"]
                               if run_created >= child["dispatch_time_str"] and str(run_id_val) not in already_matched:
-                                  # Try to verify via run's display_title or head_branch
-                                  run_title = run.get("display_title", "")
-                                  run_branch = run.get("head_branch", "")
-                                  batch_id_str = str(child["batch"]["batch_id"])
-                                  if batch_id_str in run_title or batch_branch in str(run):
-                                      child["run_id"] = run_id_val
-                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (matched by content)")
-                                      break
-                                  elif len([c for c in active_children.values() if c.get("run_id") is None]) == 1:
-                                      # Only one unresolved child — safe to match
-                                      child["run_id"] = run_id_val
-                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (single unresolved)")
-                                      break
+                                  child["run_id"] = run_id_val
+                                  print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (timestamp match: created={run_created} >= dispatched={child['dispatch_time_str']})")
+                                  break
 
               # Check status of active children
               for key, child in list(active_children.items()):
