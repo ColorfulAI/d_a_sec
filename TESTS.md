@@ -1316,6 +1316,137 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 
 **Worry**: CodeQL CLI installation may fail in Devin's environment (network restrictions, disk space, architecture mismatch). The `security-and-quality` query suite may not be available in the downloaded CodeQL bundle (requires `--download` flag which fetches from GitHub). If CodeQL takes too long (>5 min per database creation), Devin may time out or skip verification to save ACU budget. The SARIF parsing command assumes a specific JSON structure that may change between CodeQL versions.
 
+### TC-BL-CODEQL-1: Post-Session CodeQL Verification Gate Catches Remaining Alerts
+
+**Type**: End-to-end — validates the post-session CodeQL verification gate (Bug #42 Layer 2)
+
+**Why we test this**: Devin's internal CodeQL check (Layer 1) is "best effort" — Devin may skip it, misconfigure it, or run it with wrong settings. The post-session verification gate (Layer 2) runs deterministically in the pipeline with the EXACT same config as CI. This test validates that Layer 2 catches cases where Devin's fix doesn't actually resolve the target alert.
+
+**Setup**:
+1. Trigger the orchestrator with `reset_cursor=true`, `max_batches=1`
+2. Wait for the batch workflow to complete (Devin session finishes, Step 3b runs)
+3. Check the Step 3b logs for CodeQL verification output
+
+**Expected**:
+1. Step 3b logs show: "Config source: .github/workflows/codeql.yml"
+2. Step 3b logs show dynamically parsed languages, query suite, threat models
+3. Step 3b logs show CodeQL CLI download, database creation, and analysis
+4. Step 3b logs show "=== CodeQL Verification Results ===" with counts
+5. If all fixes are clean: `verified=pass`, PR gets `codeql-verified` label
+6. If any fix introduced new alerts: `verified=fail`, PR gets `codeql-verification-failed` label
+7. PR body includes "### CodeQL Verification: PASSED" or "### CodeQL Verification: FAILED" section
+
+**Validates**: Bug #42 — The pipeline now has a deterministic verification gate that uses the repo's exact CodeQL config, catching issues that Devin's internal check might miss.
+
+**Production scenario**: Enterprise security team requires all fix PRs to pass CI before merge. The `codeql-verified` label gives reviewers confidence. The `codeql-verification-failed` label flags PRs that need manual review. No "pretend fixes" ever reach the review queue.
+
+**Worry**: CodeQL CLI download fails (network, disk space), database creation fails (unsupported language features), SARIF parsing fails (format changes). The `|| true` fallback means verification errors result in `verified=error`, not a blocked PR — but this means a broken verification gate is silently bypassed.
+
+---
+
+### TC-BL-CODEQL-2: Post-Session Verification Catches NEW Alerts Introduced by Fix
+
+**Type**: Regression — validates that fixes introducing new CodeQL alerts are caught
+
+**Why we test this**: PR #159 showed that Devin added an unused import while fixing a security alert. The internal check only looked for the specific rule_id, so it missed the new `py/unused-import` alert. The post-session gate now checks ALL alerts in modified files.
+
+**Setup**:
+1. Seed main with a security alert (e.g., `py/sql-injection` in `user_service.py`)
+2. Trigger orchestrator. Devin fixes the SQL injection but adds an unused import
+3. Post-session verification runs on Devin's branch
+
+**Expected**:
+1. Step 3b SARIF parsing detects the new `py/unused-import` alert in `user_service.py`
+2. `verified=fail`, `new_alerts=1`, `remaining_alerts=0`
+3. PR body shows "### CodeQL Verification: FAILED" with "New alerts introduced by fixes: 1"
+4. PR gets `codeql-verification-failed` label
+5. PR is still created (work isn't lost) but flagged for review
+
+**Validates**: The specific failure mode from PR #159 — new alerts introduced by a fix.
+
+**Production scenario**: A fix for command injection adds `import subprocess` which CodeQL flags as unused. Without the verification gate, the PR fails CI and the team sees a red check mark on an "automated security fix" — embarrassing and trust-destroying.
+
+**Worry**: SARIF file path formats might not match between `batch_details.json` and CodeQL output (e.g., `app/foo.py` vs `./app/foo.py`). If paths don't match, the "new alerts in modified files" check won't find matches and will incorrectly report `pass`.
+
+---
+
+### TC-BL-CODEQL-3: Dynamic CodeQL Config Parsing — Portability
+
+**Type**: Unit — validates that Step 0 correctly parses different CodeQL workflow configurations
+
+**Why we test this**: The workflow must work on any repo, not just this one. Step 0 parses the repo's `codeql.yml` to extract config values. If the parsing fails or returns wrong values, both the Devin prompt and verification gate use incorrect settings.
+
+**Setup**:
+1. Examine Step 0 logs from any batch workflow run
+2. Verify the parsed values match the actual `codeql.yml` configuration
+
+**Expected**:
+1. Step 0 output: `Found CodeQL workflow: .github/workflows/codeql.yml`
+2. Languages: `actions,python` (sorted alphabetically)
+3. Query suite: `security-and-quality`
+4. Threat models: `local,remote` (sorted alphabetically)
+5. These values appear in the Devin prompt (Step 2 logs)
+6. These values appear in the verification gate (Step 3b logs)
+
+**Validates**: Dynamic config parsing — the workflow reads the repo's actual CodeQL config instead of hardcoding values.
+
+**Production scenario**: A client deploys this workflow on a JavaScript/TypeScript repo with `default` query suite and `remote`-only threat model. Without dynamic parsing, the workflow would try to run Python CodeQL on a JS repo — instant failure. With dynamic parsing, it correctly uses `javascript`, `default`, and `remote`.
+
+**Worry**: YAML parsing edge cases — nested config blocks, multi-line strings, template variables (`${{ matrix.language }}`). If the parser crashes, the fallback defaults may not match the repo's actual config, causing silent verification mismatches.
+
+---
+
+### TC-BL-CODEQL-4: Verification Gate Labels — codeql-verified vs codeql-verification-failed
+
+**Type**: Integration — validates that PRs get correct labels based on verification results
+
+**Why we test this**: Labels provide at-a-glance status for reviewers. The `codeql-verified` label means "this PR's fixes were independently verified by our pipeline." The `codeql-verification-failed` label means "review carefully — something didn't pass." Wrong labels destroy trust.
+
+**Setup**:
+1. Trigger orchestrator, wait for batch to complete
+2. Check the created PR for labels
+
+**Expected**:
+1. If verification passed: PR has `codeql-verified` label (green)
+2. If verification failed: PR has `codeql-verification-failed` label (red)
+3. Label is created automatically if it doesn't exist (no 404 errors)
+4. Label creation is idempotent (no 422 errors on repeat runs)
+
+**Validates**: Label-based status reporting for enterprise review workflows.
+
+**Production scenario**: Security team configures branch protection to require `codeql-verified` label before merge. PRs that fail verification are automatically blocked from merge until manually reviewed.
+
+**Worry**: Label creation API returns 422 if label already exists. The workflow checks for existence first (GET before POST), but race conditions between concurrent batch workflows could cause duplicate creation attempts.
+
+---
+
+### TC-BL-CODEQL-5: No Pretend Fixes — Broken Fix Never Creates Clean-Looking PR
+
+**Type**: End-to-end — validates the core "no pretend fixes" requirement
+
+**Why we test this**: This is the fundamental requirement. A fix that doesn't actually resolve the CodeQL alert must NEVER result in a PR that appears clean. The verification gate must catch it and flag it.
+
+**Setup**:
+1. Seed main with a complex vulnerability that is hard to fix correctly (e.g., taint flow through multiple files)
+2. Trigger orchestrator
+3. Devin attempts fix but introduces a new issue or doesn't fully resolve the original
+4. Observe PR creation and verification results
+
+**Expected**:
+1. Post-session verification detects remaining or new alerts
+2. PR is created but with `codeql-verification-failed` label
+3. PR body explicitly states "CodeQL Verification: FAILED" with details
+4. No reviewer can accidentally mistake this for a clean fix
+5. The PR's CodeQL CI check will also fail (double confirmation)
+
+**Validates**: DESIGN.md requirement — "A fix PR must never introduce new CodeQL alerts or leave existing alerts unresolved."
+
+**Production scenario**: An automated fix for SQL injection in a complex ORM layer partially resolves the issue but introduces a new taint flow. Without the verification gate, the PR looks like a valid security fix. A reviewer approves and merges it, introducing a NEW vulnerability while "fixing" an old one. With the gate, the PR is clearly flagged and the reviewer knows to inspect carefully.
+
+**Worry**: If the verification gate itself is broken (CodeQL CLI fails to download, SARIF parsing crashes), the `|| true` fallback means `verified=error` which is treated as "not run" — and the PR is created without any label. This silent failure mode is the most dangerous: the gate exists but doesn't actually gate anything.
+
+---
+
 ### TC-BL-REG-36: Escalating Unblock Messages Differentiate Early vs Late Attempts (Bug #41)
 
 **Type**: Behavioral — validates that unblock message content escalates appropriately
