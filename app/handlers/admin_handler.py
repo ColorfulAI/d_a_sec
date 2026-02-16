@@ -18,11 +18,13 @@ def execute_command():
 @app.route("/admin/logs")
 def view_logs():
     log_file = request.args.get("file", "app.log")
-    result = subprocess.check_output(
-        ["cat", log_file],
-        text=True
-    )
-    response = make_response(result)
+    log_dir = os.path.abspath("logs")
+    resolved = os.path.abspath(os.path.join(log_dir, log_file))
+    if not resolved.startswith(log_dir):
+        return {"error": "Invalid log file path"}, 400
+    with open(resolved, "r") as f:
+        result = f.read()
+    response = make_response(str(escape(result)))
     response.headers["Content-Type"] = "text/html"
     return response
 
@@ -31,4 +33,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return jsonify({"status": "updated", "key": key})
