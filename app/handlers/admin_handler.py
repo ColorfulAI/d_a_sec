@@ -1,6 +1,7 @@
 import os
 import subprocess
 from flask import request, Flask, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -30,4 +31,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return {"status": "updated", "key": str(escape(key))}
