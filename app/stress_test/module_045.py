@@ -26,8 +26,12 @@ def run_cmd_45_1():
 @app.route("/read_45_2")
 def read_file_45_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_dir = os.path.abspath("/var/data")
+    full_path = os.path.realpath(os.path.join(safe_dir, os.path.basename(path)))
+    if not full_path.startswith(safe_dir):
+        return Response("Forbidden", status=403, content_type="text/plain")
+    with open(full_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_45_3")
 def render_page_45_3():
