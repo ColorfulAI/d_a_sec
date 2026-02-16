@@ -1109,6 +1109,27 @@ The split can be implemented incrementally:
 
 **Why these matter in production**: At Fortune 500 scale with dozens of concurrent batch workflows, any unhandled Devin session status is a ticking time bomb. The Devin API may return `suspended`, `paused`, or other statuses not in our original design. Defensive parsing (validate JSON before jq) prevents cascading failures from API transients.
 
+### Bug #8: Partial-File Batching Causes CodeQL PR Failures
+
+**Discovered**: During iteration 2. PRs #111 and #112 (created by the batch workflow) both fail the CodeQL PR check despite Devin successfully fixing the targeted alerts.
+
+**Root cause**: The original batching algorithm split a file's alerts across batches. For example, `user_service.py` had 10 open alerts (3 XSS, 2 SQL injection, 1 command injection, etc.). The orchestrator put only 3 XSS alerts into Batch 1. When Devin fixed those 3 and created a PR, the PR modified `user_service.py`. The CodeQL PR check then scanned the modified file and reported the remaining 7 unfixed alerts as "new alerts in code changed by this pull request" — causing the PR to fail.
+
+**Timeline**:
+1. Batch 1 receives alerts #218, #219, #220 (all `py/reflective-xss` in `user_service.py` and `template_engine.py`)
+2. Devin fixes all 3 alerts, verifies internally with CodeQL CLI that those specific alerts are resolved ✅
+3. PR #112 is created, modifying `user_service.py` and `template_engine.py`
+4. CodeQL PR check runs on the modified files → finds 7 OTHER alerts (#201, #205, #206, #212, #213, #216, #217) that were not in this batch
+5. PR check reports "1 critical, 2 medium" failures → PR appears broken ❌
+
+**Why this is critical in production**: An enterprise security team sees a batch fix PR that "fails CodeQL." This destroys trust in the automated pipeline immediately. The PR actually did fix its targeted alerts, but the presentation is misleading. Every batch PR that touches a file with unfixed alerts will appear broken.
+
+**Solution**: Never split a file's alerts across batches. When a file is included in a batch, ALL of that file's open alerts must go into the same batch. This way, after Devin fixes all alerts in a file, the PR touches only fully-cleaned files and CodeQL passes. If a file has more alerts than the batch cap, that file gets its own batch (the cap is a soft limit, not a hard split boundary).
+
+**Before** (broken): Batch 1 gets 3 of 10 alerts in `user_service.py` → PR modifies file → CodeQL finds remaining 7 → FAIL
+
+**After** (fixed): Batch 1 gets ALL 10 alerts in `user_service.py` → PR modifies file → CodeQL finds 0 remaining → PASS
+
 ---
 
 ## Limitations and Future Work
