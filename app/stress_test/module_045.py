@@ -4,7 +4,7 @@ import os
 import subprocess
 import pickle
 import html
-import urllib.request
+from urllib.parse import urlparse
 from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
@@ -43,8 +43,13 @@ def render_page_45_3():
 @app.route("/fetch_45_4")
 def fetch_url_45_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
-    return resp.read()
+    ALLOWED_HOSTS = {"example.com", "api.example.com"}
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_HOSTS:
+        return Response("Forbidden", status=403, content_type="text/plain")
+    safe_url = parsed.scheme + "://" + parsed.hostname + parsed.path
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(safe_url)
+    return Response(resp.read(), content_type="text/plain")
 
 @app.route("/load_45_5")
 def load_data_45_5():
