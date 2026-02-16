@@ -544,6 +544,13 @@ jobs:
                   print(f"  Warning: Could not check active sessions: {e}")
                   return 0
 
+          # Shared headers for direct urllib requests (artifact download, etc.)
+          # gh_api() has its own internal headers, but artifact download uses urllib directly.
+          headers = {
+              "Authorization": f"token {gh_pat}",
+              "Accept": "application/vnd.github+json"
+          }
+
           dispatch_ref = os.environ.get("DISPATCH_REF", "main")
 
           def dispatch_child(batch):
@@ -765,9 +772,10 @@ jobs:
                       del active_children[key]
 
                       # Backfill: dispatch next pending batch
-                      if pending_batches:
-                          active_sessions = check_active_devin_sessions()
-                          if active_sessions < max_concurrent:
+                      # NOTE (Bug #14/#17 fix): Use child-count concurrency, not Devin session count.
+                      # check_active_devin_sessions() includes ALL sessions on the account,
+                      # which blocks backfill when external sessions are present.
+                      if pending_batches and len(active_children) < max_concurrent:
                               next_batch = pending_batches.pop(0)
                               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                               print(f"  Backfill: Dispatching Batch {next_batch['batch_id']}...")
