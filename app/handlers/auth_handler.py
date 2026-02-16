@@ -11,8 +11,7 @@ def login():
     password = request.form.get("password", "")
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
-    query = f"SELECT * FROM users WHERE username = '{username}'"
-    cursor.execute(query)
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = cursor.fetchone()
     if user and not check_password_hash(user[2], password):
         user = None
@@ -34,7 +33,8 @@ def reset_password():
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET password_hash = '" + hashed + "' WHERE email = '" + email + "'"
+        "UPDATE users SET password_hash = ? WHERE email = ?",
+        (hashed, email)
     )
     conn.commit()
     conn.close()
