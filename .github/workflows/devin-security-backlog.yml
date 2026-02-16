@@ -465,9 +465,15 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
           ISSUE_NUM: ${{ steps.tracking-issue.outputs.issue_number }}
           CURSOR_COMMENT_ID: ${{ steps.read-cursor.outputs.cursor_comment_id }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python3 << 'ORCHESTRATE_EOF'
-          import json, os, time, urllib.request, urllib.error
+          import json, os, sys, time, urllib.request, urllib.error
+
+          # Force unbuffered stdout so logs appear in real-time (Bug #11 fix)
+          sys.stdout.reconfigure(line_buffering=True)
+
+          HTTP_TIMEOUT = 30  # seconds — prevent hanging on slow API responses (Bug #12 fix)
 
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           gh_pat = os.environ["GH_PAT"]
@@ -510,7 +516,7 @@ jobs:
                   method=method
               )
               try:
-                  resp = urllib.request.urlopen(req)
+                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
                   return json.loads(resp.read()), resp.status
               except urllib.error.HTTPError as e:
                   body = e.read().decode()[:500]
@@ -524,10 +530,12 @@ jobs:
                       "https://api.devin.ai/v1/sessions?status_in=running,started",
                       headers={"Authorization": f"Bearer {devin_key}"}
                   )
-                  resp = urllib.request.urlopen(req)
+                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
                   data = json.loads(resp.read())
                   sessions = data.get("sessions", [])
-                  return len(sessions)
+                  count = len(sessions)
+                  print(f"  Active Devin sessions: {count}")
+                  return count
               except Exception as e:
                   print(f"  Warning: Could not check active sessions: {e}")
                   return 0
@@ -690,7 +698,7 @@ jobs:
                               run_id_val = child["run_id"]
                               artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}/artifacts"
                               req = urllib.request.Request(artifacts_url, headers=headers)
-                              with urllib.request.urlopen(req) as resp:
+                              with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                                   artifacts = json.loads(resp.read())
                               for artifact in artifacts.get("artifacts", []):
                                   if artifact["name"].startswith(f"batch-{batch['batch_id']}-"):
@@ -698,7 +706,7 @@ jobs:
                                       # Download and parse the artifact
                                       dl_url = artifact["archive_download_url"]
                                       req2 = urllib.request.Request(dl_url, headers=headers)
-                                      with urllib.request.urlopen(req2) as resp2:
+                                      with urllib.request.urlopen(req2, timeout=HTTP_TIMEOUT) as resp2:
                                           import zipfile, io
                                           z = zipfile.ZipFile(io.BytesIO(resp2.read()))
                                           for name in z.namelist():
