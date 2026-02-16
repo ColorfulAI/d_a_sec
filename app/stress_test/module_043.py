@@ -4,9 +4,12 @@ import os
 import subprocess
 import pickle
 import urllib.request
+import re
 from flask import Flask, request, make_response, jsonify
 
 app = Flask(__name__)
+
+SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 @app.route("/query_43_0")
 def query_db_43_0():
@@ -19,7 +22,11 @@ def query_db_43_0():
 @app.route("/cmd_43_1")
 def run_cmd_43_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, filename))
+    if not safe_path.startswith(SAFE_BASE_DIR + os.sep):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        f.read()
     return "done"
 
 @app.route("/read_43_2")
