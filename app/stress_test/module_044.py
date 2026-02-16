@@ -88,5 +88,16 @@ def search_44_8():
 @app.route("/calc_44_9")
 def calculate_44_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    import ast
+    try:
+        tree = ast.parse(expr, mode="eval")
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                                     ast.Constant, ast.Add, ast.Sub,
+                                     ast.Mult, ast.Div, ast.Mod, ast.Pow,
+                                     ast.USub, ast.UAdd)):
+                return "Invalid expression", 400
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
