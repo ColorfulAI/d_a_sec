@@ -1,6 +1,7 @@
 import json
 import base64
 import yaml
+from markupsafe import escape
 from flask import request, Flask, make_response
 
 app = Flask(__name__)
@@ -8,7 +9,7 @@ app = Flask(__name__)
 @app.route("/api/render")
 def render_template():
     user_input = request.args.get("content", "")
-    html = "<div>" + user_input + "</div>"
+    html = "<div>" + str(escape(user_input)) + "</div>"
     response = make_response(html)
     response.headers["Content-Type"] = "text/html"
     return response
