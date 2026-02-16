@@ -847,6 +847,8 @@ jobs:
                           batch_unfixable = []
                           batch_fixed = []
                           batch_attempted = []
+                          batch_pr_url = ""
+                          artifact_fetched = False
                           try:
                               run_id_val = child["run_id"]
                               artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}/artifacts"
@@ -866,14 +868,16 @@ jobs:
                                               batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
                                               batch_attempted = [int(x) for x in result_data.get("attempted_alert_ids", [])]
                                               batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
-                                              print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}")
+                                              batch_pr_url = result_data.get("pr_url", "")
+                                              artifact_fetched = True
+                                              print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}, PR: {batch_pr_url or 'none'}")
                                       z.close()
                           except Exception as e:
                               print(f"    Could not fetch batch result artifact: {e}")
-                              print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as processed")
+                              print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as attempted (not processed — status unknown)")
 
                           # Update cursor with three-state classification (Bug #18 fix)
-                          if batch_fixed or batch_attempted or batch_unfixable:
+                          if artifact_fetched and (batch_fixed or batch_attempted or batch_unfixable):
                               for aid in batch_fixed:
                                   if aid not in cursor["processed_alert_ids"]:
                                       cursor["processed_alert_ids"].append(aid)
@@ -887,11 +891,18 @@ jobs:
                               cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                               cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
                           else:
-                              # Fallback: no artifact data, mark all as processed
+                              # Bug #24 fix: mark as attempted (not processed) when artifact is missing.
+                              # "processed" implies confirmed fixed. Without artifact data, we don't know
+                              # if the fix worked. Mark as attempted so the next run re-verifies.
                               for aid in batch["alert_ids"]:
-                                  if aid not in cursor["processed_alert_ids"]:
-                                      cursor["processed_alert_ids"].append(aid)
+                                  if aid not in cursor.get("attempted_alert_ids", []):
+                                      cursor.setdefault("attempted_alert_ids", []).append(aid)
+                              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                           cursor["total_processed"] = len(cursor["processed_alert_ids"])
+
+                          # Track batch PR URL for summary reporting (Bug #25 fix)
+                          if batch_pr_url:
+                              batch["pr_url"] = batch_pr_url
                       else:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
                           failed_batches.append({**batch, "conclusion": conclusion})
@@ -964,6 +975,11 @@ jobs:
               print(f"  Attempted alert IDs: {attempted_ids}")
           if unfixable_ids:
               print(f"  Unfixable alert IDs: {unfixable_ids}")
+          batch_prs = [b.get("pr_url") for b in completed_batches if b.get("pr_url")]
+          if batch_prs:
+              print(f"  PRs created:")
+              for pr in batch_prs:
+                  print(f"    - {pr}")
 
           # Write summary for GitHub Actions
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
