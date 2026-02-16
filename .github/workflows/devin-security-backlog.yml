@@ -636,20 +636,34 @@ jobs:
               "Accept": "application/vnd.github+json"
           }
 
-          # Bug #20 fix: GitHub artifact download URLs return 302 redirects to
-          # Azure Blob Storage. urllib follows redirects and sends the GitHub
-          # Authorization header to Azure, which causes a 403. We must strip
-          # the auth header on redirect.
-          class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers_resp, newurl):
-                  new_req = urllib.request.Request(newurl)
-                  # Copy headers EXCEPT Authorization
-                  for key, val in req.header_items():
-                      if key.lower() != "authorization":
-                          new_req.add_header(key, val)
-                  return new_req
-
-          no_auth_opener = urllib.request.build_opener(NoAuthRedirectHandler)
+          # Bug #20/#21 fix: GitHub artifact download URLs return 302 redirects
+          # to Azure Blob Storage. urllib forwards the Authorization header to
+          # Azure, causing 403 (bug #20). Custom redirect handler caused 400
+          # (bug #21). Solution: use curl which natively strips auth headers
+          # on cross-domain redirects (since curl 7.58+).
+          def download_artifact_zip(url, gh_token):
+              """Download artifact zip using curl (handles auth-stripping on redirect)."""
+              import subprocess, tempfile
+              tmp_path = tempfile.mktemp(suffix=".zip")
+              result = subprocess.run(
+                  ["curl", "-sL",
+                   "-H", f"Authorization: token {gh_token}",
+                   "-H", "Accept: application/vnd.github+json",
+                   "-o", tmp_path,
+                   "-w", "%{http_code}",
+                   url],
+                  capture_output=True, text=True, timeout=60
+              )
+              http_code = result.stdout.strip()
+              if http_code == "200" and os.path.exists(tmp_path):
+                  with open(tmp_path, "rb") as f:
+                      data = f.read()
+                  os.unlink(tmp_path)
+                  return data
+              else:
+                  if os.path.exists(tmp_path):
+                      os.unlink(tmp_path)
+                  raise Exception(f"curl returned HTTP {http_code}: {result.stderr[:200]}")
 
           dispatch_ref = os.environ.get("DISPATCH_REF", "main")
 
@@ -834,18 +848,17 @@ jobs:
                                   if artifact["name"].startswith(f"batch-{batch['batch_id']}-"):
                                       print(f"    Found result artifact: {artifact['name']}")
                                       dl_url = artifact["archive_download_url"]
-                                      req2 = urllib.request.Request(dl_url, headers=headers)
-                                      with no_auth_opener.open(req2, timeout=HTTP_TIMEOUT) as resp2:
-                                          import zipfile, io
-                                          z = zipfile.ZipFile(io.BytesIO(resp2.read()))
-                                          for name in z.namelist():
-                                              if name.endswith(".json"):
-                                                  result_data = json.loads(z.read(name))
-                                                  batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
-                                                  batch_attempted = [int(x) for x in result_data.get("attempted_alert_ids", [])]
-                                                  batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
-                                                  print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}")
-                                          z.close()
+                                      import zipfile, io
+                                      zip_data = download_artifact_zip(dl_url, gh_pat)
+                                      z = zipfile.ZipFile(io.BytesIO(zip_data))
+                                      for name in z.namelist():
+                                          if name.endswith(".json"):
+                                              result_data = json.loads(z.read(name))
+                                              batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
+                                              batch_attempted = [int(x) for x in result_data.get("attempted_alert_ids", [])]
+                                              batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
+                                              print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}")
+                                      z.close()
                           except Exception as e:
                               print(f"    Could not fetch batch result artifact: {e}")
                               print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as processed")
