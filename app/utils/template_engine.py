@@ -1,5 +1,5 @@
 from flask import request, Flask, make_response
-import pickle
+import json as json_module
 import base64
 import yaml
 
@@ -17,7 +17,7 @@ def render_template():
 def deserialize_data():
     encoded = request.form.get("data", "")
     decoded = base64.b64decode(encoded)
-    obj = pickle.loads(decoded)
+    obj = json_module.loads(decoded)
     return {"result": str(obj)}
 
 @app.route("/api/parse-config", methods=["POST"])
