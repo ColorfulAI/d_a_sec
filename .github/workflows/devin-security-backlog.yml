@@ -636,6 +636,21 @@ jobs:
               "Accept": "application/vnd.github+json"
           }
 
+          # Bug #20 fix: GitHub artifact download URLs return 302 redirects to
+          # Azure Blob Storage. urllib follows redirects and sends the GitHub
+          # Authorization header to Azure, which causes a 403. We must strip
+          # the auth header on redirect.
+          class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers_resp, newurl):
+                  new_req = urllib.request.Request(newurl)
+                  # Copy headers EXCEPT Authorization
+                  for key, val in req.header_items():
+                      if key.lower() != "authorization":
+                          new_req.add_header(key, val)
+                  return new_req
+
+          no_auth_opener = urllib.request.build_opener(NoAuthRedirectHandler)
+
           dispatch_ref = os.environ.get("DISPATCH_REF", "main")
 
           def dispatch_child(batch):
@@ -820,7 +835,7 @@ jobs:
                                       print(f"    Found result artifact: {artifact['name']}")
                                       dl_url = artifact["archive_download_url"]
                                       req2 = urllib.request.Request(dl_url, headers=headers)
-                                      with urllib.request.urlopen(req2, timeout=HTTP_TIMEOUT) as resp2:
+                                      with no_auth_opener.open(req2, timeout=HTTP_TIMEOUT) as resp2:
                                           import zipfile, io
                                           z = zipfile.ZipFile(io.BytesIO(resp2.read()))
                                           for name in z.namelist():
