@@ -5,6 +5,7 @@ import subprocess
 import json
 import urllib.request
 import re
+import ast
 from flask import Flask, request, make_response, jsonify
 from markupsafe import escape
 
@@ -92,5 +93,7 @@ def search_43_8():
 @app.route("/calc_43_9")
 def calculate_43_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    if not re.match(r'^[0-9+\-*/().\s]+$', expr):
+        return "Invalid expression", 400
+    result = ast.literal_eval(expr)
     return str(result)
