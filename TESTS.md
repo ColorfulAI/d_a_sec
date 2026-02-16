@@ -1695,3 +1695,53 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #50 fix — verification gate condition expanded to all terminal states.
 
 **Production scenario**: A Devin session hits its ACU limit (suspended) after fixing 8 of 15 alerts. It managed to push the branch with 8 commits before suspension. Without Bug #50 fix, the PR is created with "CodeQL Verification: NOT RUN" — the 8 fixes are unverified. A reviewer might merge assuming the fixes are correct, but one of them introduced a new alert. With the fix, verification catches this before the PR enters the review queue.
+
+---
+
+### TC-BL-BATCH-12: Failed Session Creation Re-Queues Batch (Bug #51)
+
+**Type**: Resilience — validates orchestrator re-queues batch instead of dispatching doomed child
+
+**Why we test this**: After Bug #49 added retry logic (3 attempts with backoff), the orchestrator waits ~3.5 min before giving up on session creation. But previously, after giving up, it still dispatched the child workflow without a session — and the child would also hit 429. The batch ended up as a failed child run, wasting compute and never being retried.
+
+**Setup**:
+1. Fill all 5 Devin session slots with long-running sessions
+2. Trigger orchestrator with 6+ batches (so at least 1 batch can't get a session)
+3. Wait for the orchestrator to exhaust all 3 retries on the 6th batch's session creation
+4. Observe whether the batch is re-queued or dispatched to a child
+
+**Expected**:
+1. Orchestrator logs show `Session creation failed after retries — re-queuing batch (not dispatching child)`
+2. The batch stays in `pending_batches` — NOT dispatched to a child workflow
+3. No child workflow run is created for this batch (check GitHub Actions runs)
+4. On the next poll, when a slot frees up (another child completes), the batch is retried
+5. The batch eventually gets a session and is dispatched successfully
+
+**Validates**: Bug #51 fix — `create_and_dispatch()` returns False on session failure, re-queuing the batch.
+
+**Production scenario**: A Fortune 500 company runs the backlog sweep on 500 alerts (34 batches, 7 waves). During wave 2, all 5 session slots are occupied by long-running sessions (complex multi-file fixes). The orchestrator tries to backfill batch 6 but gets 429 three times. Before Bug #51, it dispatches a child that also fails — wasting ~5 min of compute. After Bug #51, the batch waits in the queue and is dispatched when a slot naturally frees up from wave 1 completing.
+
+**Worry**: If session creation persistently fails (e.g., Devin API is down, not just rate-limited), batches accumulate in pending indefinitely. The orchestrator's safety timeout (330 min) eventually kills the run, but the batches are never processed. Need a maximum re-queue count to detect persistent API failures vs transient rate limiting.
+
+---
+
+### TC-BL-BATCH-13: check_child_status Returns Consistent Tuple (Bug #52)
+
+**Type**: Code quality — validates function always returns (status, conclusion) tuple
+
+**Why we test this**: The `check_child_status()` function previously returned a bare string `"unknown"` on API failure but a tuple `(status, conclusion)` on success. The caller used `isinstance()` to handle both. This is fragile — any modification to the function or caller could silently break unpacking.
+
+**Setup**:
+1. Trigger an orchestrator run with at least 1 batch
+2. During the poll loop, simulate a GitHub API failure (e.g., by checking logs for any API error responses)
+3. Verify the function returns a tuple even on failure
+
+**Expected**:
+1. On API success: returns `("completed", "success")` or similar tuple
+2. On API failure: returns `("unknown", None)` — NOT bare string `"unknown"`
+3. The caller uses simple tuple unpacking: `run_status, conclusion = check_child_status(run_id_val)`
+4. No `isinstance()` checks in the caller code
+
+**Validates**: Bug #52 fix — consistent return type eliminates fragile type-checking code.
+
+**Production scenario**: During a large backlog sweep, the GitHub API occasionally returns 500 errors (server-side issues). With the old code, if someone refactored the caller to remove the `isinstance()` check (not realizing it was needed), the orchestrator would crash with `ValueError: too many values to unpack`. With consistent tuple returns, this class of bug is impossible.

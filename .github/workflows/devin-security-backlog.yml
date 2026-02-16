@@ -964,10 +964,12 @@ jobs:
               return status == 204
 
           def check_child_status(run_id_val):
+              """Bug #52 fix: always return a tuple (status, conclusion) for consistency.
+              Previously returned a bare string on error, requiring isinstance() checks."""
               url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}"
               result, status = gh_api("GET", url)
               if status != 200:
-                  return "unknown"
+                  return "unknown", None
               return result.get("status", "unknown"), result.get("conclusion")
 
           def update_cursor(cursor_data):
@@ -1036,18 +1038,18 @@ jobs:
           print(f"{'='*60}\n")
 
           def create_and_dispatch(batch):
-              """Batch mode: create Devin session first, then dispatch child with session_id."""
+              """Batch mode: create Devin session first, then dispatch child with session_id.
+              Bug #51 fix: if session creation fails after all retries, do NOT dispatch
+              the child (it would also fail on 429). Return False to re-queue the batch."""
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
               print(f"[BATCH] Creating session + dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
 
               session_id, session_url = create_devin_session(batch)
               if not session_id:
-                  print(f"  Session creation failed — dispatching child without session (fallback)")
-                  session_id = None
-                  session_url = None
-              else:
-                  _counters["sessions_created"] += 1
+                  print(f"  Session creation failed after retries — re-queuing batch (not dispatching child)")
+                  return False
+              _counters["sessions_created"] += 1
 
               success = dispatch_child(batch, session_id=session_id, session_url=session_url)
 
@@ -1140,12 +1142,7 @@ jobs:
                       continue
 
                   run_id_val = child["run_id"]
-                  status_tuple = check_child_status(run_id_val)
-
-                  if isinstance(status_tuple, tuple):
-                      run_status, conclusion = status_tuple
-                  else:
-                      run_status, conclusion = status_tuple, None
+                  run_status, conclusion = check_child_status(run_id_val)
 
                   child["status"] = run_status
 
