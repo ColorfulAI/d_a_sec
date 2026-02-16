@@ -2,7 +2,7 @@ import json
 import base64
 import yaml
 from markupsafe import escape
-from flask import request, Flask, make_response
+from flask import request, Flask, jsonify, make_response
 
 app = Flask(__name__)
 
@@ -19,7 +19,7 @@ def deserialize_data():
     encoded = request.form.get("data", "")
     decoded = base64.b64decode(encoded)
     obj = json.loads(decoded)
-    return {"result": str(obj)}
+    return jsonify({"result": str(obj)})
 
 @app.route("/api/parse-config", methods=["POST"])
 def parse_config():
