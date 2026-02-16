@@ -458,14 +458,13 @@ jobs:
         if: always()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          SESSION_STATUS: ${{ steps.poll-session.outputs.status }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create-pr.outputs.pr_url }}
+          SESSION_URL: ${{ steps.create-session.outputs.session_url }}
+          SESSION_ID: ${{ steps.create-session.outputs.session_id }}
         run: |
-          REPO="${{ github.repository }}"
-          SESSION_STATUS="${{ steps.poll-session.outputs.status }}"
-          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
-          PR_URL="${{ steps.create-pr.outputs.pr_url }}"
-          SESSION_URL="${{ steps.create-session.outputs.session_url }}"
-          SESSION_ID="${{ steps.create-session.outputs.session_id }}"
-
           # Determine which specific alerts were fixed vs unfixable.
           #
           # Bug #18 fix: We cannot rely on querying CodeQL alert state on main
@@ -509,7 +508,9 @@ jobs:
               "Accept": "application/vnd.github+json"
           }
 
-          if session_status in ("finished", "stopped", "expired") and branch_name:
+          print(f"Session status: {session_status}, branch: {branch_name}")
+
+          if session_status in ("finished", "stopped", "expired", "blocked") and branch_name:
               # Step 1: Get list of files modified in the branch vs main
               modified_files = set()
               try:

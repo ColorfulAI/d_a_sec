@@ -307,6 +307,8 @@ jobs:
       - name: Filter and batch alerts
         id: batch-alerts
         if: steps.fetch-alerts.outputs.skip != 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 << 'BATCH_EOF'
           import json, os, time
