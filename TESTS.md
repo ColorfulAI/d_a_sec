@@ -1619,3 +1619,79 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #41 escalating message strategy — different urgency levels may be more effective at different points in the session's lifecycle.
 
 **Production scenario**: A session processing 15 alerts blocks at alert #3 (complex taint flow). The first "CRITICAL" unblock message helps it resume. It processes alerts #4-#8, then blocks again at alert #9 (unfamiliar framework). The "CRITICAL" message helps again (counter was reset by Bug #37 fix). It processes #10-#12, blocks at #13 (genuinely unfixable), and the "URGENT" messages with "SKIP IT" directive help it skip #13 and finish #14-#15. Without escalation, a single generic message may not convey the right urgency at each blocking point.
+
+---
+
+### TC-BL-BATCH-9: PR Body Shows Actual CodeQL Config (Not Hardcoded) (Bug #48)
+
+**Type**: Output correctness — validates PR body uses real config values
+
+**Why we test this**: The PR body previously hardcoded `security-and-quality, threat-models: remote+local` regardless of the repo's actual CodeQL configuration. Enterprise clients reviewing fix PRs need accurate metadata about what verification was performed. Incorrect config text undermines trust.
+
+**Setup**:
+1. Trigger a backlog run on a repo whose `codeql.yml` uses `security-and-quality` queries with `local,remote` threat models
+2. Let the batch complete and PR be created
+3. Inspect the PR body's "Process" section
+
+**Expected**:
+1. PR body shows `Fixes verified internally by Devin using CodeQL CLI (security-and-quality, threat-models: local,remote)` — matching the actual config
+2. The values come from the dynamic config parsing step, not hardcoded strings
+3. If a different repo uses `security-extended` with only `remote` threat model, the PR body would reflect that
+
+**Validates**: Bug #48 fix — PR body uses `${CODEQL_QUERY_SUITE}` and `${CODEQL_THREAT_MODELS}` instead of hardcoded values.
+
+**Production scenario**: A Fortune 500 company uses `security-extended` queries (broader rule coverage) with `remote` threat model only (no local source analysis). Before the fix, every fix PR would claim verification used `security-and-quality` — a different, narrower query suite. Security auditors reviewing PRs would see a config mismatch between what the PR claims and what CI actually runs, raising red flags during compliance reviews.
+
+**Worry**: If the `codeql-config` step fails or returns empty values, the PR body would show empty strings: `Fixes verified internally by Devin using CodeQL CLI (, threat-models: )`. The template should have fallback defaults.
+
+---
+
+### TC-BL-BATCH-10: Orchestrator Retries 429 Before Falling Back (Bug #49)
+
+**Type**: Resilience — validates orchestrator retries rate-limited session creation
+
+**Why we test this**: Previously, when the orchestrator hit a 429 (rate limit) from the Devin API during session creation, it immediately fell back to standalone mode — dispatching the child without a session. The child then also hit 429. The fallback was ineffective, wasting a full child workflow run.
+
+**Setup**:
+1. Fill all 5 Devin session slots (e.g., run orchestrator with max_batches=5 on a large backlog)
+2. Trigger another orchestrator run while all 5 sessions are active
+3. The new orchestrator's `create_devin_session()` should hit 429
+
+**Expected**:
+1. Orchestrator logs show `Rate limited (429) — retry 1/3 in 30s...`
+2. After 30s wait, retries. If still 429: `Rate limited (429) — retry 2/3 in 60s...`
+3. After 60s, retries again. If still 429: `Rate limited (429) — all 3 retries exhausted`
+4. Only THEN falls back to standalone mode (or returns None to delay dispatch)
+5. Total wait before fallback: ~3.5 minutes (30 + 60 + 120s)
+6. If a session slot frees up during the retry window, the retry succeeds
+
+**Validates**: Bug #49 fix — exponential backoff retry in orchestrator's session creation.
+
+**Production scenario**: A Fortune 500 company runs the backlog sweep on a 500-alert codebase. The orchestrator dispatches 5 batches (filling all session slots). When batch 1 completes and the orchestrator backfills with batch 6, the Devin API returns 429 because the session from batch 1 hasn't fully cleaned up yet. Without retry, batch 6 would be dispatched in standalone mode (also 429 → fail). With retry, the 30s wait is enough for the slot to free up, and batch 6 gets a real session.
+
+**Worry**: If the rate limit is persistent (all 5 slots genuinely occupied), the 3.5 min of retries delays the entire orchestrator poll loop. During that time, no other children's statuses are checked, no other completions are processed, and no other backfills happen. The retry logic blocks the orchestrator's main loop.
+
+---
+
+### TC-BL-BATCH-11: Verification Runs for Suspended/Expired Sessions (Bug #50)
+
+**Type**: Security gate — validates CodeQL verification runs for all session states where a branch may exist
+
+**Why we test this**: The verification gate previously only ran for `finished`, `blocked`, and `stopped` sessions. But PRs were created for those PLUS `suspended`, `suspend_requested`, `suspend_requested_frontend`, and `expired`. This meant PRs from incomplete sessions had no CodeQL verification — the exact "pretend fix" scenario the gate prevents.
+
+**Setup**:
+1. Trigger a batch workflow with a low `max_acu_limit` (e.g., 2) so the Devin session is likely to be suspended mid-work
+2. Wait for the session to reach `suspended` state
+3. Check if Devin pushed any commits to the branch before suspension
+4. Inspect the workflow logs for the verification step
+
+**Expected**:
+1. Verification step runs (not skipped) even though session status is `suspended`
+2. If branch exists: CodeQL database is created, analysis runs, SARIF results are produced
+3. If branch doesn't exist: Verification outputs `verified=skip` (graceful handling)
+4. PR body shows actual verification result (PASSED/FAILED/SKIPPED), not "NOT RUN"
+5. Labels (`codeql-verified` or `codeql-verification-failed`) are applied correctly
+
+**Validates**: Bug #50 fix — verification gate condition expanded to all terminal states.
+
+**Production scenario**: A Devin session hits its ACU limit (suspended) after fixing 8 of 15 alerts. It managed to push the branch with 8 commits before suspension. Without Bug #50 fix, the PR is created with "CodeQL Verification: NOT RUN" — the 8 fixes are unverified. A reviewer might merge assuming the fixes are correct, but one of them introduced a new alert. With the fix, verification catches this before the PR enters the review queue.

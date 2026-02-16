@@ -1632,6 +1632,38 @@ Sessions go `blocked` when Devin completes its work and sends a final message wi
 
 ---
 
+### Bug #48: PR Body Hardcodes CodeQL Configuration Text
+
+**Problem discovered**: The batch workflow's PR body template (Create PR step) contained hardcoded text: `Fixes verified internally by Devin using CodeQL CLI (security-and-quality, threat-models: remote+local)`. If the repo uses a different query suite (e.g., `security-extended`) or different threat models (e.g., `remote` only), the PR body would be misleading — claiming verification used one config while actually using another.
+
+**Impact**: Enterprise clients reviewing fix PRs would see incorrect verification metadata. If a client's repo uses `security-extended` queries but the PR says `security-and-quality`, it undermines trust in the verification process.
+
+**Fix**: Replace hardcoded strings with actual config variables (`${CODEQL_QUERY_SUITE}`, `${CODEQL_THREAT_MODELS}`). Added these env vars to the create-pr step so they're available in the PR body template.
+
+---
+
+### Bug #49: Orchestrator 429 Fallback Dispatches Child That Will Also Hit 429
+
+**Problem discovered**: When the orchestrator's `create_devin_session()` received a 429 (rate limit) from the Devin API, it immediately returned `(None, None)`. The `create_and_dispatch()` function then dispatched the child workflow without a pre-created session (standalone fallback). But the child workflow would then try to create its own session via `POST /v1/sessions` — and hit the same rate limit. The fallback was ineffective: it just moved the 429 error from orchestrator to child.
+
+**Impact**: During high-load scenarios (5+ concurrent sessions), every rate-limited batch would waste a full child workflow run (~2 min setup + 3 retries × 60s = ~5 min) before failing. For a 34-batch backlog, this could waste 30+ minutes of GitHub Actions compute on doomed child runs.
+
+**Root cause**: The orchestrator had no retry logic for 429 responses. It gave up after a single attempt and relied on the child's retry mechanism, which faces the same rate limit.
+
+**Fix**: Added exponential backoff retry (3 attempts, starting at 30s, doubling each time: 30s → 60s → 120s) in the orchestrator's `create_devin_session()`. Only falls back to standalone mode after all retries are exhausted. Total wait before fallback: ~3.5 min — enough for a session slot to free up in most cases.
+
+---
+
+### Bug #50: Verification Gate Skipped for Suspended/Expired Sessions but PR Still Created
+
+**Problem discovered**: The CodeQL verification step (`verify-codeql`) only ran for `finished`, `blocked`, or `stopped` sessions. But the PR creation step ran for those PLUS `suspended`, `suspend_requested`, `suspend_requested_frontend`, and `expired`. This meant PRs could be created from incomplete sessions without any CodeQL verification — exactly the "pretend fix" scenario the verification gate was designed to prevent.
+
+**Impact**: If a Devin session is suspended (e.g., hit ACU limit) or expired (e.g., timed out), it may have pushed partial fixes to the branch. The PR creation step would find the branch and create a PR, but the verification step wouldn't run. The PR body would show "CodeQL Verification: NOT RUN" — which is transparent but still results in an unverified PR entering the review queue. Enterprise clients would see fix PRs without verification, undermining confidence.
+
+**Fix**: Extended the verification gate's `if` condition to include all terminal states where a branch might exist: `suspended`, `suspend_requested`, `suspend_requested_frontend`, and `expired`. The verification step already handles missing branches gracefully (returns `verified=skip`), so adding these states is safe — if the branch doesn't exist, verification is skipped and the PR creation step also skips.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations

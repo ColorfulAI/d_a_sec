@@ -546,7 +546,7 @@ jobs:
       # ----------------------------------------------------------------
       - name: Verify fixes with CodeQL
         id: verify-codeql
-        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'blocked' || steps.poll-session.outputs.status == 'stopped'
+        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'blocked' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended' || steps.poll-session.outputs.status == 'suspend_requested' || steps.poll-session.outputs.status == 'suspend_requested_frontend' || steps.poll-session.outputs.status == 'expired'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           CODEQL_LANGUAGES: ${{ steps.codeql-config.outputs.languages }}
@@ -716,6 +716,8 @@ jobs:
         if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended' || steps.poll-session.outputs.status == 'suspend_requested' || steps.poll-session.outputs.status == 'suspend_requested_frontend' || steps.poll-session.outputs.status == 'expired' || steps.poll-session.outputs.status == 'blocked'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          CODEQL_QUERY_SUITE: ${{ steps.codeql-config.outputs.query_suite }}
+          CODEQL_THREAT_MODELS: ${{ steps.codeql-config.outputs.threat_models }}
         run: |
           REPO="${{ github.repository }}"
           ALERT_COUNT=$(cat /tmp/batch_details.json | jq 'length')
@@ -778,7 +780,7 @@ jobs:
 
           ### Process
           - Each alert was fixed individually with a separate commit
-          - Fixes verified internally by Devin using CodeQL CLI (security-and-quality, threat-models: remote+local)
+          - Fixes verified internally by Devin using CodeQL CLI (${CODEQL_QUERY_SUITE}, threat-models: ${CODEQL_THREAT_MODELS})
           - Post-session CodeQL verification gate run by pipeline before PR creation
           - Alerts that could not be fixed after 2 attempts were skipped
 
