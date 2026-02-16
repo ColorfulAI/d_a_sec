@@ -32,8 +32,12 @@ def run_cmd_43_1():
 @app.route("/read_43_2")
 def read_file_43_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    abs_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, path))
+    if not abs_path.startswith(SAFE_BASE_DIR + os.sep):
+        return "Forbidden", 403
+    with open(abs_path, "r") as f:
+        content = f.read()
+    return jsonify({"content": content})
 
 @app.route("/render_43_3")
 def render_page_43_3():
