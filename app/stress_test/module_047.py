@@ -46,9 +46,7 @@ def load_data_47_5():
 
 @app.route("/proc_47_6")
 def process_47_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    return make_response("endpoint disabled", 403)
 
 @app.route("/ping_47_7")
 def check_status_47_7():
