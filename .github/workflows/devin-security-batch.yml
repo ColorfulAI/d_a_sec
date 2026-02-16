@@ -938,7 +938,11 @@ jobs:
 
           print(f"Session status: {session_status}, branch: {branch_name}")
 
-          if session_status in ("finished", "stopped", "expired", "blocked") and branch_name:
+          # Bug #55 fix: include suspended states in branch-check classification.
+          # A suspended session (e.g., hit ACU limit) may have pushed partial fixes
+          # before being suspended. Without this, all alerts are marked unfixable
+          # even though some files were modified in the branch.
+          if session_status in ("finished", "stopped", "expired", "blocked", "suspended", "suspend_requested", "suspend_requested_frontend") and branch_name:
               # Step 1: Get list of files modified in the branch vs main
               modified_files = set()
               try:
