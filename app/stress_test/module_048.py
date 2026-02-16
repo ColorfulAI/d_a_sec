@@ -4,6 +4,8 @@ import os
 import subprocess
 import re
 import json
+import ast
+import operator
 import urllib.request
 import urllib.parse
 from flask import Flask, request, make_response
@@ -86,8 +88,24 @@ def search_48_8():
     cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
     return make_response(escape(str(cursor.fetchall())))
 
+def _eval_node(node):
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub,
+           ast.Mult: operator.mul, ast.Div: operator.truediv}
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in ops:
+        return ops[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
 @app.route("/calc_48_9")
 def calculate_48_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        tree = ast.parse(expr, mode='eval')
+        result = _eval_node(tree.body)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
