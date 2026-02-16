@@ -5,10 +5,29 @@ import subprocess
 import json
 import html
 import re
+import ast
+import operator
 import urllib.request
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in SAFE_OPS:
+        return SAFE_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
 
 @app.route("/query_46_0")
 def query_db_46_0():
@@ -88,5 +107,6 @@ def search_46_8():
 @app.route("/calc_46_9")
 def calculate_46_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    tree = ast.parse(expr, mode='eval')
+    result = _eval_node(tree.body)
     return str(result)
