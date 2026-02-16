@@ -9,6 +9,12 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+ALLOWED_FILES = {
+    "readme": os.path.join(os.path.abspath("data"), "readme.txt"),
+    "config": os.path.join(os.path.abspath("data"), "config.txt"),
+    "log": os.path.join(os.path.abspath("data"), "log.txt"),
+}
+
 @app.route("/query_42_0")
 def query_db_42_0():
     user_id = request.args.get("id")
@@ -25,9 +31,15 @@ def run_cmd_42_1():
 
 @app.route("/read_42_2")
 def read_file_42_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    file_path = ALLOWED_FILES.get(key)
+    if file_path is None:
+        return "File not found", 404
+    with open(file_path, "r") as f:
+        content = f.read()
+    resp = make_response(str(escape(content)))
+    resp.headers["Content-Type"] = "text/plain"
+    return resp
 
 @app.route("/render_42_3")
 def render_page_42_3():
