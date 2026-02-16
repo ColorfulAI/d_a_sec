@@ -1,6 +1,6 @@
-import hashlib
 import sqlite3
 from flask import request, Flask, redirect, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = "hardcoded-secret-key-12345"
@@ -9,13 +9,13 @@ app.secret_key = "hardcoded-secret-key-12345"
 def login():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
-    password_hash = hashlib.md5(password.encode()).hexdigest()
-
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
-    query = f"SELECT * FROM users WHERE username = '{username}' AND password_hash = '{password_hash}'"
+    query = f"SELECT * FROM users WHERE username = '{username}'"
     cursor.execute(query)
     user = cursor.fetchone()
+    if user and not check_password_hash(user[2], password):
+        user = None
     conn.close()
 
     if user:
@@ -29,7 +29,7 @@ def login():
 def reset_password():
     email = request.form.get("email", "")
     new_password = request.form.get("new_password", "")
-    hashed = hashlib.md5(new_password.encode()).hexdigest()
+    hashed = generate_password_hash(new_password)
 
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
