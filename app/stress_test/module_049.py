@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import pickle
+import html
 import urllib.request
 from flask import Flask, request, make_response
 
@@ -14,7 +15,9 @@ def query_db_49_0():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return str(cursor.fetchall())
+    resp = make_response(html.escape(str(cursor.fetchall())))
+    resp.content_type = "text/plain"
+    return resp
 
 @app.route("/cmd_49_1")
 def run_cmd_49_1():
