@@ -19,7 +19,13 @@ def query_db_44_0():
 @app.route("/cmd_44_1")
 def run_cmd_44_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_name = os.path.basename(filename)
+    base_dir = os.path.abspath("data")
+    safe_path = os.path.realpath(os.path.join(base_dir, safe_name))
+    if not safe_path.startswith(base_dir + os.sep):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        f.read()
     return "done"
 
 @app.route("/read_44_2")
