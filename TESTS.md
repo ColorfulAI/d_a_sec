@@ -1822,3 +1822,77 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: A Fortune 500 company with strict ACU budgets sets `max_acu_limit=5` per session to control costs. A batch of 15 alerts in 8 files triggers a Devin session. Devin fixes 10 alerts across 5 files before hitting the ACU limit (session suspended). Before Bug #55, all 15 alerts are marked unfixable — 10 valid fixes are lost and flagged for human review unnecessarily. After Bug #55, 10 are marked attempted and 5 are marked unfixable, correctly reflecting reality.
 
 **Worry**: If a suspended session pushed a branch but the branch is incomplete (e.g., only half a commit was pushed), the file-modification check might incorrectly classify alerts as attempted when the fix is actually broken. The CodeQL verification step should catch this (it runs for suspended sessions per Bug #50), but if verification also fails, the PR could contain partial/broken fixes.
+
+---
+
+### TC-BL-BATCH-17: Orphaned Session Prevention on Dispatch Failure (Bug #56)
+
+**Type**: Resource leak prevention — validates that re-queued batches reuse their existing Devin session instead of creating duplicates
+
+**Why we test this**: When the orchestrator creates a Devin session for a batch but the subsequent `dispatch_child()` call fails (e.g., GitHub API 500), the batch is re-queued. Without Bug #56 fix, the retry creates a SECOND Devin session — the first one is orphaned (running, consuming ACU, doing duplicate work with no child polling it). In a Fortune 500 production setting with transient API failures, this can waste significant ACU budget and hit the 5-session concurrent limit.
+
+**Setup**:
+1. Trigger the orchestrator with `max_batches=2, max_concurrent=2`
+2. Monitor logs for `create_and_dispatch()` behavior
+3. If a dispatch failure occurs naturally, verify the retry reuses the session
+4. Alternatively, inspect the code path: `create_and_dispatch()` should check `batch.get("_session_id")` before calling `create_devin_session()`
+
+**Expected**:
+1. When `create_devin_session()` succeeds, `batch["_session_id"]` is set on the batch dict
+2. If `dispatch_child()` fails and returns `False`, the batch is re-queued with `_session_id` preserved
+3. On retry, `create_and_dispatch()` detects `batch.get("_session_id")` and prints "Reusing previously created session"
+4. No duplicate Devin session is created — `_counters["sessions_created"]` does not increment on retry
+5. The reused session_id is passed to `dispatch_child()` for the retry dispatch
+
+**Validates**: Bug #56 fix — session_id persisted on batch dict across re-queues.
+
+**Production scenario**: A Fortune 500 company runs the orchestrator during a GitHub API degradation (intermittent 500s on workflow dispatch). 5 batches each create a Devin session successfully, but 3 of the 5 dispatch calls fail. Without Bug #56 fix, the retries create 3 more sessions (8 total for 5 batches), exceeding the 5-session limit and orphaning 3 sessions at 10 ACU each = 30 ACU wasted. With the fix, only 5 sessions are created total — retries reuse existing sessions.
+
+**Worry**: If the orphaned session finishes its work and pushes to the branch BEFORE the retry dispatch's child starts polling, the child might find the branch already exists and the session already finished. The child should handle this gracefully (detect existing branch, classify alerts based on branch modifications).
+
+---
+
+### TC-BL-BATCH-18: Evicted Children Update Cursor and Trigger Backfill (Bug #57)
+
+**Type**: Cursor consistency + throughput — validates that timed-out/evicted children record their alerts in the cursor and trigger immediate backfill
+
+**Why we test this**: When a child workflow exceeds `max_child_runtime` (default 3600s), it's evicted from `active_children`. Before Bug #57 fix, the eviction only added the batch to `failed_batches` and deleted it from `active_children` — it did NOT update the cursor with the evicted alerts, and did NOT trigger backfill for the freed slot. This causes two problems: (1) the next orchestrator run re-processes the same alerts (infinite retry loop across runs), (2) the freed slot sits empty until the next poll cycle's top-of-loop backfill, reducing throughput.
+
+**Setup**:
+1. Trigger the orchestrator with `max_batches=3, max_concurrent=2, max_child_runtime=120` (2 min timeout for faster testing)
+2. The short timeout should cause at least one child to be evicted if the Devin session takes longer than 2 min
+3. Monitor orchestrator logs for eviction messages and cursor updates
+
+**Expected**:
+1. When a child is evicted (`STALE` message), its alerts are added to `cursor["attempted_alert_ids"]`
+2. `update_cursor(cursor)` is called immediately after eviction (visible in tracking issue comment update)
+3. A backfill dispatch is attempted for the freed slot (`[BACKFILL]` message follows eviction)
+4. The summary output includes evicted batches in the `failed_count`
+5. The next orchestrator run (with `reset_cursor=false`) skips the evicted alerts instead of re-processing them
+
+**Validates**: Bug #57 fix — evicted children update cursor + trigger backfill.
+
+**Production scenario**: A Fortune 500 company has a batch with 15 alerts in a complex legacy codebase. The Devin session takes 90 minutes (exceeding the 60-min default `max_child_runtime`). The orchestrator evicts the batch. Without Bug #57 fix: (a) the freed slot sits empty for up to 60s until the next poll cycle, and (b) the next cron-triggered orchestrator run re-dispatches the same 15 alerts, creating another session that also times out — infinite loop. With the fix: the alerts are marked "attempted" in the cursor, the slot is immediately backfilled, and the next run skips those alerts.
+
+**Worry**: If the evicted child's Devin session actually finishes after eviction (it's still running — only the orchestrator stopped tracking it), the session might push a branch and the alerts might actually be fixed. But the cursor marks them as "attempted" (not "processed"), so the re-verification on the next run should detect them as fixed and move them to processed. The concern is whether re-verification correctly handles this race condition.
+
+---
+
+### TC-BL-BATCH-19: Stale Header Comment Accuracy (Bug #58)
+
+**Type**: Documentation correctness — validates that the orchestrator's header comments accurately describe current behavior
+
+**Why we test this**: Stale comments that describe removed features (like session reservation) mislead developers reading the code. Bug #58 identified that line 21-22 referenced "SESSION RESERVATION: Self-limits to 3 concurrent children, reserving 2 slots for PR workflows" — a design removed in Bug #14. Misleading comments in a 1400+ line workflow file can cause incorrect capacity planning and debugging confusion.
+
+**Setup**:
+1. Read the orchestrator file header (first 30 lines)
+2. Search for references to "session reservation", "reserving slots", or "PR workflow slots" in the header
+
+**Expected**:
+1. The header accurately describes child-count concurrency (not session reservation)
+2. No references to "reserving slots for PR workflows" exist in the header
+3. The header mentions `max_concurrent` as the concurrency mechanism
+
+**Validates**: Bug #58 fix — stale header comment updated to reflect current concurrency model.
+
+**Production scenario**: A new engineer joins the security team and reads the orchestrator header to understand how concurrency works. With the stale comment, they believe 2 of 5 Devin slots are reserved for PR workflows and set `max_concurrent=5` thinking only 3 will be used for backlog. In reality, all 5 slots are used for backlog batches, and if PR workflows fire simultaneously, they compete for Devin sessions.
