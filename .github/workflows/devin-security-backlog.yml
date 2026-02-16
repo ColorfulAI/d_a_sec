@@ -1042,16 +1042,7 @@ jobs:
           # Bug #28 fix: Include PR URLs in step summary so enterprise teams
           # can start reviewing immediately from the Actions UI.
           if [ -f /tmp/orchestrator_results.json ]; then
-            PR_URLS=$(python3 -c "
-import json
-try:
-    with open('/tmp/orchestrator_results.json') as f:
-        data = json.load(f)
-    prs = data.get('pr_urls', [])
-    if prs:
-        print('\\n'.join(prs))
-except: pass
-")
+            PR_URLS=$(python3 -c "import json; data=json.load(open('/tmp/orchestrator_results.json')); prs=data.get('pr_urls',[]); print('\n'.join(prs)) if prs else None" 2>/dev/null)
             if [ -n "$PR_URLS" ]; then
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "### Fix PRs Created" >> $GITHUB_STEP_SUMMARY
