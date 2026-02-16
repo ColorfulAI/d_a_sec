@@ -1,7 +1,7 @@
 import os
 import shlex
 import subprocess
-from flask import request, Flask, make_response
+from flask import request, Flask, jsonify, make_response
 
 app = Flask(__name__)
 
@@ -32,4 +32,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return jsonify({"status": "updated", "key": key})
