@@ -1503,6 +1503,36 @@ The cursor parsing step uses a Python heredoc (`python3 << 'CURSOR_PARSE_EOF'`) 
 
 **Solution (Bug #33 fix)**: Aligned the `cursor = { ... }` dict and `print(...)` to the same indentation level (4 spaces relative to the `if`), matching Python's requirement for consistent block indentation.
 
+**Worry: Devin sessions persistently ending "blocked" despite unattended prompt (Bug #34 — CONFIRMED)**
+
+In both Cycle 2 and Cycle 3 test runs, every Devin session ended with `status_enum=blocked` instead of `finished`. The Bug #31 mitigation (adding "This is an UNATTENDED AUTOMATED run" to the prompt) was insufficient — Devin's internal logic decides to ask questions regardless of prompt instructions when it encounters uncertainty.
+
+**Observed behavior**: Batch 1 session blocked at poll 12 (~11 min), Batch 2 session blocked at poll 15 (~14 min). Both sessions had pushed code to their branches and modified the correct files, but stopped mid-work to ask a question.
+
+**Production impact**: High — every batch session ends prematurely. The files ARE modified (so alerts get classified as "attempted"), but Devin may not have completed all fixes. The session effectively does partial work and then stops.
+
+**Solution (Bug #34 fix)**: Auto-unblock via Devin's message API. When the poll loop detects `status_enum=blocked`, instead of immediately accepting it as terminal, send a follow-up message via `POST /v1/sessions/{session_id}/message` instructing Devin to continue. Allow up to 2 unblock attempts before accepting `blocked` as terminal. This uses the Devin API's intended mechanism for mid-session guidance without creating a new session.
+
+**Worry: No alert exclusion filter for test/vendor files (Bug #35 — DOCUMENTED)**
+
+The orchestrator fetches ALL open CodeQL alerts on main, including alerts in test files, vendor directories, CI configuration files, and template files. In production, some of these alerts may be intentional (e.g., security test fixtures) or not worth auto-fixing (e.g., third-party vendored code).
+
+**Observed behavior**: Alert #1 maps to `.github/workflows/blank.yml` — a test/template file. The workflow correctly included it in a batch and Devin attempted to fix it, but this may not be desirable.
+
+**Production impact**: Low — Devin will attempt to fix all alerts regardless. The worst case is wasted session time on alerts that should be excluded. No data corruption or misclassification.
+
+**Mitigation**: Document as a future enhancement. Add an optional `exclude_paths` input to the orchestrator workflow that accepts glob patterns (e.g., `test/**, vendor/**, .github/workflows/blank.yml`). Alerts in matching files are skipped.
+
+**Worry: Devin-created PRs lack structured batch metadata (Bug #36 — CONFIRMED)**
+
+When Devin creates a PR from within its session (before the batch workflow's "Create PR" step runs), the PR has Devin's auto-generated description. The batch workflow detects the existing PR and uses it, but does not update the PR body with the structured alert severity table, batch attribution, or link to the GitHub Actions run.
+
+**Observed behavior**: Both PRs #145 and #146 were created by Devin before the batch workflow's PR creation step. The workflow logged "PR already exists" and used the existing PR URL. The PR bodies had Devin's description instead of the structured batch metadata.
+
+**Production impact**: Medium — enterprise teams reviewing fix PRs won't see the structured alert table, severity ratings, or attribution to the specific Actions run. This reduces auditability and makes PR review less efficient.
+
+**Solution (Bug #36 fix)**: When the batch workflow's "Create PR" step detects an existing PR (POST returns error, falls back to search), PATCH the existing PR's title and body with the structured batch metadata template. This ensures consistent, professional PR metadata regardless of whether Devin or the workflow created the PR first.
+
 ---
 
 ## Limitations and Future Work
