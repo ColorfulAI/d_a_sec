@@ -4,11 +4,19 @@ from flask import request, Flask, make_response
 
 app = Flask(__name__)
 
+ALLOWED_COMMANDS = {
+    "status": ["systemctl", "status", "app"],
+    "uptime": ["uptime"],
+    "disk": ["df", "-h"],
+}
+
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
-    cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
-    return {"output": output}
+    cmd_name = request.form.get("command", "")
+    if cmd_name not in ALLOWED_COMMANDS:
+        return {"error": "Command not allowed"}, 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd_name], capture_output=True, text=True)
+    return {"output": result.stdout}
 
 @app.route("/admin/logs")
 def view_logs():
