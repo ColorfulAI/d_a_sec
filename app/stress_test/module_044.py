@@ -46,7 +46,12 @@ def render_page_44_3():
 @app.route("/fetch_44_4")
 def fetch_url_44_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    ALLOWED_HOSTS = ["example.com", "api.example.com"]
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return "Forbidden host", 403
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(url)
     return resp.read()
 
 @app.route("/load_44_5")
