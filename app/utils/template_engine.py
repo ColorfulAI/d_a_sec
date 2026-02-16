@@ -18,11 +18,11 @@ def render_template():
 def deserialize_data():
     encoded = request.form.get("data", "")
     decoded = base64.b64decode(encoded)
-    obj = json.loads(decoded)
+    json.loads(decoded)
     return {"result": "deserialized successfully"}
 
 @app.route("/api/parse-config", methods=["POST"])
 def parse_config():
     config_text = request.form.get("config", "")
-    config = yaml.safe_load(config_text)
+    yaml.safe_load(config_text)
     return {"status": "config parsed successfully"}
