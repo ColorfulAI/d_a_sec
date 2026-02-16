@@ -1191,3 +1191,50 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #25 — The orchestrator summary previously only reported alert counts and IDs, not PR URLs. For enterprise teams, the summary is the primary output — it should link to every fix PR so reviewers can start merging immediately without manual GitHub searches.
 
 **Production scenario**: The security team lead runs the weekly backlog sweep on Friday evening. Monday morning, they check the tracking issue for the sweep results. The summary says "22 alerts attempted across 2 batches" but doesn't say WHERE the fix PRs are. The lead has to search GitHub for `devin/security-batch-*` branches, find the PRs, and distribute them to reviewers. With the fix, the summary lists every PR URL, and the lead can assign reviewers directly from the tracking issue.
+
+### TC-BL-REG-31: Cursor Comment Accumulation Prevention (Bug #26)
+
+**Setup**: Trigger the orchestrator with `reset_cursor=true` and `max_batches=2`. This ensures `cursor_comment_id` starts empty. Let both batches complete (2 cursor updates during batch completions + 1 final update = 3 `update_cursor()` calls).
+
+**Expected**:
+1. The first `update_cursor()` call creates a new comment via POST
+2. The function saves the new comment's ID via `nonlocal cursor_comment_id`
+3. All subsequent `update_cursor()` calls PATCH the same comment (HTTP 200)
+4. Only 1 cursor comment exists on issue #108 after the run completes (not 3)
+5. The final cursor comment contains the complete state from all batches
+
+**Validates**: Bug #26 — Without the fix, each `update_cursor()` call with empty `cursor_comment_id` creates a new comment. In a 2-batch run, this produces 3 cursor comments instead of 1. Over time, the tracking issue accumulates hundreds of stale comments, becoming unreadable for humans and eventually hitting GitHub API pagination limits (100 comments/page).
+
+**Worry**: The `nonlocal` keyword in Python requires the variable to be defined in an enclosing scope. If the heredoc's variable scoping doesn't support `nonlocal` correctly (e.g., if `cursor_comment_id` is treated as a global), the fix silently fails and comments still accumulate. Also, if the POST fails (HTTP 500), the comment ID isn't saved, and the next call creates another new comment — acceptable behavior but should be logged.
+
+**Production scenario**: A Fortune 500 company runs the orchestrator weekly via cron. After 6 months (26 runs), the tracking issue has 26-78 cursor comments (depending on batch count per run). The security team uses this issue as their dashboard. The noise-to-signal ratio makes it unusable. With the fix, there's exactly 1 cursor comment that gets updated in-place.
+
+### TC-BL-REG-32: Failed Batch Alerts Tracked in Cursor (Bug #27)
+
+**Setup**: Trigger the orchestrator with 2 batches. Simulate a child workflow failure by either: (a) manually cancelling one child workflow run mid-execution, or (b) waiting for a natural failure (e.g., Devin API rate limit causing the child to fail). Check the cursor after the orchestrator completes.
+
+**Expected**:
+1. The failed batch's alerts appear in `attempted_alert_ids` in the cursor
+2. The next orchestrator run skips these alerts (they're in `attempted`)
+3. The re-verification logic (Bug #18b) checks if these alerts are now fixed on main
+4. If not fixed, they stay in `attempted` and are NOT re-dispatched as new batches
+
+**Validates**: Bug #27 — Without the fix, failed batch alerts are added to `failed_batches` but NOT to the cursor. The next orchestrator run finds them as "remaining" and re-dispatches them. If the failure is persistent, this creates an infinite loop of failed dispatches consuming Devin sessions.
+
+**Worry**: Marking failed batch alerts as `attempted` might be too aggressive. If the failure was transient (e.g., GitHub Actions runner out of disk space), the alerts should be retried. But with the current fix, they're skipped until re-verification detects them as fixed (which won't happen if the fix was never applied). A retry counter would be more nuanced but adds complexity.
+
+**Production scenario**: A repo has a file (`legacy_crypto.py`) with 10 CodeQL alerts. The file uses deprecated cryptography APIs that Devin can't fix without major refactoring. Every batch that includes this file fails because Devin's fix introduces import errors. Without Bug #27 fix, this batch is re-dispatched every week, wasting 10 Devin sessions per month. With the fix, the alerts are marked as `attempted` and skipped until a human resolves them.
+
+### TC-BL-REG-33: Step Summary Includes PR URLs (Bug #28)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`. Let the batch complete and create a PR. Check the GitHub Actions step summary (visible in the Actions UI) for the PR URL.
+
+**Expected**:
+1. The orchestrator results JSON includes a `pr_urls` array with the batch's PR URL
+2. The Summary step reads the results JSON and appends a "Fix PRs Created" section
+3. The step summary shows the PR URL as a clickable link
+4. The failed batches in results JSON include `alert_ids` for debugging
+
+**Validates**: Bug #28 — The step summary is the most visible output for enterprise teams. Without PR URLs, teams have to dig into job logs or search GitHub to find the fix PRs. The step summary should be a complete, actionable dashboard.
+
+**Worry**: The Summary step runs with `if: always()`, meaning it executes even if the orchestrate step failed. If the orchestrator crashes before writing `/tmp/orchestrator_results.json`, the Python script in the Summary step should handle the missing file gracefully (the `try/except` catches this). Also, if the orchestrator completes but no PRs were created (all batches failed), the "Fix PRs Created" section should be absent, not show an empty list.

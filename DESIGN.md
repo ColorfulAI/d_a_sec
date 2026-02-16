@@ -1425,6 +1425,30 @@ The orchestrator's final summary logged alert counts, attempted IDs, and unfixab
 
 **Solution (Bug #25 fix)**: The orchestrator now extracts `pr_url` from each batch's result artifact and stores it on the batch object. The final summary includes a "PRs created" section listing all batch PR URLs.
 
+**Worry: Cursor comment accumulation on tracking issue (Bug #26 — CONFIRMED)**
+
+When `RESET_CURSOR=true` is used (or on first run when no cursor exists), the `cursor_comment_id` variable is empty. The `update_cursor()` function checks `if cursor_comment_id:` before PATCHing — with an empty ID, it skips PATCH and creates a new comment via POST every time. In a multi-batch run, each batch completion triggers `update_cursor()`, plus one final update at the end. Result: N+1 cursor comments created per orchestrator run instead of 1.
+
+**Observed behavior (Cycle 1 validation run 22061905178)**: The orchestrator created 2 cursor comments on issue #108 (one after batch completion, one at the end), even though it should have PATCHed the first one.
+
+**Production impact**: Over weeks of scheduled runs, the tracking issue accumulates hundreds of stale cursor comments. The cursor loading code finds the last one (correct), but the issue becomes unreadable for humans. GitHub API pagination (100 comments/page) could eventually cause the cursor to be missed if it's beyond page 1.
+
+**Solution (Bug #26 fix)**: Added `nonlocal cursor_comment_id` to `update_cursor()`. After a successful POST (new comment created), the function saves the new comment's ID: `cursor_comment_id = str(result["id"])`. All subsequent calls within the same run use PATCH on that comment.
+
+**Worry: Failed batch alerts not tracked in cursor — infinite re-processing (Bug #27 — CONFIRMED)**
+
+When a child workflow completes with conclusion != "success" (failure, cancelled, timed_out), the orchestrator adds the batch to `failed_batches` but does NOT update the cursor with those alert IDs. On the next orchestrator run, these alerts appear as "remaining" (not in processed, attempted, or unfixable) and get re-dispatched. If the failure is persistent (e.g., a specific alert's file causes a build error in the child workflow), the same batch is re-dispatched every run indefinitely, wasting Devin sessions.
+
+**Production impact**: A Fortune 500 repo with 500 alerts could have a batch of 15 alerts that consistently fails due to one problematic file. Every weekly sweep re-dispatches this batch, consuming a Devin session slot for ~15 minutes and producing the same failure. Over a month, that's 4 wasted sessions and slots that could have processed other batches.
+
+**Solution (Bug #27 fix)**: Failed batch alerts are now added to `attempted_alert_ids` in the cursor. This means the next run's re-verification logic (Bug #18b) checks if these alerts are now fixed on main. If the failure was transient and a partial fix landed, re-verification catches it. If not, the alerts stay in `attempted` and are skipped until manual intervention.
+
+**Worry: Step summary missing PR URLs — enterprise teams can't find fix PRs (Bug #28 — CONFIRMED)**
+
+The GitHub Actions step summary (visible in the Actions UI) showed batch counts, alert counts, and timing, but no PR URLs. Enterprise teams reviewing the Actions UI had to separately search GitHub for `devin/security-batch-*` branches to find the fix PRs. The orchestrator's Python stdout logs included PR URLs, but those are buried in the job log and not visible in the summary view.
+
+**Solution (Bug #28 fix)**: The orchestrator results JSON now includes `pr_urls` array. The Summary step reads this file and appends a "Fix PRs Created" section to the step summary with clickable links. Also added `alert_ids` to the failed batches in the results JSON for debugging.
+
 ---
 
 ## Limitations and Future Work
