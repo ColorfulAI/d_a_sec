@@ -31,8 +31,12 @@ def run_cmd_44_1():
 @app.route("/read_44_2")
 def read_file_44_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    base_dir = os.path.abspath("uploads")
+    safe_path = os.path.realpath(os.path.join(base_dir, path))
+    if not safe_path.startswith(base_dir + os.sep):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_44_3")
 def render_page_44_3():
