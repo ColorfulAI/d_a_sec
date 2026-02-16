@@ -25,9 +25,13 @@ def run_cmd_49_1():
 
 @app.route("/read_49_2")
 def read_file_49_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_key = request.args.get("path")
+    ALLOWED_FILES = {"readme": "uploads/readme.txt", "config": "uploads/config.txt", "data": "uploads/data.txt"}
+    file_path = ALLOWED_FILES.get(file_key)
+    if file_path is None:
+        return "Invalid file", 400
+    with open(file_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_49_3")
 def render_page_49_3():
