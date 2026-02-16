@@ -1425,6 +1425,42 @@ The orchestrator's final summary logged alert counts, attempted IDs, and unfixab
 
 **Solution (Bug #25 fix)**: The orchestrator now extracts `pr_url` from each batch's result artifact and stores it on the batch object. The final summary includes a "PRs created" section listing all batch PR URLs.
 
+**Worry: Unblock counter never resets — sessions terminated prematurely at different blocking points (Bug #37 — CONFIRMED)**
+
+The `UNBLOCK_ATTEMPTS` counter in the batch workflow's poll loop monotonically increases. If a Devin session goes blocked → working → blocked (at a different point in its work), the counter does not reset. With `MAX_UNBLOCK_ATTEMPTS=2`, a batch processing 12 alerts across 3 files could hit 3 separate blocking points (one per file), but the session gets terminated after the 2nd unblock — even though each unblock successfully resumed work.
+
+**Observed behavior (Cycle 4 runs 22064834214 + 22064837375)**: Both batch sessions received 2 unblock messages (HTTP 200 each). The sessions remained in `blocked` status on subsequent polls. The logs show "Session blocked after 2 unblock attempts — accepting as terminal" without checking whether the session resumed work between unblock attempts.
+
+**Production impact**: High — in a Fortune 500 repo with large batches (15 alerts across 5+ files), Devin may need to ask clarifying questions at multiple points during a long session. Each blocking point is independent (different file, different vulnerability type). The fixed budget of 2 unblocks means the session is killed after the 2nd question, regardless of how much useful work happened between questions.
+
+**Solution (Bug #37 fix)**: Three changes: (1) Track `LAST_STATUS` to detect transitions. When the session transitions from `blocked` → `working`, reset `UNBLOCK_ATTEMPTS` to 0. This means the budget applies per consecutive blocking episode, not per session lifetime. (2) Increase `MAX_UNBLOCK_ATTEMPTS` from 2 to 3 for more resilience. (3) Use a more forceful unblock message that explicitly instructs Devin not to ask questions. (4) Wait 90 seconds (instead of 60) after sending unblock to give the session time to process the message.
+
+**Worry: PR body classification metadata appended BEFORE collect-results runs (Bug #38 — CONFIRMED)**
+
+The Bug #36 fix PATCHes the PR body with structured batch metadata during the "Create PR" step (Step 4). However, the three-state classification (fixed/attempted/unfixable) is computed in the "Collect results" step (Step 5), which runs AFTER Step 4. This means the PR body's metadata template has empty classification fields — the actual alert classification data is never written to the PR body.
+
+**Observed behavior (Cycle 4 PRs #148, #149)**: Both PRs had the structured batch metadata template (title, severity table, run link) but the classification section showed 0 fixed, 0 attempted, 0 unfixable — even though the collect-results step correctly classified all 22 alerts as "attempted".
+
+**Production impact**: Medium — enterprise teams reviewing fix PRs see the structured template but with empty/zero classification data. The PR appears to have processed 0 alerts, which is misleading. The actual results are only visible in the workflow run logs and the uploaded artifact, not in the PR itself.
+
+**Solution (Bug #38 fix)**: Added a new step (Step 5b: "Update PR with classification metadata") that runs AFTER collect-results. This step reads the classification outputs (fixed_alert_ids, attempted_alert_ids, unfixable_alert_ids) and PATCHes the PR body to append: (1) a human-readable classification summary table, and (2) a machine-readable JSON block in an HTML comment (`<!-- batch-classification-metadata {...} -->`) for the orchestrator to parse on subsequent runs.
+
+**Worry: Cursor doesn't store per-alert PR URLs for re-verification correlation (Bug #39 — DOCUMENTED)**
+
+The cursor stores `processed_alert_ids`, `attempted_alert_ids`, and `unfixable_alert_ids` as flat lists of alert numbers. When the orchestrator re-verifies "attempted" alerts on a subsequent run, it checks CodeQL alert state on main. If the alert is still open, it needs to know WHICH PR contained the attempted fix — to check if the PR was merged, abandoned, or still open. Currently, there is no mapping from alert ID → PR URL in the cursor.
+
+**Production impact**: Low-medium — the re-verification logic works without this mapping (it checks CodeQL state directly), but it cannot provide actionable guidance like "Alert #42 was attempted in PR #148 which is still open — merge it to resolve." Enterprise teams lose traceability.
+
+**Mitigation**: Document as a future enhancement. The cursor format can be extended to include a `alert_pr_map` dictionary (`{"42": "https://github.com/.../pull/148", ...}`). The Bug #38 fix already writes this data to the PR body, so the orchestrator could extract it from PR bodies during re-verification.
+
+**Worry: Production cursor parsing path (reset_cursor=false) never tested in real run (Bug #40 — DOCUMENTED)**
+
+All 4 test cycles used `reset_cursor=true`, which bypasses the cursor parsing Python code entirely (exits early before the heredoc executes). The Bug #33 fix (IndentationError) was applied based on code review, not runtime validation. If there are other issues in the cursor parsing logic (e.g., JSON parsing edge cases, missing fields, type mismatches), they would only manifest in production scheduled runs.
+
+**Production impact**: Medium — the first scheduled cron run (every 6 hours) will exercise the cursor parsing path. If there's an undetected bug, the cron run fails silently and the backlog sweep stops. The Bug #33 fix addressed the most obvious issue (IndentationError), but there may be others.
+
+**Mitigation**: The next test cycle should explicitly test with `reset_cursor=false` after at least one run has created a cursor comment. This validates the full cursor load → parse → resume path.
+
 ---
 
 ## Limitations and Future Work

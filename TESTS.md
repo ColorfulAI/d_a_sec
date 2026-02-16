@@ -1191,3 +1191,77 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #25 — The orchestrator summary previously only reported alert counts and IDs, not PR URLs. For enterprise teams, the summary is the primary output — it should link to every fix PR so reviewers can start merging immediately without manual GitHub searches.
 
 **Production scenario**: The security team lead runs the weekly backlog sweep on Friday evening. Monday morning, they check the tracking issue for the sweep results. The summary says "22 alerts attempted across 2 batches" but doesn't say WHERE the fix PRs are. The lead has to search GitHub for `devin/security-batch-*` branches, find the PRs, and distribute them to reviewers. With the fix, the summary lists every PR URL, and the lead can assign reviewers directly from the tracking issue.
+
+### TC-BL-REG-31: Unblock Counter Resets After Session Resumes Working (Bug #37)
+
+**Type**: Regression — validates that the unblock counter resets when a session transitions from blocked → working
+
+**Why we test this**: In production, a Devin session processing a large batch (15 alerts across 5+ files) may encounter multiple independent blocking points — one per file or vulnerability type. Each blocking point is unrelated to the previous one. Without counter reset, a session that successfully resumes work after an unblock still counts that attempt toward the lifetime budget. A batch touching 4 files could legitimately block 4 times, but the old code would kill it after the 2nd block.
+
+**Setup**:
+1. Seed the repo with 15+ CodeQL alerts spread across 4-5 different files to create a large batch
+2. Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`
+3. Wait for the batch workflow to start polling the Devin session
+4. Monitor the poll logs for blocked → working → blocked transitions
+
+**Expected**:
+1. When the session transitions from `blocked` to `working`, the log shows: "Session resumed working after unblock — resetting unblock counter (was N/3)"
+2. The `UNBLOCK_ATTEMPTS` counter resets to 0 after each successful resume
+3. The session can handle 3+ independent blocking points across different files (as long as it resumes working between each)
+4. The session is only terminated when it blocks 3 times CONSECUTIVELY without resuming work
+
+**Validates**: Bug #37 — The old code used a monotonically increasing counter that never reset. A session processing a 15-alert batch across 5 files could block at 3 different files, but was killed after the 2nd block even though each unblock successfully resumed work. The fix tracks `LAST_STATUS` and resets the counter on `blocked → working` transitions.
+
+**Production scenario**: A Fortune 500 monorepo has 200 CodeQL alerts across 40 files. Batches of 15 alerts cover 3-4 files each. Devin asks a clarifying question when switching between files (e.g., "Should I use the existing sanitizer in utils.py or create a new one?"). With 5 concurrent batches, each batch session may block 3-4 times (once per file transition). Without counter reset, 60% of sessions would be killed prematurely after just 2 files. With counter reset, sessions complete all files as long as they resume work after each unblock.
+
+**Worry**: The counter reset could mask a pathological case: a session that rapidly alternates between blocked and working without making progress (e.g., blocked → working for 1 second → blocked again). The counter resets each time, so the session never hits the consecutive-block limit. The 45-poll timeout (45 minutes) is the only safety net. In production, this could waste a Devin session slot for 45 minutes on a non-productive session.
+
+### TC-BL-REG-32: PR Body Updated with Classification Metadata After Collect-Results (Bug #38)
+
+**Type**: Regression — validates that the PR body includes classification data from collect-results
+
+**Why we test this**: The PR body is the primary artifact enterprise teams review. If it shows "0 fixed, 0 attempted, 0 unfixable" when 12 alerts were actually attempted, the team loses trust in the system. The classification metadata must be written AFTER the collect-results step computes the actual numbers.
+
+**Setup**:
+1. Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`
+2. Wait for the batch workflow to complete (session finishes or times out)
+3. Check the PR body via GitHub API: `GET /repos/{repo}/pulls/{pr_number}`
+
+**Expected**:
+1. The PR body contains a "### Alert Classification Summary" table
+2. The table shows non-zero counts matching the actual alert classification
+3. The PR body contains a `<!-- batch-classification-metadata {...} -->` HTML comment
+4. The JSON inside the HTML comment has correct `fixed_alert_ids`, `attempted_alert_ids`, `unfixable_alert_ids`
+5. The `run_id` in the metadata matches the batch workflow's run ID
+6. The `session_id` in the metadata matches the Devin session ID
+
+**Validates**: Bug #38 — The old code PATCHed the PR body in Step 4 (Create PR) before Step 5 (Collect results) ran. The classification fields were always empty/zero. The fix adds Step 5b that PATCHes the PR body AFTER collect-results with the actual classification data.
+
+**Production scenario**: The security team reviews a batch fix PR. The PR body says "12 alerts attempted, 3 unfixable (human review needed)". The team knows exactly what to review: merge the PR for the 12 attempted fixes, then manually investigate the 3 unfixable alerts listed by ID. Without this metadata, the team sees an empty classification and has to dig through workflow logs to understand what happened.
+
+**Worry**: The Step 5b PATCH overwrites whatever was in the PR body before (Devin's description + Step 4's template). If Devin added important context to the PR description (e.g., "I changed the sanitization approach in user_service.py because the existing pattern was deprecated"), that context is lost when Step 5b appends the classification table. The current implementation APPENDS to the existing body rather than replacing it, but this creates an ever-growing PR body if the workflow runs multiple times on the same branch.
+
+### TC-BL-REG-33: Cursor Parsing Path Exercised with reset_cursor=false (Bug #40)
+
+**Type**: Integration — validates that the production cursor parsing code path works end-to-end
+
+**Why we test this**: All test cycles used `reset_cursor=true`, which bypasses cursor parsing entirely. The production cron schedule uses `reset_cursor=false` (the default), which exercises the full cursor load → parse → filter → resume path. Bug #33 (IndentationError) was found in this code path via code review, but the fix was never validated at runtime.
+
+**Setup**:
+1. First, run the orchestrator with `reset_cursor=true`, `max_batches=1` to create an initial cursor comment on the tracking issue
+2. Wait for the run to complete (cursor comment created with processed/attempted/unfixable alert IDs)
+3. Then run the orchestrator again with `reset_cursor=false`, `max_batches=1` to exercise cursor parsing
+4. Check the orchestrator logs for cursor parsing output
+
+**Expected**:
+1. The second run successfully parses the cursor comment from the tracking issue
+2. The log shows "Found cursor comment..." with the correct alert ID counts
+3. Already-processed/attempted alerts are excluded from the new batch
+4. Only remaining unprocessed alerts are dispatched to new batches
+5. The orchestrator does NOT crash with IndentationError or any other Python error
+
+**Validates**: Bug #40 — The cursor parsing Python code has never been executed in a real workflow run. All testing used `reset_cursor=true` which skips cursor parsing entirely. This test validates the full production path.
+
+**Production scenario**: The cron schedule runs every 6 hours with `reset_cursor=false`. The first run processes 15 alerts (batch 1). Six hours later, the second run loads the cursor, sees 15 alerts already attempted, and dispatches the remaining 7 alerts as batch 2. If cursor parsing fails, the second run either crashes (visible failure) or re-processes all 22 alerts (silent duplication, wasting Devin sessions).
+
+**Worry**: The cursor comment format is a JSON blob inside a GitHub issue comment with a `<!-- backlog-cursor -->` marker. If the marker format changes, or if another comment coincidentally contains the marker text, the parsing logic may find the wrong comment or no comment at all. Additionally, if the cursor JSON has been manually edited by a human (e.g., to remove an alert from the unfixable list), the parser may fail on unexpected field types or missing keys.
