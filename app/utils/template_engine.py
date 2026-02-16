@@ -25,4 +25,4 @@ def deserialize_data():
 def parse_config():
     config_text = request.form.get("config", "")
     config = yaml.safe_load(config_text)
-    return {"config": config}
+    return jsonify(config=config)
