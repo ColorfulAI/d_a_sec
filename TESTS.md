@@ -960,3 +960,38 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: An organization sets conservative ACU limits per session. A complex batch with 15 alerts causes the session to expire after fixing only 8. Without proper `expired` handling, all 15 alerts are marked unfixable. With the fix, the 8 fixed alerts are correctly identified via CodeQL re-query, and only the remaining 7 are flagged for human review.
 
 **Worry**: The `expired` status triggers the "Create PR" path, but an expired session may not have pushed a branch at all. The branch-existence check (HTTP 404 guard) should handle this — if no branch exists, `pr_created=false` and no PR is attempted. But if the session pushed a partial branch with broken code, a PR is created with incomplete fixes that may fail CodeQL. The collect-results step's per-alert CodeQL re-query is the safety net here.
+
+### TC-BL-REG-18: Artifact Download Headers Defined (Bug #16)
+
+**Setup**: Trigger the orchestrator with `max_batches=1` and `max_concurrent=1`. Let it dispatch one child batch. Wait for the child to complete successfully (at least one alert fixed). Check orchestrator logs for the artifact download step.
+
+**Expected**:
+1. The orchestrator logs `Found result artifact: batch-N-result` after child completion
+2. The orchestrator logs `Fixed: X, Unfixable: Y` with actual per-alert counts
+3. The cursor comment on the tracking issue shows `unfixable_alert_ids` as a separate list (not empty if some alerts weren't fixed)
+4. NO `NameError` or `Could not fetch batch result artifact` error in the orchestrator logs
+5. The `headers` variable is defined before the main orchestrator loop with the correct auth token
+
+**Validates**: Bug #16 fix — the `headers` variable was undefined in the orchestrator's Python scope. The artifact download code at lines 722/730 used `urllib.request.Request(artifacts_url, headers=headers)` but `headers` was never assigned. This caused a guaranteed `NameError`, caught by the `except Exception` handler, which silently fell through to "marking all alerts as processed" — destroying the fixed/unfixable distinction.
+
+**Production scenario**: A Fortune 500 company runs the backlog orchestrator nightly. Devin fixes 80% of alerts and leaves 20% unfixable. But the orchestrator's `NameError` means ALL alerts are marked as "processed" — none are flagged as unfixable. The human review notification never fires. The security team believes the backlog is 100% resolved. Three months later, an auditor finds 50 unaddressed vulnerabilities that were silently buried.
+
+**Worry**: The `except Exception` handler is too broad — it catches `NameError`, `TypeError`, `KeyError`, and other programming errors, not just network/API failures. Any future typo or refactoring mistake in the artifact download code will be silently swallowed, and the orchestrator will fall back to "all processed" without anyone knowing. Consider narrowing the exception handler to `(urllib.error.URLError, json.JSONDecodeError, zipfile.BadZipFile)` so programming errors crash loudly.
+
+### TC-BL-REG-19: Backfill Uses Child-Count Concurrency (Bug #17)
+
+**Setup**: Trigger the orchestrator with `max_batches=3` and `max_concurrent=1`. This forces sequential processing: dispatch batch 1, wait for completion, backfill with batch 2, wait, backfill with batch 3. Have 5+ external Devin sessions active on the account during the test (e.g., from PR-scoped workflows on other PRs).
+
+**Expected**:
+1. The orchestrator dispatches batch 1 immediately (initial fill uses child-count, not session count)
+2. After batch 1 completes, the orchestrator backfills with batch 2 despite 5+ external sessions running
+3. After batch 2 completes, the orchestrator backfills with batch 3
+4. The backfill path does NOT call `check_active_devin_sessions()`
+5. The backfill path checks `len(active_children) < max_concurrent` only
+6. All 3 batches complete — no batches are left pending due to external session blocking
+
+**Validates**: Bug #17 fix — the backfill path still called `check_active_devin_sessions()` after Bug #14 was supposed to remove it. External sessions blocked backfill, causing the orchestrator to dispatch only the first wave and leave remaining batches pending forever.
+
+**Production scenario**: Same as Bug #14 — the organization uses Devin for multiple repos. The initial fill dispatches correctly (Bug #14 fix), but after the first wave completes, backfill is blocked by external sessions. For a 34-batch backlog with max_concurrent=3, only batches 1-3 complete. Batches 4-34 are never dispatched. The orchestrator reports "31 batches remaining" and exits. The next cron run picks them up, but then the same thing happens again.
+
+**Worry**: With the session reservation gate fully removed from both initial fill AND backfill, there's no protection against overwhelming the Devin API. If max_concurrent=5 and the organization already has 5 sessions running, the orchestrator dispatches 5 children that all fail to create Devin sessions (429). The children retry with backoff, but if the organization's session usage doesn't decrease, all children eventually timeout. Consider adding a soft warning (log only, no blocking) when external session count is high.

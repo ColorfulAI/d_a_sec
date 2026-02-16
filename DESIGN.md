@@ -1213,6 +1213,26 @@ The split can be implemented incrementally:
 
 **Diagnostic improvement**: Every poll now logs `Poll N/45: status=X status_enum=Y`, making it trivial to diagnose future polling issues from workflow logs.
 
+### Bug #16: `headers` Variable Undefined in Artifact Download (NameError)
+
+**Discovered**: During code review of the orchestrator's main loop on main branch. The artifact download code at lines 722 and 730 uses `urllib.request.Request(artifacts_url, headers=headers)`, but `headers` was never defined in the Python scope.
+
+**Root cause**: The `gh_api()` function builds its own headers internally (`{"Authorization": f"token {gh_pat}", ...}`) but doesn't expose them to the outer scope. The artifact download code was written assuming `headers` existed as a module-level variable, but it doesn't. This causes a guaranteed `NameError` at runtime.
+
+**Why this is critical in production**: This bug silently breaks the entire unfixable-alert-to-human-review pipeline. When a child batch completes successfully, the orchestrator tries to download the batch result artifact to get the per-alert fixed/unfixable breakdown. The `NameError` is caught by the `except Exception` handler, which falls through to "marking all alerts as processed" — silently losing the fixed/unfixable distinction. Every alert appears as "processed" in the cursor, and no alerts are ever flagged as unfixable. The human review notification never fires. The backlog appears 100% complete when it isn't.
+
+**Solution**: Defined a `headers` dict in the orchestrator scope before the main loop, with the same auth token used by `gh_api()`.
+
+### Bug #17: Session Reservation Gate Still in Backfill Path
+
+**Discovered**: During code review. PR #120 (Bug #14) removed `check_active_devin_sessions()` from the initial dispatch loop, but the backfill path (triggered after a child completes, line 769-770) still calls it and gates on `if active_sessions < max_concurrent`.
+
+**Root cause**: Bug #14 fix was incomplete — it only updated the initial fill loop. The backfill path is a separate code block that runs when a child completes and a pending batch needs to be dispatched. This path was missed during the Bug #14 fix.
+
+**Why this is critical in production**: After the first wave of children completes, the orchestrator tries to backfill with the next batch. But if 5+ external Devin sessions are running, `check_active_devin_sessions()` returns >= max_concurrent, and the backfill is blocked. The orchestrator correctly dispatched the initial children (Bug #14 fix), but then gets stuck after the first wave. For a 34-batch backlog, only the first 3 batches complete — the remaining 31 are never dispatched.
+
+**Solution**: Replaced the backfill's `check_active_devin_sessions()` check with `len(active_children) < max_concurrent`, matching the initial fill path.
+
 ---
 
 ## Unfixable Alert → Human Review Pipeline
