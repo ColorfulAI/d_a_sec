@@ -1,14 +1,23 @@
 import os
 import subprocess
-from flask import request, Flask, make_response
+from flask import request, Flask, jsonify
+
+ALLOWED_COMMANDS = {
+    "status": ["status"],
+    "health": ["health"],
+    "version": ["version"],
+    "uptime": ["uptime"],
+}
 
 app = Flask(__name__)
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
-    return {"output": output}
+    if cmd not in ALLOWED_COMMANDS:
+        return jsonify({"error": "Command not allowed"}), 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True, text=True)
+    return jsonify({"output": result.stdout})
 
 @app.route("/admin/logs")
 def view_logs():
