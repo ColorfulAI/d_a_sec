@@ -851,3 +851,77 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: A CI/CD team deploys an updated batch workflow while a backlog sweep is in progress. The currently-running children should complete with the old code (no mid-flight changes), and only subsequent dispatches should pick up the new code.
 
 **Worry**: If the orchestrator expects fields in the batch result artifact that the old child code doesn't produce, it will crash when trying to parse the artifact. The orchestrator must handle missing fields gracefully (fallback to treating all alerts as "processed" rather than crashing).
+
+---
+
+### TC-BL-REG-12: Python Stdout Unbuffered in Heredoc Mode (Bug #11)
+
+**Setup**: Trigger the orchestrator workflow. Cancel it after 30 seconds (before the first poll completes). Check the workflow logs for the cancelled run.
+
+**Expected**:
+1. Log output appears in real-time (each `print()` shows immediately, not buffered)
+2. After cancellation, ALL print statements executed before cancellation are visible in the logs
+3. The `PYTHONUNBUFFERED=1` env var is set in the workflow step
+4. `sys.stdout.reconfigure(line_buffering=True)` is called at the top of the Python heredoc
+
+**Validates**: Bug #11 fix — Python's stdout is fully buffered in non-TTY (heredoc) mode. Without this fix, cancelling a long-running orchestrator loses ALL diagnostic output.
+
+**Production scenario**: An operator triggers the backlog sweep, sees it running for 20 minutes with zero output, and cancels it. Without unbuffered stdout, they get zero information about what happened. With the fix, they see exactly which step the orchestrator reached before cancellation.
+
+**Worry**: If `PYTHONUNBUFFERED=1` is removed or `sys.stdout.reconfigure()` is deleted during a refactor, the orchestrator reverts to silent mode. Every future debugging session becomes blind.
+
+---
+
+### TC-BL-REG-13: HTTP Timeouts on All API Calls (Bug #12)
+
+**Setup**: Trigger the orchestrator workflow. Inspect the workflow YAML to verify every `urllib.request.urlopen()` call has `timeout=HTTP_TIMEOUT`.
+
+**Expected**:
+1. Every `urlopen()` call in both orchestrator and batch workflows has `timeout=HTTP_TIMEOUT`
+2. `HTTP_TIMEOUT` is defined as 30 seconds
+3. If the Devin API or GitHub API hangs for >30 seconds, a `socket.timeout` exception is raised
+4. The exception is caught and logged (not silently swallowed)
+5. The orchestrator continues operating (retries or marks the batch as failed) instead of blocking forever
+
+**Validates**: Bug #12 fix — `urllib.request.urlopen()` defaults to infinite timeout. A single hung API call blocks the entire orchestrator indefinitely.
+
+**Production scenario**: The Devin API experiences a partial outage (responds to health checks but hangs on session creation). Without timeouts, the orchestrator blocks forever on the first API call. With 30s timeout, the orchestrator detects the hang, logs it, and either retries or moves on.
+
+**Worry**: A new `urlopen()` call added during a feature update might omit the `timeout` parameter, reintroducing the infinite-hang vulnerability. Code review must check for this.
+
+---
+
+### TC-BL-REG-14: gh_api Handles 204 No Content Responses (Bug #13)
+
+**Setup**: Trigger the orchestrator workflow with `max_batches=1`. Check the logs for the dispatch step. Verify the `dispatch_child()` function returns `True` (not `False`).
+
+**Expected**:
+1. `gh_api("POST", dispatch_url, data)` returns `({}, 204)` for a successful workflow dispatch
+2. `dispatch_child()` checks `status == 204` and returns `True`
+3. The child batch workflow run appears in GitHub Actions within 30 seconds of dispatch
+4. The orchestrator logs "Dispatched successfully" (not "Dispatch FAILED")
+
+**Validates**: Bug #13 fix — GitHub's `workflow_dispatch` endpoint returns HTTP 204 No Content with an empty body. The old `gh_api()` tried `json.loads(b'')` which raised `JSONDecodeError`, caught as `status=0`. `dispatch_child()` checked `status == 204` but got 0, returning `False` even though the HTTP request actually succeeded.
+
+**Production scenario**: The orchestrator dispatches 5 child workflows. Without the 204 fix, ALL dispatches appear to fail (returning `False`), but they actually succeed on GitHub's side. This creates 5 orphan workflow runs that consume Devin sessions and ACU budget, while the orchestrator reports 0 progress and retries — creating 5 MORE orphan runs. Each retry cycle burns more budget.
+
+**Worry**: The `not body` check in `gh_api()` also skips JSON parsing for non-204 responses with empty bodies. A future GitHub API change that returns an empty body with status 200 would be silently accepted instead of raising an error. This is the safer trade-off (don't crash), but could mask unexpected API behavior.
+
+---
+
+### TC-BL-REG-15: Session Reservation Gate Removed — Child-Count Concurrency Only (Bug #14)
+
+**Setup**: Create 5+ active Devin sessions externally (e.g., via the PR-scoped workflow on multiple PRs). Then trigger the orchestrator workflow with `max_batches=1`.
+
+**Expected**:
+1. The orchestrator does NOT check `check_active_devin_sessions()` before dispatching
+2. The orchestrator dispatches based solely on `len(active_children) < max_concurrent`
+3. Even with 62 external sessions running, the orchestrator immediately dispatches a child workflow
+4. The child workflow handles Devin API 429 rate limits internally (retry with backoff)
+5. The orchestrator logs show no "Session reservation" or "Waiting for session slots" messages
+
+**Validates**: Bug #14 fix — `check_active_devin_sessions()` queries ALL sessions on the Devin account, not just sessions from this orchestrator. External sessions (PR reviews, other repos) block dispatch indefinitely because `62 >= max_concurrent(3)`.
+
+**Production scenario**: A Fortune 500 company uses Devin for multiple repos and workflows. At any given time, 5-10 Devin sessions are running across the organization. The backlog orchestrator would NEVER dispatch because it sees 10 active sessions >= 3 limit. The security backlog grows indefinitely while the orchestrator reports "waiting for session slots."
+
+**Worry**: With the session reservation gate removed, if `max_concurrent=5` and 5 other sessions are already consuming all Devin slots, the orchestrator will dispatch 5 children that all fail to create Devin sessions (429 rate limit). The children must handle this gracefully with retry/backoff. If they don't, all 5 children fail immediately and the orchestrator marks all batches as failed.
