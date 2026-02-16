@@ -894,46 +894,57 @@ jobs:
               return prompt
 
           def create_devin_session(batch):
-              """Create a Devin session for a batch via v1 API. Returns (session_id, session_url) or (None, None)."""
+              """Create a Devin session for a batch via v1 API. Returns (session_id, session_url) or (None, None).
+              Bug #49 fix: retries with exponential backoff on 429 before giving up.
+              Previously, a single 429 caused immediate fallback to standalone mode,
+              which meant the child would also hit 429 (same rate limit)."""
               print(f"  Creating Devin session for Batch {batch['batch_id']}...")
               details, summary = fetch_alert_details(batch["alert_ids"])
               details_json = json.dumps(details, indent=2)
               prompt = build_session_prompt(batch, details_json, summary)
-              prompt_json = json.dumps(prompt)
 
-              try:
-                  req = urllib.request.Request(
-                      "https://api.devin.ai/v1/sessions",
-                      data=json.dumps({"prompt": prompt, "max_acu_limit": 10}).encode(),
-                      headers={
-                          "Authorization": f"Bearer {devin_key}",
-                          "Content-Type": "application/json"
-                      },
-                      method="POST"
-                  )
-                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
-                  data = json.loads(resp.read())
-                  session_id = data.get("session_id", "")
-                  session_url = data.get("url", "")
-                  if not session_url and session_id:
-                      session_url = f"https://app.devin.ai/sessions/{session_id}"
-                  if session_id:
-                      print(f"    Session created: {session_url}")
-                      return session_id, session_url
-                  else:
-                      print(f"    Session creation returned no session_id")
+              max_retries = 3
+              retry_wait = 30
+              for attempt in range(1, max_retries + 1):
+                  try:
+                      req = urllib.request.Request(
+                          "https://api.devin.ai/v1/sessions",
+                          data=json.dumps({"prompt": prompt, "max_acu_limit": 10}).encode(),
+                          headers={
+                              "Authorization": f"Bearer {devin_key}",
+                              "Content-Type": "application/json"
+                          },
+                          method="POST"
+                      )
+                      resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+                      data = json.loads(resp.read())
+                      session_id = data.get("session_id", "")
+                      session_url = data.get("url", "")
+                      if not session_url and session_id:
+                          session_url = f"https://app.devin.ai/sessions/{session_id}"
+                      if session_id:
+                          print(f"    Session created: {session_url}")
+                          return session_id, session_url
+                      else:
+                          print(f"    Session creation returned no session_id")
+                          return None, None
+                  except urllib.error.HTTPError as e:
+                      status_code = e.code
+                      body = e.read().decode()[:300]
+                      if status_code == 429 and attempt < max_retries:
+                          print(f"    Rate limited (429) — retry {attempt}/{max_retries} in {retry_wait}s...")
+                          time.sleep(retry_wait)
+                          retry_wait *= 2
+                          continue
+                      elif status_code == 429:
+                          print(f"    Rate limited (429) — all {max_retries} retries exhausted")
+                      else:
+                          print(f"    Session creation failed (HTTP {status_code}): {body}")
                       return None, None
-              except urllib.error.HTTPError as e:
-                  status_code = e.code
-                  body = e.read().decode()[:300]
-                  if status_code == 429:
-                      print(f"    Rate limited (429) — will retry later")
-                  else:
-                      print(f"    Session creation failed (HTTP {status_code}): {body}")
-                  return None, None
-              except Exception as e:
-                  print(f"    Session creation error: {e}")
-                  return None, None
+                  except Exception as e:
+                      print(f"    Session creation error: {e}")
+                      return None, None
+              return None, None
 
           def dispatch_child(batch, session_id=None, session_url=None):
               """Dispatch child workflow, optionally with pre-created session."""
