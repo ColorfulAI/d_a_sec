@@ -1,4 +1,5 @@
 from flask import request, Flask, make_response
+from markupsafe import escape
 import pickle
 import base64
 import yaml
@@ -24,4 +25,4 @@ def deserialize_data():
 def parse_config():
     config_text = request.form.get("config", "")
     config = yaml.load(config_text)
-    return {"config": config}
+    return {"config": escape(str(config))}
