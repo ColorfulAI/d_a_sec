@@ -37,9 +37,7 @@ def render_page_47_3():
 
 @app.route("/fetch_47_4")
 def fetch_url_47_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
-    return resp.read()
+    return make_response("endpoint disabled", 403)
 
 @app.route("/load_47_5")
 def load_data_47_5():
