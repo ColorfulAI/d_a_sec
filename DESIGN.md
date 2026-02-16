@@ -1132,6 +1132,114 @@ The split can be implemented incrementally:
 
 ---
 
+## Unfixable Alert → Human Review Pipeline
+
+### The Problem
+
+When Devin cannot fix an alert after 2 internal CodeQL verification attempts inside the session, that alert must be:
+1. **Identified by specific alert ID** (not just a count)
+2. **Recorded in the cursor** as `unfixable_alert_ids` (so future runs skip it)
+3. **Surfaced to humans** with clear actionable information
+
+Without this pipeline, unfixable alerts are silently buried in the "processed" bucket. No human is notified, no one knows which specific alerts need manual attention, and the backlog appears "complete" when it isn't.
+
+### Architecture
+
+```
+Batch Workflow (child)                    Orchestrator
+┌─────────────────────┐                   ┌─────────────────────┐
+│ Devin session        │                   │                     │
+│ completes            │                   │                     │
+│         │            │                   │                     │
+│         ▼            │                   │                     │
+│ Re-query CodeQL API  │                   │                     │
+│ for EACH alert ID    │                   │                     │
+│ in this batch        │                   │                     │
+│         │            │                   │                     │
+│    ┌────┴────┐       │                   │                     │
+│    │         │       │                   │                     │
+│  fixed    still open │   artifact.json   │                     │
+│    │         │       │ ─────────────────>│ Download artifact   │
+│    ▼         ▼       │                   │         │           │
+│ fixed_    unfixable_ │                   │    ┌────┴────┐      │
+│ alert_ids alert_ids  │                   │    │         │      │
+│                      │                   │ cursor:   cursor:   │
+│ Upload as artifact   │                   │ processed unfixable │
+└─────────────────────┘                   │         │           │
+                                          │         ▼           │
+                                          │ Post comment on     │
+                                          │ tracking issue:     │
+                                          │ "⚠ N alerts need   │
+                                          │  human review"      │
+                                          │         │           │
+                                          │         ▼           │
+                                          │ Apply label:        │
+                                          │ devin:human-review- │
+                                          │ needed              │
+                                          └─────────────────────┘
+```
+
+### How It Works
+
+**Step 1: Batch workflow verifies each alert (source of truth)**
+
+After the Devin session completes, the batch workflow re-queries the CodeQL API for each alert ID in the batch:
+- `state == "fixed"` → alert goes to `fixed_alert_ids`
+- `state == "dismissed"` → treated as resolved (someone manually dismissed it)
+- `state == "open"` → alert goes to `unfixable_alert_ids`
+- API error → conservatively marked unfixable
+
+This is the **source of truth** — not commit counting (which was the old approach and unreliable: 1 commit ≠ 1 fix).
+
+**Step 2: Orchestrator reads batch result artifact**
+
+When a child workflow completes successfully, the orchestrator downloads its `batch-{id}-result` artifact (a ZIP containing `batch_result.json`). This JSON contains:
+```json
+{
+  "fixed_alert_ids": ["201", "205", "206"],
+  "unfixable_alert_ids": ["212", "217"],
+  "fixed_count": 3,
+  "failed_count": 2
+}
+```
+
+**Step 3: Cursor updated with per-alert granularity**
+
+- Fixed alerts → `cursor.processed_alert_ids` (won't be retried)
+- Unfixable alerts → `cursor.unfixable_alert_ids` (won't be retried, AND surfaced to humans)
+- If artifact download fails → fallback: all alerts marked as `processed` (safe but loses granularity)
+
+**Step 4: Human notification**
+
+If any unfixable alerts exist after the orchestrator completes:
+1. A comment is posted on the tracking issue with a table of unfixable alert IDs + links
+2. The `devin:human-review-needed` label is applied to the tracking issue
+3. The workflow summary includes the unfixable count
+
+### Why This Matters in Production
+
+| Without this pipeline | With this pipeline |
+|---|---|
+| Alert silently disappears into "processed" | Alert explicitly tagged as "unfixable" |
+| No human is notified | Tracking issue comment + label alerts the team |
+| Next run skips it (good) but no one knows why | Next run skips it AND humans know to investigate |
+| Backlog dashboard shows 100% complete (misleading) | Dashboard shows "150 fixed, 12 need human review" |
+| Enterprise client asks "what happened to alert #217?" | Client sees "Alert #217: Devin attempted, needs human review" |
+
+### Edge Cases and Worries
+
+**Worry: CodeQL API returns stale state**
+After Devin pushes a fix, the CodeQL alert state might not immediately flip to "fixed" because CodeQL re-analysis needs to run on the default branch. The batch workflow queries CodeQL right after the session completes, which may be before the fix is merged.
+
+**Mitigation**: The batch workflow checks alert state on the `main` branch. Since the fix is on a PR branch (not yet merged), alerts will likely still show as "open." This means the first run may over-report unfixable alerts. On the next orchestrator run (after PRs are merged), the re-query will correctly show them as "fixed" and they'll be removed from the unfixable list. This is a conservative approach — better to over-report than under-report.
+
+**Worry: Artifact download fails**
+If the orchestrator can't download the batch result artifact (permissions, timing, GitHub API issue), it falls back to marking all alerts as "processed" — losing the fixed/unfixable distinction.
+
+**Mitigation**: The fallback is safe (alerts won't be retried), but loses granularity. The orchestrator logs a warning when this happens. Future improvement: also check child workflow outputs directly via the GitHub Actions API.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations

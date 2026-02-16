@@ -710,3 +710,105 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #7 fix — operator precedence is correct with explicit grouping.
 
 **Worry**: The old code `&& finished || stopped` would enter the commit-counting block when status=stopped even without a branch, then query `https://api.github.com/repos/.../compare/main...` with an empty branch name, getting a 404 or unexpected response.
+
+---
+
+## Unfixable Alert → Human Review Tests
+
+### TC-BL-REG-5: Unfixable Alerts Identified by Re-Querying CodeQL
+
+**Setup**: Seed main with alerts in files that contain deliberately unfixable patterns (e.g., a SQL injection that requires architectural refactoring, not a simple parameterization). Trigger backlog workflow with max_batches=1.
+
+**Expected**:
+1. Devin session completes (finished or stopped)
+2. Batch workflow's collect-results step re-queries CodeQL API for each alert ID
+3. Alerts that are still `state=open` are listed in `unfixable_alert_ids` output
+4. Alerts that flipped to `state=fixed` are listed in `fixed_alert_ids` output
+5. The `batch_result.json` artifact contains both lists with specific alert IDs
+6. The batch workflow summary shows "Alerts Requiring Human Review" section with clickable links
+
+**Validates**: The batch workflow uses CodeQL API as source of truth (not commit counting) to determine which alerts were actually fixed.
+
+**Production scenario**: A Fortune 500 repo has 50 alerts. Devin fixes 40 but can't fix 10 (complex architectural issues). Without per-alert verification, the orchestrator marks all 50 as "processed" and no one knows about the 10. With this fix, the 10 are explicitly flagged for human review.
+
+**Worry**: If the CodeQL API returns stale state (fix not yet reflected because PR not merged), alerts may be incorrectly classified as unfixable. This is a conservative error — better to over-report than miss genuinely unfixable alerts. The next orchestrator run (after PR merge) will re-classify correctly.
+
+---
+
+### TC-BL-REG-6: Orchestrator Categorizes Fixed vs Unfixable in Cursor
+
+**Setup**: Run the orchestrator with a batch that has mixed results (some fixed, some unfixable). Check the tracking issue cursor after completion.
+
+**Expected**:
+1. Orchestrator downloads batch result artifact from child workflow
+2. `fixed_alert_ids` from artifact → added to `cursor.processed_alert_ids`
+3. `unfixable_alert_ids` from artifact → added to `cursor.unfixable_alert_ids`
+4. Cursor JSON on tracking issue shows both lists with correct alert IDs
+5. `total_fixed` and `total_unfixable` counters are accurate
+6. On next orchestrator run, both fixed and unfixable alerts are skipped (not re-dispatched)
+
+**Validates**: The orchestrator properly categorizes alerts based on batch results, not just batch success/failure.
+
+**Production scenario**: After 3 orchestrator runs, the cursor shows: "150 processed, 135 fixed, 15 unfixable." A security manager can immediately see the remediation progress and know exactly which 15 alerts need manual attention.
+
+**Worry**: If artifact download fails (GitHub API issue, permissions), the orchestrator falls back to marking all alerts as "processed" — losing the fixed/unfixable distinction. The fallback is safe but not ideal. Check that the warning is logged clearly.
+
+---
+
+### TC-BL-REG-7: Tracking Issue Gets Human Review Comment
+
+**Setup**: Run the orchestrator with alerts that result in some unfixable. Check the tracking issue after completion.
+
+**Expected**:
+1. Orchestrator posts a "⚠ Alerts Requiring Human Review" comment on the tracking issue
+2. Comment contains a table with: alert ID, link to CodeQL alert, "Manual review" action
+3. The `devin:human-review-needed` label is applied to the tracking issue
+4. The label is created with correct color and description if it doesn't exist
+5. The label check uses GET before POST (no 422 errors on repeat runs)
+6. Comment includes a link back to the orchestrator run for context
+
+**Validates**: Unfixable alerts are surfaced to humans through GitHub's native notification system (issue comment + label → email/Slack notifications for watchers).
+
+**Production scenario**: An enterprise security team has a Slack integration that triggers on `devin:human-review-needed` label. When the orchestrator flags unfixable alerts, the team's #security-alerts Slack channel gets an immediate notification with links to the specific alerts. No manual checking of workflow runs needed.
+
+**Worry**: If the comment is posted but the label isn't applied (or vice versa), the notification pipeline is broken. Both must succeed for the full notification flow. Also: if the tracking issue doesn't exist (deleted or wrong number), the comment post fails silently. The orchestrator should handle this gracefully.
+
+---
+
+### TC-BL-REG-8: Unfixable Alerts Skipped on Next Run
+
+**Setup**: Run the orchestrator once (some alerts become unfixable). Run the orchestrator again without changing any code.
+
+**Expected**:
+1. Second run reads cursor from tracking issue
+2. Alerts in `unfixable_alert_ids` are skipped during alert filtering: "Unfixable (skipped): N"
+3. Alerts in `processed_alert_ids` are also skipped
+4. Only new/unprocessed alerts (if any) are batched
+5. If all alerts are processed or unfixable, the orchestrator exits with "No new alerts to process"
+6. No new Devin sessions are created for unfixable alerts
+
+**Validates**: The cursor's `unfixable_alert_ids` list actually prevents re-processing. An unfixable alert is never sent to Devin again.
+
+**Production scenario**: A cron-triggered orchestrator runs every 6 hours. If alert #217 was unfixable on the first run, it must not consume a Devin session slot on subsequent runs. With 5 concurrent session slots and potentially hundreds of new alerts, wasting a slot on a known-unfixable alert delays the entire backlog.
+
+**Worry**: If the cursor parsing has a bug (e.g., string vs int comparison for alert IDs), unfixable alerts might not be recognized and get re-dispatched repeatedly. Each re-dispatch wastes a Devin session (~10 min, ~$X in ACU costs) for a guaranteed failure.
+
+---
+
+### TC-BL-REG-9: Session Failure Marks All Batch Alerts as Unfixable
+
+**Setup**: Trigger a batch workflow where the Devin session fails entirely (status=failed or error — e.g., Devin can't clone the repo, hits an internal error).
+
+**Expected**:
+1. Session status is `failed` or `error`
+2. Collect-results step marks ALL alerts in the batch as unfixable (conservative)
+3. `unfixable_alert_ids` = full list of batch alert IDs
+4. `fixed_alert_ids` = empty
+5. The batch workflow still uploads the result artifact (so orchestrator can read it)
+6. Tracking issue gets the "human review" comment for ALL affected alerts
+
+**Validates**: Complete session failures are handled conservatively — all alerts are flagged for human review rather than silently disappearing.
+
+**Production scenario**: Devin's API has a transient outage. A batch of 15 alerts gets a session that immediately fails. Without this handling, those 15 alerts are marked "processed" and never retried. With this handling, they're marked "unfixable" with a clear reason, and a human can decide to re-run after the outage is resolved.
+
+**Worry**: If session failure causes the collect-results step to also fail (cascading error), no artifact is uploaded, and the orchestrator's fallback marks everything as "processed" — losing the unfixable distinction entirely. The collect-results step must have `if: always()` to run even on prior step failures.

@@ -688,10 +688,52 @@ jobs:
                       if conclusion == "success":
                           print(f"  Batch {batch['batch_id']}: COMPLETED (success)")
                           completed_batches.append(batch)
-                          # Update cursor: mark alerts as processed
-                          for aid in batch["alert_ids"]:
-                              if aid not in cursor["processed_alert_ids"]:
-                                  cursor["processed_alert_ids"].append(aid)
+
+                          # Fetch batch result artifact to get per-alert fixed/unfixable breakdown
+                          # The child workflow outputs fixed_alert_ids and unfixable_alert_ids
+                          batch_unfixable = []
+                          batch_fixed = []
+                          try:
+                              run_id_val = child["run_id"]
+                              artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}/artifacts"
+                              req = urllib.request.Request(artifacts_url, headers=headers)
+                              with urllib.request.urlopen(req) as resp:
+                                  artifacts = json.loads(resp.read())
+                              for artifact in artifacts.get("artifacts", []):
+                                  if artifact["name"].startswith(f"batch-{batch['batch_id']}-"):
+                                      print(f"    Found result artifact: {artifact['name']}")
+                                      # Download and parse the artifact
+                                      dl_url = artifact["archive_download_url"]
+                                      req2 = urllib.request.Request(dl_url, headers=headers)
+                                      with urllib.request.urlopen(req2) as resp2:
+                                          import zipfile, io
+                                          z = zipfile.ZipFile(io.BytesIO(resp2.read()))
+                                          for name in z.namelist():
+                                              if name.endswith(".json"):
+                                                  result_data = json.loads(z.read(name))
+                                                  batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
+                                                  batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
+                                                  print(f"    Fixed: {len(batch_fixed)}, Unfixable: {len(batch_unfixable)}")
+                                          z.close()
+                          except Exception as e:
+                              print(f"    Could not fetch batch result artifact: {e}")
+                              print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as processed")
+
+                          # Update cursor with per-alert granularity
+                          if batch_fixed or batch_unfixable:
+                              for aid in batch_fixed:
+                                  if aid not in cursor["processed_alert_ids"]:
+                                      cursor["processed_alert_ids"].append(aid)
+                              for aid in batch_unfixable:
+                                  if aid not in cursor.get("unfixable_alert_ids", []):
+                                      cursor.setdefault("unfixable_alert_ids", []).append(aid)
+                              cursor["total_fixed"] = cursor.get("total_fixed", 0) + len(batch_fixed)
+                              cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
+                          else:
+                              # Fallback: no artifact data, mark all as processed
+                              for aid in batch["alert_ids"]:
+                                  if aid not in cursor["processed_alert_ids"]:
+                                      cursor["processed_alert_ids"].append(aid)
                           cursor["total_processed"] = len(cursor["processed_alert_ids"])
                       else:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
@@ -738,6 +780,7 @@ jobs:
 
           # Summary
           total_time = int(time.time() - start_time)
+          unfixable_ids = cursor.get("unfixable_alert_ids", [])
           print(f"\n{'='*60}")
           print(f"Orchestrator complete")
           print(f"{'='*60}")
@@ -747,6 +790,10 @@ jobs:
           print(f"  Batches remaining: {len(pending_batches)}")
           print(f"  Total alerts processed: {sum(b['alert_count'] for b in completed_batches)}")
           print(f"  Total alerts failed: {sum(b['alert_count'] for b in failed_batches)}")
+          print(f"  Alerts fixed: {cursor.get('total_fixed', 0)}")
+          print(f"  Alerts unfixable (human review): {len(unfixable_ids)}")
+          if unfixable_ids:
+              print(f"  Unfixable alert IDs: {unfixable_ids}")
 
           # Write summary for GitHub Actions
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
@@ -755,12 +802,15 @@ jobs:
               f.write(f"failed_count={len(failed_batches)}\n")
               f.write(f"remaining_count={len(pending_batches)}\n")
               f.write(f"total_time={total_time}\n")
+              f.write(f"unfixable_count={len(unfixable_ids)}\n")
+              f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
 
           # Write detailed results
           results = {
               "completed": [{"batch_id": b["batch_id"], "alert_ids": b["alert_ids"]} for b in completed_batches],
               "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion")} for b in failed_batches],
-              "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches]
+              "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches],
+              "unfixable_alert_ids": unfixable_ids
           }
           with open("/tmp/orchestrator_results.json", "w") as f:
               json.dump(results, f, indent=2)
@@ -780,5 +830,67 @@ jobs:
           echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
           echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+
+      # ----------------------------------------------------------------
+      # STEP 8: Report unfixable alerts for human review
+      # ----------------------------------------------------------------
+      - name: Report unfixable alerts
+        if: always() && steps.orchestrate.outputs.unfixable_count != '0' && steps.orchestrate.outputs.unfixable_count != ''
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          ISSUE_NUMBER="${{ steps.tracking-issue.outputs.issue_number }}"
+          UNFIXABLE_IDS="${{ steps.orchestrate.outputs.unfixable_alert_ids }}"
+          UNFIXABLE_COUNT="${{ steps.orchestrate.outputs.unfixable_count }}"
+          RUN_ID="${{ github.run_id }}"
+
+          # Build the human review comment body
+          BODY="## :warning: Alerts Requiring Human Review\n\n"
+          BODY+="**${UNFIXABLE_COUNT} alert(s)** could not be automatically fixed by Devin after internal CodeQL verification (2 attempts per alert inside the session).\n\n"
+          BODY+="These alerts need manual investigation by a security engineer.\n\n"
+          BODY+="| Alert | Link | Action Needed |\n"
+          BODY+="|-------|------|---------------|\n"
+
+          IFS=',' read -ra AIDS <<< "$UNFIXABLE_IDS"
+          for aid in "${AIDS[@]}"; do
+            if [ -n "$aid" ]; then
+              BODY+="| #${aid} | [View alert](https://github.com/${REPO}/security/code-scanning/${aid}) | :eyes: Manual review |\n"
+            fi
+          done
+
+          BODY+="\n---\n"
+          BODY+="*Reported by [orchestrator run](https://github.com/${REPO}/actions/runs/${RUN_ID})*\n"
+          BODY+="*These alerts were attempted by Devin but could not be resolved. Possible reasons: complex logic requiring human judgment, false positives that should be dismissed, or alerts requiring architectural changes.*"
+
+          # Post comment on the tracking issue
+          if [ -n "$ISSUE_NUMBER" ] && [ "$ISSUE_NUMBER" != "0" ]; then
+            echo "Posting unfixable alerts report to issue #$ISSUE_NUMBER..."
+            curl -s -L -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+              -d "$(jq -n --arg body "$(echo -e "$BODY")" '{body: $body}')"
+            echo "Posted unfixable alerts report."
+          fi
+
+          # Apply label for visibility
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/labels/devin%3Ahuman-review-needed")
+          if [ "$HTTP_CODE" = "404" ]; then
+            curl -s -L -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/labels" \
+              -d '{"name":"devin:human-review-needed","color":"d93f0b","description":"Alerts that Devin could not auto-fix — requires human security review"}'
+          fi
+          curl -s -L -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/labels" \
+            -d '["devin:human-review-needed"]'
+          echo "Applied devin:human-review-needed label to issue #$ISSUE_NUMBER"
