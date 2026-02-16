@@ -1194,6 +1194,25 @@ The split can be implemented incrementally:
 
 **Trade-off**: If max_concurrent=3 and 4 other sessions are already running, the orchestrator may dispatch 3 children that each fail to create Devin sessions (429). This is acceptable because: (1) child workflows retry with backoff, (2) failed session creation doesn't waste ACU budget, and (3) the orchestrator's poll loop will detect child failures and handle them.
 
+### Bug #15: Status Field Mismatch in Batch Workflow Polling
+
+**Discovered**: During iteration 3 (batch run 22056586654). The batch workflow polled the Devin session for 28+ minutes without detecting completion, despite the session having successfully created PR #121 with all CodeQL checks passing.
+
+**Root cause**: The batch workflow's polling logic extracted the `.status` field (a free-form string) from the Devin API response and matched it against a fixed set of values: `finished|stopped|blocked|suspended|failed|error`. However, the Devin API's well-defined field is `.status_enum`, which uses a different, documented set of values: `working`, `blocked`, `expired`, `finished`, `suspend_requested`, `suspend_requested_frontend`, `resume_requested`, `resume_requested_frontend`, `resumed`. The `.status` field value didn't match any case branch, so every poll fell through to the "still running" path.
+
+**Why this is critical in production**: Every batch workflow run would poll for the full 45-minute timeout and then report "timeout" even when the Devin session completed successfully in 10 minutes. This means: (1) batch workflows take 4.5× longer than necessary, (2) the orchestrator's rolling window is blocked (a slot that should free up in 10 min is held for 45 min), (3) a 34-batch backlog that should take ~70 min takes ~315 min (5+ hours), dangerously close to GitHub Actions' 6-hour timeout, and (4) all alerts are incorrectly marked as "timeout" (unfixable) even when they were successfully fixed.
+
+**Solution**: Updated the polling logic to:
+1. Extract both `.status` and `.status_enum` from the API response
+2. Prefer `status_enum` (well-defined enum) over `status` (free-form string)
+3. Fall back to `.status` only if `status_enum` is missing or null
+4. Added `expired` as a recognized terminal state (session timed out)
+5. Added `suspend_requested` and `suspend_requested_frontend` to the blocked/needs-intervention case
+6. Log both fields (`status=$STATUS status_enum=$STATUS_ENUM`) for future debugging
+7. Updated downstream steps (Create PR condition, collect-results) to handle all new status values
+
+**Diagnostic improvement**: Every poll now logs `Poll N/45: status=X status_enum=Y`, making it trivial to diagnose future polling issues from workflow logs.
+
 ---
 
 ## Unfixable Alert → Human Review Pipeline

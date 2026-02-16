@@ -925,3 +925,38 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: A Fortune 500 company uses Devin for multiple repos and workflows. At any given time, 5-10 Devin sessions are running across the organization. The backlog orchestrator would NEVER dispatch because it sees 10 active sessions >= 3 limit. The security backlog grows indefinitely while the orchestrator reports "waiting for session slots."
 
 **Worry**: With the session reservation gate removed, if `max_concurrent=5` and 5 other sessions are already consuming all Devin slots, the orchestrator will dispatch 5 children that all fail to create Devin sessions (429 rate limit). The children must handle this gracefully with retry/backoff. If they don't, all 5 children fail immediately and the orchestrator marks all batches as failed.
+
+### TC-BL-REG-16: Status Field Mismatch — Polling Uses status_enum (Bug #15)
+
+**Setup**: Trigger the orchestrator workflow with `max_batches=1`. Let the child batch workflow create a Devin session and wait for it to complete. Monitor the batch workflow's "Poll Devin session status" step logs.
+
+**Expected**:
+1. Each poll line logs BOTH fields: `Poll N/45: status=X status_enum=Y`
+2. The polling exits promptly when `status_enum` reaches a terminal value (`finished`, `expired`, `blocked`, `suspend_requested`, etc.)
+3. The polling does NOT run for 45 minutes (the full timeout) when the session has already completed
+4. The `EFFECTIVE_STATUS` logic correctly falls back to `.status` if `.status_enum` is missing/null
+5. The downstream "Create PR" step fires for `finished`, `stopped`, `expired`, `suspended`, `suspend_requested`, and `suspend_requested_frontend` statuses
+6. The collect-results step correctly categorizes alerts based on the effective status
+
+**Validates**: Bug #15 fix — the batch workflow's polling logic previously checked `.status` (free-form string) against `finished|stopped|blocked|suspended|failed|error`, but the Devin API returns `.status_enum` with a different value set (`working`, `finished`, `expired`, `suspend_requested`, etc.). Every poll fell through to "still running" because `.status` didn't match any case branch.
+
+**Production scenario**: A Fortune 500 company runs the backlog orchestrator nightly. Each batch takes ~10 min for Devin to fix. Without the Bug #15 fix, every batch polls for 45 min (the full timeout), so a 34-batch backlog takes 5+ hours instead of ~70 min. With the fix, the polling detects completion immediately and frees the slot for the next batch.
+
+**Worry**: If the Devin API changes `status_enum` values in a future version (e.g., adds `completed` instead of `finished`), the polling will silently revert to timeout mode. The dual-field logging (`status=X status_enum=Y`) is the safety net — operators can spot the unknown value in logs and update the case statement. But if no one is watching logs, the regression goes unnoticed until backlog runs start timing out.
+
+### TC-BL-REG-17: Expired Session Handled Gracefully (Bug #15 Extension)
+
+**Setup**: Create a Devin session with a very low `max_acu_limit` (e.g., 1) so the session expires before completing all fixes. Trigger the batch workflow with this session's batch of alerts.
+
+**Expected**:
+1. The polling detects `status_enum=expired` and exits with `status=expired`
+2. The "Create PR" step fires (session may have pushed partial fixes before expiring)
+3. The collect-results step queries CodeQL for each alert — any that were fixed before expiration are marked as `fixed`, the rest as `unfixable`
+4. The unfixable alerts appear in the workflow summary under "Alerts Requiring Human Review"
+5. The orchestrator correctly processes the batch result and updates the cursor
+
+**Validates**: The `expired` status handling added as part of Bug #15 fix. Previously, an expired session would cause the polling to timeout (45 min waste) and all alerts would be marked as "timeout" — losing any partial fixes the session made before expiring.
+
+**Production scenario**: An organization sets conservative ACU limits per session. A complex batch with 15 alerts causes the session to expire after fixing only 8. Without proper `expired` handling, all 15 alerts are marked unfixable. With the fix, the 8 fixed alerts are correctly identified via CodeQL re-query, and only the remaining 7 are flagged for human review.
+
+**Worry**: The `expired` status triggers the "Create PR" path, but an expired session may not have pushed a branch at all. The branch-existence check (HTTP 404 guard) should handle this — if no branch exists, `pr_created=false` and no PR is attempted. But if the session pushed a partial branch with broken code, a PR is created with incomplete fixes that may fail CodeQL. The collect-results step's per-alert CodeQL re-query is the safety net here.
