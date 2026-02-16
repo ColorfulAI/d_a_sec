@@ -63,7 +63,9 @@ def fetch_url_49_4():
 @app.route("/load_49_5")
 def load_data_49_5():
     data = request.get_data()
-    return str(json.loads(data))
+    resp = make_response(html.escape(str(json.loads(data))))
+    resp.content_type = "text/plain"
+    return resp
 
 @app.route("/proc_49_6")
 def process_49_6():
