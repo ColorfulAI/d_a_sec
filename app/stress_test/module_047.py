@@ -11,6 +11,10 @@ from markupsafe import escape
 app = Flask(__name__)
 
 SAFE_READ_DIR = "/var/data"
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com/data",
+}
 
 @app.route("/query_47_0")
 def query_db_47_0():
@@ -46,7 +50,10 @@ def render_page_47_3():
 
 @app.route("/fetch_47_4")
 def fetch_url_47_4():
-    url = request.args.get("url")
+    key = request.args.get("url")
+    url = ALLOWED_URLS.get(key)
+    if url is None:
+        return "URL not allowed", 403
     resp = urllib.request.urlopen(url)
     return resp.read()
 
