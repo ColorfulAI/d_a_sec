@@ -10,6 +10,8 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+SAFE_READ_DIR = "/var/data"
+
 @app.route("/query_47_0")
 def query_db_47_0():
     user_id = request.args.get("id")
@@ -29,8 +31,13 @@ def run_cmd_47_1():
 @app.route("/read_47_2")
 def read_file_47_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_base = os.path.realpath(SAFE_READ_DIR)
+    safe_path = os.path.realpath(os.path.join(safe_base, path))
+    if not safe_path.startswith(safe_base + os.sep):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        content = f.read()
+    return escape(content)
 
 @app.route("/render_47_3")
 def render_page_47_3():
