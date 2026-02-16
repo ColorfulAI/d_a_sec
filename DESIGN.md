@@ -1366,6 +1366,31 @@ This meant the three-state classification from Bug #18 still never reached the c
 
 **Solution (Bug #21 fix)**: Replaced the entire urllib-based artifact download with a `subprocess.run(["curl", "-sL", ...])` call. `curl` natively strips `Authorization` headers on cross-domain redirects (since curl 7.58+, standard on all GitHub-hosted runners). This avoids both the 403 (Bug #20) and the 400 (Bug #21) by never touching Python's redirect handling. The function `download_artifact_zip()` writes to a temp file, reads the bytes, and cleans up. A 60-second subprocess timeout prevents hangs.
 
+**Worry: Multi-batch cross-matching causes orphaned runs and infinite polling (Bug #22 — CONFIRMED)**
+
+When 2+ batches are dispatched within seconds of each other, the orchestrator's run resolution logic cross-matches them. GitHub's API returns workflow runs newest-first. The old code iterated this list per-child and grabbed the first unmatched run created after the child's dispatch time. When batch 1 (dispatched at T1) and batch 2 (dispatched at T1+5s) both trigger workflow runs, the API returns batch 2's run first (newest). Batch 1's resolution loop grabs batch 2's run because it was created after T1. Batch 2 then cannot find its own run (the original run for batch 1 was created between T1 and T1+5s but before T1+5s, so it doesn't match batch 2's `>= T1+5s` filter).
+
+**Observed behavior (iteration 4, orchestrator run 22060117744)**:
+1. Orchestrator dispatched batch 1 at T1, batch 2 at T1+5s
+2. GitHub created run A (for batch 1) and run B (for batch 2)
+3. Poll #1: Batch 1 resolved → run B (WRONG — run B was batch 2's run)
+4. Batch 2 could never find run A (created before batch 2's dispatch time)
+5. After 5 minutes: batch 2 re-dispatched → created run C (3rd workflow run, 3rd Devin session!)
+6. Run A completed as an orphan — wasted a Devin session slot
+7. Orchestrator stuck polling batch 2's re-dispatched run for 25+ minutes
+8. Had to be manually cancelled
+
+**Compound issues**:
+- **Orphaned Devin sessions**: Run A created a real Devin session that processed alerts but was never tracked. Its results were lost.
+- **Wasted ACU budget**: 3 Devin sessions created instead of 2 (50% waste)
+- **Infinite polling**: The `check_child_status()` function returns string `"unknown"` on API failure. The polling loop only handled `"completed"`, `"queued"`, `"in_progress"`, `"waiting"`. Any other status silently kept the child in `active_children` forever.
+
+**Why this is critical in production**: With 34 batches (500 alerts), every pair of concurrent dispatches risks cross-matching. A 5-slot rolling window dispatching 5 batches simultaneously would create 10 Devin sessions (5 correct + 5 orphans), burning the entire session budget in one wave. The orchestrator would then hang indefinitely waiting for the orphaned runs to "complete."
+
+**Solution (Bug #22 fix — two parts)**:
+1. **Chronological matching**: Collect ALL unresolved children in one pass. Sort both the API runs and unresolved children oldest-first by timestamp. Match 1:1 in dispatch order. Add `already_matched.add(run_id)` within the loop to prevent double-matching (was also a latent bug in the old code).
+2. **Unknown status handler**: Added `else` branch in the polling loop for unexpected statuses. Logs the unexpected status and evicts the child after `max_child_runtime` seconds, preventing infinite hang.
+
 ---
 
 ## Limitations and Future Work

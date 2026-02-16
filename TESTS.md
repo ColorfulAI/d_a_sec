@@ -1082,3 +1082,57 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: After deploying Bug #20's fix, a company's nightly backlog sweep still silently fails to download artifacts — but now with HTTP 400 instead of 403. The security team investigates the 403 fix, confirms `NoAuthRedirectHandler` is deployed, and concludes "artifact download is fixed." But the error has merely changed shape. The three-state classification still never reaches the cursor. Unfixable alerts are still invisible. This is a cascading fix failure — Bug #20's fix introduced Bug #21, and the fallback behavior masks both.
 
 **Worry**: Python's `urllib` redirect handling is fundamentally unreliable for GitHub's artifact download flow (GitHub API → 302 → Azure Blob Storage). Any fix that stays within urllib is fragile. The curl-based solution is the correct approach because curl's redirect handling is battle-tested and natively handles auth-stripping. But we must verify curl is available on the runner (standard on GitHub-hosted Ubuntu runners, may not be on self-hosted). If curl is missing or returns non-200, the fallback still triggers — test that the fallback path is still functional as a safety net.
+
+### TC-BL-REG-25: Multi-Batch Run Resolution Does Not Cross-Match (Bug #22)
+
+**Setup**: Trigger the orchestrator with `max_batches=2`, `reset_cursor=true`, `max_concurrent=3`. This dispatches 2 child batch workflows within seconds of each other. Observe the orchestrator logs during the run resolution phase (Poll #1 and subsequent polls).
+
+**Expected**:
+1. Orchestrator dispatches batch 1 at T1 and batch 2 at T1+5s
+2. On Poll #1, batch 1 resolves to the FIRST run created (oldest), batch 2 resolves to the SECOND run created (newest)
+3. Each batch's resolved run ID corresponds to the correct child workflow (no cross-matching)
+4. NO re-dispatch occurs for either batch (no "No workflow run found after Xs — re-dispatching" message)
+5. Exactly 2 child workflow runs are created total (not 3 or more)
+6. Both batches complete and the orchestrator exits the polling loop normally
+7. The summary shows results for both batches
+
+**Validates**: Bug #22 — GitHub's API returns workflow runs newest-first. The old code iterated per-child and matched the first unmatched run, causing batch 1 to grab batch 2's run. The fix sorts runs oldest-first and resolves all unmatched children in one pass with chronological 1:1 matching.
+
+**Production scenario**: A Fortune 500 company has 500 open CodeQL alerts (34 batches). The orchestrator dispatches 5 batches in the first wave. Without this fix, cross-matching creates 10 workflow runs (5 correct + 5 orphans from re-dispatch), burns 10 Devin sessions instead of 5, and the orchestrator hangs for 25+ minutes on orphaned runs. With 34 batches across 7 waves, the total waste is catastrophic: ~35 orphaned sessions, $thousands in wasted ACU budget, and the backlog sweep never completes within the 6-hour GitHub Actions timeout.
+
+**Worry**: The cross-matching is deterministic — it happens EVERY time 2+ batches are dispatched close together. This is not a rare race condition; it's a guaranteed failure in any multi-batch run. The `already_matched` set in the old code was built once at the start of the loop but never updated within the loop, so even if two children happened to match different runs, a third child could re-match an already-taken run.
+
+### TC-BL-REG-26: Unknown Status Does Not Cause Infinite Polling (Bug #22)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`. During the child batch workflow's execution, simulate a GitHub API outage by observing what happens when `check_child_status()` returns `"unknown"` (API failure). This can be tested by checking the orchestrator logs for any `unexpected status 'unknown'` messages.
+
+**Expected**:
+1. If `check_child_status()` returns `"unknown"` (API failure), the orchestrator logs `Batch X: unexpected status 'unknown' (Ys)`
+2. The child stays in `active_children` (transient failures should not immediately evict)
+3. If the API recovers on the next poll, the child's status returns to normal
+4. If the API fails for longer than `max_child_runtime` (3600s), the child is evicted with conclusion `unknown_status_unknown`
+5. The orchestrator does NOT hang indefinitely — it either recovers or evicts
+
+**Validates**: Bug #22 (part 2) — The polling loop previously only handled `"completed"`, `"queued"`, `"in_progress"`, `"waiting"`. Any other status silently kept the child in `active_children` forever. The `while active_children or pending_batches:` loop never exited because `active_children` never emptied.
+
+**Production scenario**: GitHub experiences a 30-minute API degradation (not uncommon — see https://www.githubstatus.com). During this window, every `check_child_status()` call returns `"unknown"`. Without the fix, the orchestrator accumulates children in `active_children` that can never be removed, the rolling window fills up (5/5 slots "occupied" by ghosts), no new batches are dispatched, and the orchestrator runs until the 6-hour timeout. With the fix, the orchestrator tolerates transient API failures and recovers once the API comes back.
+
+**Worry**: The 3600s eviction timeout for unknown status is very generous. If the API is down for 30 minutes, the orchestrator wastes 30 minutes of polling before evicting. A more aggressive strategy (e.g., evict after 10 consecutive unknown polls) would recover faster. But the conservative approach avoids false evictions from a single API hiccup. The trade-off is documented here for production tuning.
+
+### TC-BL-REG-27: Orchestrator Completes After All Children Complete (Bug #22 Regression)
+
+**Setup**: Trigger the orchestrator with `max_batches=2`, `reset_cursor=true`, `max_concurrent=3`. Let both child batch workflows run to completion. Monitor the orchestrator's polling loop until it exits.
+
+**Expected**:
+1. Both child batch workflows complete (status=completed, conclusion=success or failure)
+2. The orchestrator detects both completions and removes them from `active_children`
+3. `active_children` empties, `pending_batches` is empty
+4. The `while active_children or pending_batches:` loop exits normally
+5. The orchestrator proceeds to the summary step and completes
+6. Total orchestrator runtime is approximately: (child runtime) + (poll overhead) — NOT stuck for 25+ minutes after children complete
+
+**Validates**: Bug #22 full regression — confirms the orchestrator does not hang after all children complete. The previous iteration 4 attempt (orchestrator 22060117744) hung for 25+ minutes after both children (22060122063, 22060125305) completed successfully. The root cause was cross-matching + missing unknown status handler.
+
+**Production scenario**: The simplest invariant: if all children are done, the orchestrator should be done too. Any violation of this invariant means the backlog sweep never reports results, the cursor is never updated, unfixable alerts are never surfaced to humans, and the GitHub Actions job runs until the 6-hour timeout (costing compute minutes and blocking subsequent scheduled runs).
+
+**Worry**: Even with the Bug #22 fix, there are other paths that could cause the polling loop to hang: (a) a child's status transitions through an unexpected GitHub Actions state (e.g., "cancelled" before the orchestrator polls), (b) the safety timeout is set too high (currently 5400s = 90 minutes), or (c) a child is evicted but the orchestrator fails to update the cursor before the safety timeout. This test validates the happy path; TC-BL-REG-26 covers the API failure path.
