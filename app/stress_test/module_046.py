@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import pickle
+import urllib.parse
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -47,7 +48,12 @@ def render_page_46_3():
 @app.route("/fetch_46_4")
 def fetch_url_46_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    ALLOWED_HOSTS = ["example.com", "api.example.com"]
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_HOSTS:
+        return "Forbidden host", 403
+    safe_url = urllib.parse.urlunparse((parsed.scheme, parsed.hostname, parsed.path, "", parsed.query, ""))
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_46_5")
