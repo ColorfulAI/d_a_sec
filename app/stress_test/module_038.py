@@ -1,61 +1,71 @@
-"""Stress test module 38 — contains intentional vulnerabilities for testing."""
+"""Stress test module 38 — intentional vulnerabilities for CodeQL testing."""
+import sqlite3
+import os
+import subprocess
+import pickle
+import urllib.request
+from flask import Flask, request, make_response
 
-def query_db_380(request):
+app = Flask(__name__)
+
+@app.route("/query_38_0")
+def query_db_38_0():
     user_id = request.args.get("id")
-    import sqlite3
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return cursor.fetchall()
+    return str(cursor.fetchall())
 
-def run_cmd_381(request):
+@app.route("/cmd_38_1")
+def run_cmd_38_1():
     filename = request.args.get("file")
-    import os
     os.system("cat " + filename)
     return "done"
 
-def read_file_382(request):
+@app.route("/read_38_2")
+def read_file_38_2():
     path = request.args.get("path")
     with open(path, "r") as f:
         return f.read()
 
-def render_page_383(request):
+@app.route("/render_38_3")
+def render_page_38_3():
     name = request.args.get("name")
-    return "<html><body>Hello " + name + "</body></html>"
+    return make_response("<html><body>Hello " + name + "</body></html>")
 
-def fetch_url_384(request):
+@app.route("/fetch_38_4")
+def fetch_url_38_4():
     url = request.args.get("url")
-    import urllib.request
     resp = urllib.request.urlopen(url)
     return resp.read()
 
-def load_data_385(request):
-    import pickle
+@app.route("/load_38_5")
+def load_data_38_5():
     data = request.get_data()
-    return pickle.loads(data)
+    return str(pickle.loads(data))
 
-def process_386(request):
-    import subprocess
+@app.route("/proc_38_6")
+def process_38_6():
     cmd = request.args.get("cmd")
     result = subprocess.run(cmd, shell=True, capture_output=True)
     return result.stdout
 
-def check_status_387(request):
-    import os
+@app.route("/ping_38_7")
+def check_status_38_7():
     host = request.args.get("host")
     stream = os.popen("ping -c 1 " + host)
     return stream.read()
 
-def search_388(request):
+@app.route("/search_38_8")
+def search_38_8():
     term = request.args.get("q")
-    import sqlite3
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute(f"SELECT * FROM products WHERE name LIKE '%{term}%'")
-    return cursor.fetchall()
+    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
+    return str(cursor.fetchall())
 
-def calculate_389(request):
+@app.route("/calc_38_9")
+def calculate_38_9():
     expr = request.args.get("expr")
     result = eval(expr)
     return str(result)
-
