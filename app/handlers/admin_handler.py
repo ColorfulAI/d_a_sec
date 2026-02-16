@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 from flask import request, Flask, jsonify
 from markupsafe import escape
@@ -24,12 +23,18 @@ def execute_command():
     )
     return jsonify({"output": result.stdout})
 
+ALLOWED_LOG_FILES = {
+    "app.log": os.path.join("logs", "app.log"),
+    "error.log": os.path.join("logs", "error.log"),
+    "access.log": os.path.join("logs", "access.log"),
+}
+
 @app.route("/admin/logs")
 def view_logs():
     log_file = request.args.get("file", "app.log")
-    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', log_file):
-        return jsonify({"error": "Invalid file name"}), 400
-    safe_path = os.path.join("logs", log_file)
+    safe_path = ALLOWED_LOG_FILES.get(log_file)
+    if safe_path is None:
+        return jsonify({"error": "Invalid log file"}), 400
     with open(safe_path, "r") as f:
         content = f.read()
     return jsonify({"content": content})
