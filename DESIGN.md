@@ -1449,6 +1449,18 @@ The GitHub Actions step summary (visible in the Actions UI) showed batch counts,
 
 **Solution (Bug #28 fix)**: The orchestrator results JSON now includes `pr_urls` array. The Summary step reads this file and appends a "Fix PRs Created" section to the step summary with clickable links. Also added `alert_ids` to the failed batches in the results JSON for debugging.
 
+**Worry: Multi-line Python in YAML block scalar breaks workflow dispatch (Bug #29 — CONFIRMED)**
+
+The Bug #28 fix added inline Python code inside a `$(python3 -c "...")` command substitution within the Summary step's `run: |` block. The Python code was written across multiple lines starting at column 1 (no indentation). YAML's literal block scalar (`|`) requires all content lines to be indented at least as much as the first content line (10 spaces in this case). Lines starting at column 1 violate this rule, causing a YAML `ScannerError: could not find expected ':'` at the `import json` line.
+
+**Observed behavior**: After merging PR #139 with the multi-line Python code, every `workflow_dispatch` attempt returned HTTP 422: `"Workflow does not have 'workflow_dispatch' trigger"`. GitHub couldn't parse the YAML at all, so none of the workflow's triggers were recognized. The entire backlog workflow was non-functional.
+
+**Production impact**: This is a deployment-blocking bug. A single YAML syntax error renders the entire workflow invisible to GitHub Actions. No error notification is sent — the workflow simply stops appearing in the Actions UI and API. In production, this means a scheduled sweep silently stops running with no alert.
+
+**Root cause**: Python code embedded in shell command substitutions within YAML block scalars must stay on a single line, or use a heredoc (`python3 << 'EOF'`) with proper indentation. The multi-line `$(python3 -c "...")` pattern is a YAML footgun.
+
+**Solution (Bug #29 fix)**: Collapsed the Python code into a single-line expression: `python3 -c "import json; data=json.load(open('/tmp/orchestrator_results.json')); prs=data.get('pr_urls',[]); print('\n'.join(prs)) if prs else None" 2>/dev/null`. Error handling via `2>/dev/null` replaces the `try/except` block.
+
 ---
 
 ## Limitations and Future Work

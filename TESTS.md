@@ -1238,3 +1238,25 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Validates**: Bug #28 — The step summary is the most visible output for enterprise teams. Without PR URLs, teams have to dig into job logs or search GitHub to find the fix PRs. The step summary should be a complete, actionable dashboard.
 
 **Worry**: The Summary step runs with `if: always()`, meaning it executes even if the orchestrate step failed. If the orchestrator crashes before writing `/tmp/orchestrator_results.json`, the Python script in the Summary step should handle the missing file gracefully (the `try/except` catches this). Also, if the orchestrator completes but no PRs were created (all batches failed), the "Fix PRs Created" section should be absent, not show an empty list.
+
+---
+
+### TC-BL-REG-34: YAML Block Scalar Integrity (Bug #29 Regression)
+
+**Type**: Regression — Deployment-blocking YAML syntax error
+
+**Why we test this**: A single YAML syntax error in the workflow file renders the entire workflow invisible to GitHub Actions. No error notification is sent — the workflow silently stops being dispatchable. This happened when a multi-line Python script inside a `$(python3 -c "...")` command substitution broke the YAML literal block scalar (`run: |`) by starting lines at column 1.
+
+**Setup**: After any change to the workflow file that includes inline Python code:
+1. Run `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/devin-security-backlog.yml'))"` locally to validate YAML syntax
+2. Attempt to dispatch the workflow via API: `POST /repos/{owner}/{repo}/actions/workflows/devin-security-backlog.yml/dispatches`
+3. Verify the response is HTTP 204 (success), not HTTP 422
+
+**Expected**:
+1. YAML validation passes without `ScannerError`
+2. Workflow dispatch returns HTTP 204
+3. The workflow appears in the Actions UI with the `workflow_dispatch` trigger visible
+
+**Validates**: Bug #29 — Multi-line Python code embedded in YAML `run: |` blocks inside `$(...)` command substitutions must either be collapsed to a single line or use a properly indented heredoc (`python3 << 'EOF'`). The multi-line `$(python3 -c "...")` pattern is a YAML footgun that is not caught by any CI check — only by attempting to dispatch.
+
+**Worry**: There is no automated CI check that validates GitHub Actions YAML files before merge. A broken YAML file can be merged to main and silently disable the workflow. In production, this means the scheduled backlog sweep stops running with no alert to the team. Consider adding a pre-merge validation step (e.g., `yamllint` or a custom action that parses all workflow files).
