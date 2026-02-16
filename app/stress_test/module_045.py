@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import re
 import html
 from urllib.parse import urlparse
 from flask import Flask, request, make_response, Response
@@ -68,8 +69,10 @@ def process_45_6():
 @app.route("/ping_45_7")
 def check_status_45_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return Response("Invalid host", status=400, content_type="text/plain")
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return Response(result.stdout, content_type="text/plain")
 
 @app.route("/search_45_8")
 def search_45_8():
