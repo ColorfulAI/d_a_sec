@@ -1265,3 +1265,75 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: The cron schedule runs every 6 hours with `reset_cursor=false`. The first run processes 15 alerts (batch 1). Six hours later, the second run loads the cursor, sees 15 alerts already attempted, and dispatches the remaining 7 alerts as batch 2. If cursor parsing fails, the second run either crashes (visible failure) or re-processes all 22 alerts (silent duplication, wasting Devin sessions).
 
 **Worry**: The cursor comment format is a JSON blob inside a GitHub issue comment with a `<!-- backlog-cursor -->` marker. If the marker format changes, or if another comment coincidentally contains the marker text, the parsing logic may find the wrong comment or no comment at all. Additionally, if the cursor JSON has been manually edited by a human (e.g., to remove an alert from the unfixable list), the parser may fail on unexpected field types or missing keys.
+
+### TC-BL-REG-34: Session Prompt Prevents Blocking via CRITICAL OPERATING MODE Header (Bug #41)
+
+**Type**: End-to-end — validates that the improved prompt reduces session blocking
+
+**Why we test this**: In all 4 previous test cycles, every Devin session ended with `status_enum=blocked` after ~10 minutes of working. The sessions never resumed after receiving unblock messages. The root cause is that Devin's default behavior uses `block_on_user=true` when uncertain. The fix rewrites the prompt to open with an explicit `CRITICAL OPERATING MODE` header that forbids blocking.
+
+**Setup**:
+1. Trigger the orchestrator with `reset_cursor=true`, `max_batches=1` (single batch to isolate prompt behavior)
+2. Wait for the batch workflow to create a Devin session
+3. Monitor the session's `status_enum` transitions over time via the poll log
+
+**Expected**:
+1. The session prompt starts with "CRITICAL OPERATING MODE" (visible in the workflow logs)
+2. The session spends MORE time in `working` status before going `blocked` (if it blocks at all)
+3. If the session does go `blocked`, the escalating unblock messages include "CRITICAL" and "URGENT" framing
+4. The wait time between unblock attempts is 120s (first 2) then 180s (subsequent)
+5. `MAX_UNBLOCK_ATTEMPTS` is 5 (increased from 3)
+6. `CONSECUTIVE_BLOCKED` counter is logged for each blocked poll
+
+**Validates**: Bug #41 — The old prompt buried the "UNATTENDED AUTOMATED run" instruction at the end. Sessions consistently blocked. The fix moves the non-blocking instruction to the FIRST line and makes it more explicit.
+
+**Production scenario**: A Fortune 500 company runs the backlog sweep on a repo with 500 alerts (34 batches). If every session blocks and never resumes, the pipeline produces 34 PRs with "attempted" alerts but none confirmed "fixed." The security team has no confidence the fixes actually work. The improved prompt should reduce blocking to <20% of sessions (some may still block if encountering genuinely ambiguous situations).
+
+**Worry**: Even with the improved prompt, Devin may still block in certain situations (e.g., repo requires authentication to clone, CodeQL CLI download fails, file has complex dependencies that Devin can't resolve). The escalating unblock messages may not be sufficient if the session is in a deep blocking state. The 5-attempt budget with 120-180s waits means a blocked session consumes ~12-15 minutes of polling time before being accepted as terminal — this is acceptable but adds to total runtime.
+
+### TC-BL-REG-35: CodeQL Verification Uses Exact CI Configuration (Bug #42)
+
+**Type**: End-to-end — validates that the Devin session executes CodeQL verification matching CI
+
+**Why we test this**: PRs #111 and #112 (created by previous batch workflow runs) failed CodeQL checks in CI, despite the prompt instructing Devin to verify fixes internally. The root cause was vague verification instructions — Devin may have skipped CodeQL or used different settings than CI.
+
+**Setup**:
+1. Trigger the orchestrator with `reset_cursor=true`, `max_batches=1`
+2. Wait for the batch workflow to complete
+3. Check the Devin session URL to inspect what commands Devin actually ran
+4. Check the created PR's CodeQL CI check result
+
+**Expected**:
+1. The prompt includes the exact CodeQL CLI commands with `--overwrite`, `security-and-quality` suite, and SARIF parsing
+2. The Devin session logs show CodeQL being downloaded and executed (look for `codeql database create` and `codeql database analyze` in session transcript)
+3. The Devin session logs show SARIF parsing output ("Found X remaining alerts for RULE_ID in FILE")
+4. The created PR's CodeQL CI check passes (no new alerts introduced by the fixes)
+5. If CodeQL verification failed for an alert, Devin skipped it (no broken fix committed)
+
+**Validates**: Bug #42 — The old prompt said "Check if the specific alert rule ID still appears" without specifying HOW. The fix provides the exact `python3 -c` command to parse SARIF output programmatically.
+
+**Production scenario**: An enterprise security team requires all fix PRs to pass CI before merge. If batch fix PRs consistently fail CodeQL (because Devin's internal verification doesn't match CI), the team loses trust in the pipeline and stops merging automated fixes. Every fix PR must pass CodeQL on the first CI run.
+
+**Worry**: CodeQL CLI installation may fail in Devin's environment (network restrictions, disk space, architecture mismatch). The `security-and-quality` query suite may not be available in the downloaded CodeQL bundle (requires `--download` flag which fetches from GitHub). If CodeQL takes too long (>5 min per database creation), Devin may time out or skip verification to save ACU budget. The SARIF parsing command assumes a specific JSON structure that may change between CodeQL versions.
+
+### TC-BL-REG-36: Escalating Unblock Messages Differentiate Early vs Late Attempts (Bug #41)
+
+**Type**: Behavioral — validates that unblock message content escalates appropriately
+
+**Why we test this**: The original implementation sent the same generic unblock message for every attempt. This doesn't help if the session didn't respond to the first message. The fix sends escalating messages: "CRITICAL" framing for attempts 1-2, "URGENT" framing with explicit skip-and-push directives for attempts 3+.
+
+**Setup**:
+1. Trigger a batch workflow that processes alerts likely to cause Devin to block (complex multi-file vulnerabilities)
+2. Wait for the session to go `blocked`
+3. Monitor the poll logs for unblock message content across multiple attempts
+
+**Expected**:
+1. Attempts 1-2: Message contains "CRITICAL" and "You MUST continue working immediately"
+2. Attempts 3+: Message contains "URGENT" and "This is attempt N to unblock you" and "SKIP IT immediately"
+3. Wait times: 120s after attempts 1-2, 180s after attempts 3+
+4. If session resumes working between blocks, the counter resets (Bug #37 fix still active)
+5. Maximum 5 unblock attempts before accepting terminal blocked state
+
+**Validates**: Bug #41 escalating message strategy — different urgency levels may be more effective at different points in the session's lifecycle.
+
+**Production scenario**: A session processing 15 alerts blocks at alert #3 (complex taint flow). The first "CRITICAL" unblock message helps it resume. It processes alerts #4-#8, then blocks again at alert #9 (unfamiliar framework). The "CRITICAL" message helps again (counter was reset by Bug #37 fix). It processes #10-#12, blocks at #13 (genuinely unfixable), and the "URGENT" messages with "SKIP IT" directive help it skip #13 and finish #14-#15. Without escalation, a single generic message may not convey the right urgency at each blocking point.
