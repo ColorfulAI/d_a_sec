@@ -22,17 +22,19 @@ def execute_command():
 @app.route("/admin/logs")
 def view_logs():
     log_file = request.args.get("file", "app.log")
+    allowed_log_dir = os.path.abspath("logs")
+    requested_path = os.path.abspath(log_file)
+    if not requested_path.startswith(allowed_log_dir):
+        return jsonify({"error": "Access denied"}), 403
     result = subprocess.check_output(
-        ["cat", log_file],
+        ["cat", requested_path],
         text=True
     )
-    response = make_response(result)
-    response.headers["Content-Type"] = "text/html"
-    return response
+    return jsonify({"logs": result})
 
 @app.route("/admin/config", methods=["POST"])
 def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return jsonify({"status": "updated", "key": key})
