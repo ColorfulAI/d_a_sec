@@ -372,43 +372,63 @@ jobs:
                   a.get("rule", {}).get("security_severity_level", "low"), 3) for a in kv[1])
           )
 
-          # Build batches: prefer same-file, backfill remaining space
+          # Build batches: ALL alerts per file stay together (never split a file)
+          #
+          # WHY: If a batch touches file X but only fixes 3 of 10 alerts in X,
+          # the PR modifies X and CodeQL reports the remaining 7 as failures.
+          # By keeping all alerts for a file in the same batch, the PR either
+          # cleans the file completely or doesn't touch it at all.
+          #
+          # STRATEGY: Pack whole-file groups into batches using first-fit.
+          # A batch can exceed alerts_per_batch if a single file has more alerts
+          # than the cap (rare but possible). We never break a file across batches.
           batches = []
           file_remaining = {}
           for fp, fa in sorted_files:
               file_remaining[fp] = list(fa)
 
+          current_batch = []
+          current_batch_files = set()
           for fp, _ in sorted_files:
-              while file_remaining.get(fp):
-                  batch_alerts = file_remaining[fp][:alerts_per_batch]
-                  file_remaining[fp] = file_remaining[fp][len(batch_alerts):]
+              if not file_remaining.get(fp):
+                  continue
+              file_alerts = file_remaining[fp]
+              if not file_alerts:
+                  continue
 
-                  # Backfill from other files
-                  if len(batch_alerts) < alerts_per_batch:
-                      for other_fp, _ in sorted_files:
-                          if other_fp == fp or not file_remaining.get(other_fp):
-                              continue
-                          space = alerts_per_batch - len(batch_alerts)
-                          taken = file_remaining[other_fp][:space]
-                          file_remaining[other_fp] = file_remaining[other_fp][len(taken):]
-                          batch_alerts.extend(taken)
-                          if len(batch_alerts) >= alerts_per_batch:
-                              break
-
+              # If adding this file would exceed the cap AND we already have alerts,
+              # close the current batch and start a new one
+              if current_batch and len(current_batch) + len(file_alerts) > alerts_per_batch:
                   batch_id = len(batches) + 1
-                  alert_ids = [a.get("number") for a in batch_alerts]
-                  files = list(set(
-                      a.get("most_recent_instance", {}).get("location", {}).get("path", "?")
-                      for a in batch_alerts))
+                  alert_ids = [a.get("number") for a in current_batch]
                   ts = int(time.time())
-
                   batches.append({
                       "batch_id": batch_id,
                       "alert_ids": alert_ids,
                       "alert_count": len(alert_ids),
-                      "files": files,
+                      "files": list(current_batch_files),
                       "branch_name": f"devin/security-batch-{batch_id}-{ts}"
                   })
+                  current_batch = []
+                  current_batch_files = set()
+
+              # Add ALL alerts for this file (never split)
+              current_batch.extend(file_alerts)
+              current_batch_files.add(fp)
+              file_remaining[fp] = []
+
+          # Flush remaining batch
+          if current_batch:
+              batch_id = len(batches) + 1
+              alert_ids = [a.get("number") for a in current_batch]
+              ts = int(time.time())
+              batches.append({
+                  "batch_id": batch_id,
+                  "alert_ids": alert_ids,
+                  "alert_count": len(alert_ids),
+                  "files": list(current_batch_files),
+                  "branch_name": f"devin/security-batch-{batch_id}-{ts}"
+              })
 
           # Apply max_batches limit
           if max_batches > 0:
