@@ -9,6 +9,8 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
+
 @app.route("/query_44_0")
 def query_db_44_0():
     user_id = request.args.get("id")
@@ -46,8 +48,11 @@ def render_page_44_3():
 
 @app.route("/fetch_44_4")
 def fetch_url_44_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    safe_url = ALLOWED_URLS.get(url_key)
+    if safe_url is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_44_5")
