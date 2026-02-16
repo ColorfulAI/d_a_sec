@@ -22,8 +22,14 @@ def login():
 
     if user:
         session["user_id"] = user[0]
-        redirect_url = request.args.get("next", "/dashboard")
-        return redirect(redirect_url)
+        next_page = request.args.get("next", "dashboard")
+        allowed_routes = {
+            "dashboard": "/dashboard",
+            "profile": "/profile",
+            "settings": "/settings",
+            "home": "/home",
+        }
+        return redirect(allowed_routes.get(next_page, "/dashboard"))
 
     return {"error": "Invalid credentials"}, 401
 
