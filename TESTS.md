@@ -635,3 +635,78 @@ curl -s -H "Authorization: Bearer $DEVIN_API_KEY" \
 curl -s -H "Authorization: token $GH_PAT" \
   "https://api.github.com/repos/$REPO/pulls?state=open&head=devin/security-batch"
 ```
+
+---
+
+## Regression Tests (Bugs Found During Testing)
+
+### TC-BL-REG-1: Partial-File Batching Must Not Split Files (Bug #8)
+
+**Setup**: Seed main with alerts distributed as:
+- `user_service.py`: 5 alerts (3 XSS, 1 SQL injection, 1 command injection)
+- `template_engine.py`: 4 alerts (2 XSS, 2 unsafe deserialization)
+- `admin_handler.py`: 2 alerts
+
+Trigger backlog workflow with `alerts_per_batch=6`.
+
+**Expected**:
+1. Batch 1: ALL 5 alerts in `user_service.py` (never split)
+2. Batch 2: ALL 4 alerts in `template_engine.py` + 2 in `admin_handler.py` = 6 alerts
+3. No batch contains a partial set of a file's alerts
+4. When Devin fixes all alerts in `user_service.py`, the PR modifies only that file and CodeQL finds 0 remaining alerts → PASS
+5. If a file has more alerts than the cap (e.g., 20 alerts in one file), that file gets its own batch (cap is soft limit)
+
+**Validates**: Bug #8 fix — all alerts per file stay in the same batch so CodeQL PR checks pass.
+
+**Production scenario**: Enterprise repo where `auth.py` has 15 different vulnerability types. The old algorithm would put 15 in batch 1 and backfill from other files. If only 10 of the 15 are fixable, batch 1's PR still modifies `auth.py` and CodeQL reports the 5 unfixed ones as failures. With the fix, all 15 go together and the PR either cleans the file completely or reports a clear subset.
+
+**Worry**: If the batching algorithm silently splits a file (e.g., due to an off-by-one in the packing logic), every batch PR touching that file will fail CodeQL. This is the #1 trust-destroying bug for enterprise clients — "your automated fix PRs all fail CI" is an immediate uninstall.
+
+---
+
+### TC-BL-REG-2: Suspended Session Handled Gracefully (Bug #5)
+
+**Setup**: Trigger backlog workflow with a batch that creates a Devin session. If the session transitions to `suspended` status (not controllable, but observable).
+
+**Expected**:
+1. Polling loop detects `suspended` status
+2. Logs warning: "Session is suspended — may need manual intervention"
+3. Exits polling with `completed=true`, `status=suspended`
+4. Workflow does NOT crash with jq parse error
+5. Collect-results step handles the non-finished status gracefully
+
+**Validates**: Bug #5 fix — `suspended` status is handled in the polling `case` statement.
+
+**Worry**: If `suspended` is not handled, the polling loop continues for 7+ wasted polls until the API returns non-JSON, causing a jq crash (bug #6). This is a cascading failure: one unhandled status → wasted time → API transient → crash.
+
+---
+
+### TC-BL-REG-3: Non-JSON API Response Doesn't Crash Polling (Bug #6)
+
+**Setup**: Trigger backlog workflow. During polling, if the Devin API returns a non-JSON response (HTML error page, rate limit response, empty body).
+
+**Expected**:
+1. `jq empty` guard detects non-JSON response
+2. Logs: "API returned non-JSON response (N bytes). Retrying..."
+3. Continues to next poll cycle (does NOT exit with error)
+4. On subsequent polls, if API recovers, polling continues normally
+
+**Validates**: Bug #6 fix — JSON validation guard before jq parsing.
+
+**Worry**: Without the guard, ANY transient API issue (network hiccup, rate limit HTML page, 502 gateway error) crashes the entire batch workflow. At Fortune 500 scale with 50+ batch workflows running, a brief API instability would cascade-fail all active batches.
+
+---
+
+### TC-BL-REG-4: Operator Precedence in Collect-Results (Bug #7)
+
+**Setup**: Trigger backlog workflow. A batch's Devin session completes with `status=stopped` but no branch was created (Devin couldn't clone or hit an error before pushing).
+
+**Expected**:
+1. Collect-results step evaluates: `BRANCH_NAME` is empty AND `STATUS` is `stopped`
+2. The conditional `[ -n "$BRANCH_NAME" ] && { [ "$STATUS" = "finished" ] || [ "$STATUS" = "stopped" ]; }` correctly short-circuits at the `BRANCH_NAME` check
+3. Does NOT enter the commit-counting block
+4. Reports 0 fixed alerts (correct — no branch means no fixes)
+
+**Validates**: Bug #7 fix — operator precedence is correct with explicit grouping.
+
+**Worry**: The old code `&& finished || stopped` would enter the commit-counting block when status=stopped even without a branch, then query `https://api.github.com/repos/.../compare/main...` with an empty branch name, getting a 404 or unexpected response.
