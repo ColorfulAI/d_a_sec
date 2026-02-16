@@ -1,0 +1,761 @@
+# Devin Security Backlog Sweep — Orchestrator Workflow
+#
+# This workflow processes the ENTIRE backlog of open CodeQL alerts on main.
+# It uses a sub-workflow fan-out pattern:
+#   1. Fetches all open CodeQL alerts on main (paginated)
+#   2. Reads cursor from tracking issue (skip already-processed alerts)
+#   3. Groups remaining alerts into batches (15 per batch, grouped by file)
+#   4. Dispatches child workflows (devin-security-batch.yml), one per batch
+#   5. Polls child workflow statuses (rolling window of max 3 active)
+#   6. As each child completes, updates cursor
+#   7. Continues until all batches are dispatched and completed
+#
+# KEY DESIGN DECISIONS (see DESIGN.md for full rationale):
+#
+# 1. SUB-WORKFLOW FAN-OUT: Each batch is a separate workflow run with its own
+#    logs, timeout, and failure isolation. No 6-hour timeout concern.
+#
+# 2. STREAMING PR CREATION: PRs are created by child workflows as they complete,
+#    not waiting for all batches. First PR available in ~10 minutes.
+#
+# 3. SESSION RESERVATION: Self-limits to 3 concurrent children, reserving 2
+#    slots for PR workflows that may fire at any time.
+#
+# 4. CURSOR-BASED STATELESS PICKUP: A GitHub issue comment stores processed
+#    alert IDs so the next run skips already-handled alerts.
+#
+# 5. WAVE-BASED PROCESSING: The orchestrator fills available slots, polls for
+#    completion, and immediately backfills freed slots with pending batches.
+
+name: Devin Security Backlog
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      max_batches:
+        description: "Maximum number of batches to process (0 = unlimited)"
+        required: false
+        type: string
+        default: "0"
+      dry_run:
+        description: "Log what would be done without dispatching children"
+        required: false
+        type: boolean
+        default: false
+      max_concurrent:
+        description: "Maximum concurrent child workflows (default: 3, max: 5)"
+        required: false
+        type: string
+        default: "3"
+      reset_cursor:
+        description: "Reset cursor and reprocess all alerts"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  security-events: read
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: devin-security-backlog
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    env:
+      MAX_CONCURRENT: ${{ github.event.inputs.max_concurrent || '3' }}
+      MAX_BATCHES: ${{ github.event.inputs.max_batches || '0' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      RESET_CURSOR: ${{ github.event.inputs.reset_cursor || 'false' }}
+      ALERTS_PER_BATCH: 15
+      POLL_INTERVAL: 60
+      MAX_CHILD_RUNTIME: 3600
+      SAFETY_TIMEOUT: 19800
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # STEP 1: Health check
+      # ----------------------------------------------------------------
+      - name: Health check
+        id: health-check
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+        run: |
+          HEALTHY=true
+
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT secret is not set."
+            HEALTHY=false
+          fi
+
+          if [ -z "$DEVIN_API_KEY" ]; then
+            echo "::error::DEVIN_API_KEY secret is not set."
+            HEALTHY=false
+          else
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X GET "https://api.devin.ai/v1/sessions" \
+              -H "Authorization: Bearer $DEVIN_API_KEY")
+            if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+              echo "::error::DEVIN_API_KEY returned HTTP $HTTP_CODE"
+              HEALTHY=false
+            else
+              echo "Devin API: reachable (HTTP $HTTP_CODE)"
+            fi
+          fi
+
+          if [ "$HEALTHY" = "false" ]; then
+            exit 1
+          fi
+          echo "Health check passed."
+
+      # ----------------------------------------------------------------
+      # STEP 2: Fetch all open CodeQL alerts on main
+      # ----------------------------------------------------------------
+      - name: Fetch all open CodeQL alerts
+        id: fetch-alerts
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          echo "Fetching all open CodeQL alerts on main..."
+
+          PAGE=1
+          echo '[]' > /tmp/all_alerts.json
+          TOTAL_FETCHED=0
+
+          while true; do
+            RESP=$(curl -s -L \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100&page=$PAGE")
+
+            PAGE_COUNT=$(echo "$RESP" | jq 'if type == "array" then length else 0 end')
+            if [ "$PAGE_COUNT" -eq 0 ] || [ "$PAGE_COUNT" = "null" ]; then
+              break
+            fi
+
+            echo "$RESP" > /tmp/alerts_page.json
+            jq -s '.[0] + .[1]' /tmp/all_alerts.json /tmp/alerts_page.json > /tmp/alerts_merged.json
+            mv /tmp/alerts_merged.json /tmp/all_alerts.json
+            TOTAL_FETCHED=$((TOTAL_FETCHED + PAGE_COUNT))
+
+            echo "Page $PAGE: $PAGE_COUNT alerts (total: $TOTAL_FETCHED)"
+
+            if [ "$PAGE_COUNT" -lt 100 ]; then
+              break
+            fi
+            PAGE=$((PAGE + 1))
+          done
+
+          echo "Total open alerts on main: $TOTAL_FETCHED"
+          echo "total_alerts=$TOTAL_FETCHED" >> $GITHUB_OUTPUT
+
+          if [ "$TOTAL_FETCHED" -eq 0 ]; then
+            echo "No open alerts to process."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # STEP 3: Find or create tracking issue for cursor state
+      # ----------------------------------------------------------------
+      - name: Find or create tracking issue
+        id: tracking-issue
+        if: steps.fetch-alerts.outputs.skip != 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          LABEL="devin:backlog-tracker"
+
+          # Create label if it doesn't exist
+          LABEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/labels/$(echo "$LABEL" | sed 's/:/%3A/g')")
+          if [ "$LABEL_HTTP" = "404" ]; then
+            curl -s -L -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/labels" \
+              -d "{\"name\": \"$LABEL\", \"color\": \"0075ca\", \"description\": \"Tracks Devin security backlog sweep progress\"}" \
+              2>/dev/null || true
+          fi
+
+          # Find existing tracking issue
+          ISSUES=$(curl -s -L \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/issues?labels=$LABEL&state=open&per_page=1")
+          ISSUE_NUM=$(echo "$ISSUES" | jq -r '.[0].number // empty')
+
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "Creating tracking issue..."
+            RESP=$(curl -s -L -X POST \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues" \
+              -d "{
+                \"title\": \"Devin Security Backlog — Progress Tracker\",
+                \"body\": \"This issue tracks the progress of the Devin Security Backlog Sweep.\\n\\nDo not edit this issue manually — it is updated automatically by the workflow.\",
+                \"labels\": [\"$LABEL\"]
+              }")
+            ISSUE_NUM=$(echo "$RESP" | jq -r '.number')
+            echo "Created tracking issue #$ISSUE_NUM"
+          else
+            echo "Found tracking issue #$ISSUE_NUM"
+          fi
+
+          echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------
+      # STEP 4: Read cursor from tracking issue
+      # ----------------------------------------------------------------
+      - name: Read cursor
+        id: read-cursor
+        if: steps.fetch-alerts.outputs.skip != 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ISSUE_NUM: ${{ steps.tracking-issue.outputs.issue_number }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          if [ "$RESET_CURSOR" = "true" ]; then
+            echo "Cursor reset requested. Starting fresh."
+            echo '{"processed_alert_ids":[],"unfixable_alert_ids":[],"in_progress":{},"total_fixed":0,"total_unfixable":0}' > /tmp/cursor.json
+            echo "cursor_found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Fetch comments and find cursor
+          COMMENTS=$(curl -s -L \
+            -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUM/comments?per_page=100")
+
+          # Save comments for Python to read
+          echo "$COMMENTS" > /tmp/cursor_comments.json
+
+          python3 << 'CURSOR_PARSE_EOF'
+          import json, os
+
+          try:
+              with open("/tmp/cursor_comments.json") as f:
+                  comments = json.load(f)
+                  if not isinstance(comments, list):
+                      comments = []
+          except:
+              comments = []
+
+          cursor = None
+          comment_id = ""
+          marker = "<!-- backlog-cursor -->"
+
+          for c in comments:
+              body = c.get("body", "")
+              if marker in body:
+                  comment_id = str(c.get("id", ""))
+                  start = body.find("```json\n")
+                  end = body.find("\n```", start + 8) if start >= 0 else -1
+                  if start >= 0 and end >= 0:
+                      json_str = body[start + 8:end]
+                      try:
+                          cursor = json.loads(json_str)
+                      except:
+                          print("WARNING: Cursor JSON corrupted. Starting fresh.")
+
+          if cursor is None:
+              cursor = {
+                  "processed_alert_ids": [],
+                  "unfixable_alert_ids": [],
+                  "in_progress": {},
+                  "total_fixed": 0,
+                  "total_unfixable": 0
+              }
+              print("No cursor found. Starting fresh scan.")
+          else:
+              print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable")
+
+          with open("/tmp/cursor.json", "w") as f:
+              json.dump(cursor, f, indent=2)
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"cursor_comment_id={comment_id}\n")
+              f.write(f"cursor_found={'true' if comment_id else 'false'}\n")
+          CURSOR_PARSE_EOF
+
+      # ----------------------------------------------------------------
+      # STEP 5: Filter alerts and group into batches
+      # ----------------------------------------------------------------
+      - name: Filter and batch alerts
+        id: batch-alerts
+        if: steps.fetch-alerts.outputs.skip != 'true'
+        run: |
+          python3 << 'BATCH_EOF'
+          import json, os, time
+
+          alerts_per_batch = int(os.environ.get("ALERTS_PER_BATCH", "15"))
+          max_batches_str = os.environ.get("MAX_BATCHES", "0")
+          max_batches = int(max_batches_str) if max_batches_str else 0
+
+          with open("/tmp/all_alerts.json") as f:
+              all_alerts = json.load(f)
+
+          with open("/tmp/cursor.json") as f:
+              cursor = json.load(f)
+
+          processed = set(cursor.get("processed_alert_ids", []))
+          unfixable = set(cursor.get("unfixable_alert_ids", []))
+
+          # Filter out already-processed and unfixable alerts
+          remaining = []
+          skipped_processed = 0
+          skipped_unfixable = 0
+
+          for a in all_alerts:
+              alert_num = a.get("number")
+              if alert_num in processed or alert_num in unfixable:
+                  if alert_num in unfixable:
+                      skipped_unfixable += 1
+                  else:
+                      skipped_processed += 1
+                  continue
+              remaining.append(a)
+
+          print(f"Total open alerts: {len(all_alerts)}")
+          print(f"Already processed: {skipped_processed}")
+          print(f"Unfixable (skipped): {skipped_unfixable}")
+          print(f"Remaining to process: {len(remaining)}")
+
+          if not remaining:
+              print("No new alerts to process.")
+              gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+              with open(gh_out, "a") as f:
+                  f.write("batch_count=0\n")
+                  f.write("total_remaining=0\n")
+              with open("/tmp/batches.json", "w") as f:
+                  json.dump([], f)
+              exit(0)
+
+          # Group by file for efficient Devin sessions
+          severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+          file_groups = {}
+          for a in remaining:
+              loc = a.get("most_recent_instance", {}).get("location", {})
+              path = loc.get("path", "unknown")
+              file_groups.setdefault(path, []).append(a)
+
+          # Sort each file group by severity
+          for fg in file_groups.values():
+              fg.sort(key=lambda a: severity_order.get(
+                  a.get("rule", {}).get("security_severity_level", "low"), 3))
+
+          # Sort files by most severe alert
+          sorted_files = sorted(
+              file_groups.items(),
+              key=lambda kv: min(severity_order.get(
+                  a.get("rule", {}).get("security_severity_level", "low"), 3) for a in kv[1])
+          )
+
+          # Build batches: prefer same-file, backfill remaining space
+          batches = []
+          file_remaining = {}
+          for fp, fa in sorted_files:
+              file_remaining[fp] = list(fa)
+
+          for fp, _ in sorted_files:
+              while file_remaining.get(fp):
+                  batch_alerts = file_remaining[fp][:alerts_per_batch]
+                  file_remaining[fp] = file_remaining[fp][len(batch_alerts):]
+
+                  # Backfill from other files
+                  if len(batch_alerts) < alerts_per_batch:
+                      for other_fp, _ in sorted_files:
+                          if other_fp == fp or not file_remaining.get(other_fp):
+                              continue
+                          space = alerts_per_batch - len(batch_alerts)
+                          taken = file_remaining[other_fp][:space]
+                          file_remaining[other_fp] = file_remaining[other_fp][len(taken):]
+                          batch_alerts.extend(taken)
+                          if len(batch_alerts) >= alerts_per_batch:
+                              break
+
+                  batch_id = len(batches) + 1
+                  alert_ids = [a.get("number") for a in batch_alerts]
+                  files = list(set(
+                      a.get("most_recent_instance", {}).get("location", {}).get("path", "?")
+                      for a in batch_alerts))
+                  ts = int(time.time())
+
+                  batches.append({
+                      "batch_id": batch_id,
+                      "alert_ids": alert_ids,
+                      "alert_count": len(alert_ids),
+                      "files": files,
+                      "branch_name": f"devin/security-batch-{batch_id}-{ts}"
+                  })
+
+          # Apply max_batches limit
+          if max_batches > 0:
+              batches = batches[:max_batches]
+              print(f"Limited to {max_batches} batches (per input)")
+
+          print(f"\nCreated {len(batches)} batches:")
+          for b in batches:
+              print(f"  Batch {b['batch_id']}: {b['alert_count']} alerts in {', '.join(b['files'][:3])}")
+
+          with open("/tmp/batches.json", "w") as f:
+              json.dump(batches, f, indent=2)
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"batch_count={len(batches)}\n")
+              f.write(f"total_remaining={len(remaining)}\n")
+          BATCH_EOF
+
+      # ----------------------------------------------------------------
+      # STEP 6: Dispatch child workflows and manage rolling window
+      # This is the core orchestrator loop. It:
+      #   - Dispatches up to MAX_CONCURRENT children
+      #   - Polls for completion every POLL_INTERVAL seconds
+      #   - Backfills freed slots with pending batches
+      #   - Updates cursor as batches complete
+      #   - Exits when all batches are dispatched + completed
+      # ----------------------------------------------------------------
+      - name: Dispatch and manage child workflows
+        id: orchestrate
+        if: steps.batch-alerts.outputs.batch_count != '0'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          ISSUE_NUM: ${{ steps.tracking-issue.outputs.issue_number }}
+          CURSOR_COMMENT_ID: ${{ steps.read-cursor.outputs.cursor_comment_id }}
+        run: |
+          python3 << 'ORCHESTRATE_EOF'
+          import json, os, time, urllib.request, urllib.error
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          gh_pat = os.environ["GH_PAT"]
+          devin_key = os.environ["DEVIN_API_KEY"]
+          issue_num = os.environ.get("ISSUE_NUM", "")
+          cursor_comment_id = os.environ.get("CURSOR_COMMENT_ID", "")
+          dry_run = os.environ.get("DRY_RUN", "false") == "true"
+          max_concurrent = min(int(os.environ.get("MAX_CONCURRENT", "3")), 5)
+          poll_interval = int(os.environ.get("POLL_INTERVAL", "60"))
+          max_child_runtime = int(os.environ.get("MAX_CHILD_RUNTIME", "3600"))
+          safety_timeout = int(os.environ.get("SAFETY_TIMEOUT", "19800"))
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+
+          with open("/tmp/batches.json") as f:
+              all_batches = json.load(f)
+          with open("/tmp/cursor.json") as f:
+              cursor = json.load(f)
+
+          if not all_batches:
+              print("No batches to process.")
+              exit(0)
+
+          print(f"Orchestrator config:")
+          print(f"  Batches: {len(all_batches)}")
+          print(f"  Max concurrent: {max_concurrent}")
+          print(f"  Poll interval: {poll_interval}s")
+          print(f"  Max child runtime: {max_child_runtime}s ({max_child_runtime//60} min)")
+          print(f"  Safety timeout: {safety_timeout}s ({safety_timeout//60} min)")
+          print(f"  Dry run: {dry_run}")
+
+          def gh_api(method, url, data=None):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode() if data else None,
+                  headers={
+                      "Authorization": f"token {gh_pat}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json"
+                  },
+                  method=method
+              )
+              try:
+                  resp = urllib.request.urlopen(req)
+                  return json.loads(resp.read()), resp.status
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode()[:500]
+                  return {"error": body, "status": e.code}, e.code
+              except Exception as e:
+                  return {"error": str(e)}, 0
+
+          def check_active_devin_sessions():
+              try:
+                  req = urllib.request.Request(
+                      "https://api.devin.ai/v1/sessions?status_in=running,started",
+                      headers={"Authorization": f"Bearer {devin_key}"}
+                  )
+                  resp = urllib.request.urlopen(req)
+                  data = json.loads(resp.read())
+                  sessions = data.get("sessions", [])
+                  return len(sessions)
+              except Exception as e:
+                  print(f"  Warning: Could not check active sessions: {e}")
+                  return 0
+
+          def dispatch_child(batch):
+              alert_ids_str = ",".join(str(a) for a in batch["alert_ids"])
+              url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/dispatches"
+              data = {
+                  "ref": "main",
+                  "inputs": {
+                      "batch_id": str(batch["batch_id"]),
+                      "alert_ids": alert_ids_str,
+                      "branch_name": batch["branch_name"],
+                      "tracking_issue": str(issue_num)
+                  }
+              }
+              result, status = gh_api("POST", url, data)
+              return status == 204
+
+          def find_child_run(batch_id, after_time):
+              url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=10&created=>={after_time}"
+              result, status = gh_api("GET", url)
+              if status != 200:
+                  return None
+              for run in result.get("workflow_runs", []):
+                  # Match by checking inputs in the run
+                  run_url = f"https://api.github.com/repos/{repo}/actions/runs/{run['id']}"
+                  run_detail, _ = gh_api("GET", run_url)
+                  # For workflow_dispatch runs, we can check the name/title
+                  if run.get("status") != "completed" or True:
+                      return run
+              return None
+
+          def check_child_status(run_id_val):
+              url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}"
+              result, status = gh_api("GET", url)
+              if status != 200:
+                  return "unknown"
+              return result.get("status", "unknown"), result.get("conclusion")
+
+          def update_cursor(cursor_data):
+              marker = "<!-- backlog-cursor -->"
+              cursor_json = json.dumps(cursor_data, indent=2)
+              body = f"{marker}\n## Backlog Sweep Cursor\n\n*Last updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}*\n\n```json\n{cursor_json}\n```\n\n---\n*Updated by [orchestrator run](https://github.com/{repo}/actions/runs/{run_id})*"
+              url_base = f"https://api.github.com/repos/{repo}/issues"
+
+              if cursor_comment_id:
+                  result, status = gh_api("PATCH", f"{url_base}/comments/{cursor_comment_id}", {"body": body})
+                  if status == 200:
+                      return True
+              # Create new comment
+              result, status = gh_api("POST", f"{url_base}/{issue_num}/comments", {"body": body})
+              return status == 201
+
+          # ============================================================
+          # MAIN ORCHESTRATOR LOOP
+          # ============================================================
+          pending_batches = list(all_batches)
+          active_children = {}  # run_id -> {batch, dispatched_at, batch_id}
+          completed_batches = []
+          failed_batches = []
+          start_time = time.time()
+
+          if dry_run:
+              print("\n=== DRY RUN MODE ===")
+              for b in pending_batches:
+                  print(f"  Would dispatch: Batch {b['batch_id']} ({b['alert_count']} alerts) -> {b['branch_name']}")
+              print(f"\nTotal: {len(pending_batches)} batches, {sum(b['alert_count'] for b in pending_batches)} alerts")
+              exit(0)
+
+          print(f"\n{'='*60}")
+          print(f"Starting orchestrator loop")
+          print(f"{'='*60}\n")
+
+          # Initial fill: dispatch up to max_concurrent
+          while len(active_children) < max_concurrent and pending_batches:
+              # Check session reservation: don't use all 5 Devin slots
+              active_sessions = check_active_devin_sessions()
+              if active_sessions >= max_concurrent:
+                  print(f"  Session reservation: {active_sessions} active sessions >= {max_concurrent} limit. Waiting...")
+                  break
+
+              batch = pending_batches.pop(0)
+              dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+              print(f"Dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+              success = dispatch_child(batch)
+
+              if success:
+                  # We need to find the workflow run ID. Wait a moment for GitHub to register it.
+                  time.sleep(5)
+                  # Store with dispatch timestamp so we can find it
+                  active_children[f"batch_{batch['batch_id']}"] = {
+                      "batch": batch,
+                      "dispatched_at": time.time(),
+                      "dispatch_time_str": dispatch_time,
+                      "run_id": None,  # Will be resolved during polling
+                      "status": "dispatched"
+                  }
+                  print(f"  Dispatched successfully")
+              else:
+                  print(f"  Dispatch FAILED — will retry later")
+                  pending_batches.insert(0, batch)
+                  time.sleep(10)
+
+          # Poll loop
+          poll_count = 0
+          while active_children or pending_batches:
+              # Safety timeout check
+              elapsed = time.time() - start_time
+              if elapsed > safety_timeout:
+                  print(f"\n  SAFETY TIMEOUT ({safety_timeout//60} min). Saving cursor and exiting.")
+                  print(f"  Completed: {len(completed_batches)}, Failed: {len(failed_batches)}, Remaining: {len(pending_batches) + len(active_children)}")
+                  break
+
+              time.sleep(poll_interval)
+              poll_count += 1
+              print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
+
+              # Resolve run IDs for newly dispatched children
+              for key, child in list(active_children.items()):
+                  if child["run_id"] is None:
+                      # Search for the workflow run
+                      url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch"
+                      result, status = gh_api("GET", url)
+                      if status == 200:
+                          for run in result.get("workflow_runs", []):
+                              run_created = run.get("created_at", "")
+                              if run_created >= child["dispatch_time_str"]:
+                                  # Check if this run matches our batch
+                                  # We'll use the most recent unmatched run
+                                  run_id_val = run["id"]
+                                  if str(run_id_val) not in [str(c.get("run_id")) for c in active_children.values() if c.get("run_id")]:
+                                      child["run_id"] = run_id_val
+                                      print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val}")
+                                      break
+
+              # Check status of active children
+              for key, child in list(active_children.items()):
+                  if child["run_id"] is None:
+                      # Check for stuck dispatch
+                      age = time.time() - child["dispatched_at"]
+                      if age > 300:  # 5 minutes without finding run
+                          print(f"  Batch {child['batch']['batch_id']}: No workflow run found after {int(age)}s — re-dispatching")
+                          pending_batches.append(child["batch"])
+                          del active_children[key]
+                      continue
+
+                  run_id_val = child["run_id"]
+                  status_tuple = check_child_status(run_id_val)
+
+                  if isinstance(status_tuple, tuple):
+                      run_status, conclusion = status_tuple
+                  else:
+                      run_status, conclusion = status_tuple, None
+
+                  child["status"] = run_status
+
+                  if run_status == "completed":
+                      batch = child["batch"]
+                      if conclusion == "success":
+                          print(f"  Batch {batch['batch_id']}: COMPLETED (success)")
+                          completed_batches.append(batch)
+                          # Update cursor: mark alerts as processed
+                          for aid in batch["alert_ids"]:
+                              if aid not in cursor["processed_alert_ids"]:
+                                  cursor["processed_alert_ids"].append(aid)
+                          cursor["total_fixed"] = len(cursor["processed_alert_ids"])
+                      else:
+                          print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
+                          failed_batches.append({**batch, "conclusion": conclusion})
+
+                      del active_children[key]
+
+                      # Backfill: dispatch next pending batch
+                      if pending_batches:
+                          active_sessions = check_active_devin_sessions()
+                          if active_sessions < max_concurrent:
+                              next_batch = pending_batches.pop(0)
+                              dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                              print(f"  Backfill: Dispatching Batch {next_batch['batch_id']}...")
+                              if dispatch_child(next_batch):
+                                  time.sleep(5)
+                                  active_children[f"batch_{next_batch['batch_id']}"] = {
+                                      "batch": next_batch,
+                                      "dispatched_at": time.time(),
+                                      "dispatch_time_str": dispatch_time,
+                                      "run_id": None,
+                                      "status": "dispatched"
+                                  }
+
+                      # Update cursor after each completion (streaming)
+                      update_cursor(cursor)
+
+                  elif run_status in ("queued", "in_progress", "waiting"):
+                      age = time.time() - child["dispatched_at"]
+                      if age > max_child_runtime:
+                          print(f"  Batch {child['batch']['batch_id']}: STALE ({int(age)}s > {max_child_runtime}s) — evicting")
+                          failed_batches.append({**child["batch"], "conclusion": "timeout_evicted"})
+                          del active_children[key]
+                          # Don't re-dispatch stale batches immediately
+                      else:
+                          print(f"  Batch {child['batch']['batch_id']}: {run_status} ({int(age)}s)")
+
+          # ============================================================
+          # FINAL CURSOR UPDATE
+          # ============================================================
+          cursor["last_run"] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+          cursor["last_run_id"] = run_id
+          update_cursor(cursor)
+
+          # Summary
+          total_time = int(time.time() - start_time)
+          print(f"\n{'='*60}")
+          print(f"Orchestrator complete")
+          print(f"{'='*60}")
+          print(f"  Total time: {total_time}s ({total_time//60} min)")
+          print(f"  Batches completed: {len(completed_batches)}")
+          print(f"  Batches failed: {len(failed_batches)}")
+          print(f"  Batches remaining: {len(pending_batches)}")
+          print(f"  Total alerts processed: {sum(b['alert_count'] for b in completed_batches)}")
+          print(f"  Total alerts failed: {sum(b['alert_count'] for b in failed_batches)}")
+
+          # Write summary for GitHub Actions
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(gh_out, "a") as f:
+              f.write(f"completed_count={len(completed_batches)}\n")
+              f.write(f"failed_count={len(failed_batches)}\n")
+              f.write(f"remaining_count={len(pending_batches)}\n")
+              f.write(f"total_time={total_time}\n")
+
+          # Write detailed results
+          results = {
+              "completed": [{"batch_id": b["batch_id"], "alert_ids": b["alert_ids"]} for b in completed_batches],
+              "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion")} for b in failed_batches],
+              "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches]
+          }
+          with open("/tmp/orchestrator_results.json", "w") as f:
+              json.dump(results, f, indent=2)
+
+          ORCHESTRATE_EOF
+
+      # ----------------------------------------------------------------
+      # STEP 7: Summary
+      # ----------------------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Devin Security Backlog Sweep" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total alerts on main**: ${{ steps.fetch-alerts.outputs.total_alerts }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Batches created**: ${{ steps.batch-alerts.outputs.batch_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY

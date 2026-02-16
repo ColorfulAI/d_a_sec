@@ -896,187 +896,27 @@ jobs:
           fi
 
       # ------------------------------------------------------------------
-      # STEP 7: Create Devin sessions for pre-existing alerts (batched).
-      # Same enhancements as new-in-PR: CodeQL verification, rebase,
-      # skip unfixable, rate limit handling, ACU cap.
-      # Batching: prefer same-file, backfill to fill batch (cap 15).
-      #
-      # IMPORTANT: Branch name is DETERMINISTIC (based on PR number, not
-      # timestamp) so that re-runs reuse the same branch and don't create
-      # infinite new branches/PRs. Retry logic happens inside each
-      # session (local CodeQL verification, 2 attempts per alert).
+      # STEP 7: Note pre-existing alerts (handled by backlog workflow).
+      # SPLIT-TRIGGER DESIGN: The PR workflow does NOT create sessions
+      # for pre-existing alerts. Those are handled by the scheduled
+      # backlog workflow (devin-security-backlog.yml). This prevents:
+      #   - PR workflows being blocked by batch work
+      #   - Session explosion under concurrent PRs (BUG #9)
+      #   - Pre-existing failures affecting PR exit codes (BUG #5)
+      # See DESIGN.md "Split-Trigger Architecture" for full rationale.
       # ------------------------------------------------------------------
-      - name: Create Devin sessions for pre-existing alerts (batched)
-        if: steps.filter-alerts.outputs.pre_actionable_count != '0' && steps.health-check.outputs.devin_available == 'true'
+      - name: Note pre-existing alerts (handled by backlog workflow)
+        if: steps.filter-alerts.outputs.pre_actionable_count != '0'
         id: devin-preexisting
-        env:
-          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
-          PR_NUMBER: ${{ steps.pr-context.outputs.pr_number }}
         run: |
-          export REPO="${{ github.repository }}"
-          export PR_NUMBER="$PR_NUMBER"
-          export FIX_BRANCH="devin/security-fixes-pr${PR_NUMBER}"
-
-          echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
-
-          python3 << 'BATCH_EOF'
-          import json, os, time, urllib.request, urllib.error
-
-          alerts = json.load(open("/tmp/preexisting_actionable.json"))
-          repo = os.environ["REPO"]
-          fix_branch = os.environ["FIX_BRANCH"]
-          pr_number = os.environ["PR_NUMBER"]
-          api_key = os.environ["DEVIN_API_KEY"]
-          max_per_batch = 15
-          max_concurrent = 3
-          max_total_sessions = 20
-
-          severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
-
-          # Group by file, sort each group by severity
-          file_groups = {}
-          for a in alerts:
-              file_groups.setdefault(a["file"], []).append(a)
-          for fg in file_groups.values():
-              fg.sort(key=lambda a: severity_order.get(a["severity"], 4))
-
-          # Sort files by most severe alert first
-          sorted_files = sorted(
-              file_groups.items(),
-              key=lambda kv: min(severity_order.get(a["severity"], 4) for a in kv[1])
-          )
-
-          # Build batches: prefer same-file, backfill remaining space
-          batches = []
-          remaining = {}
-          for fp, fa in sorted_files:
-              remaining[fp] = list(fa)
-
-          for fp, fa in sorted_files:
-              if not remaining[fp]:
-                  continue
-              while remaining[fp]:
-                  batch = remaining[fp][:max_per_batch]
-                  remaining[fp] = remaining[fp][len(batch):]
-                  if len(batch) < max_per_batch:
-                      for other_fp, other_fa in sorted_files:
-                          if other_fp == fp or not remaining.get(other_fp):
-                              continue
-                          space = max_per_batch - len(batch)
-                          taken = remaining[other_fp][:space]
-                          remaining[other_fp] = remaining[other_fp][len(taken):]
-                          batch.extend(taken)
-                          if len(batch) >= max_per_batch:
-                              break
-                  batches.append(batch)
-
-          session_ids = []
-          session_urls = []
-
-          for i, batch in enumerate(batches[:max_total_sessions]):
-              summary_lines = []
-              for a in batch:
-                  summary_lines.append(
-                      f"- [{a['rule_id']}] {a['rule_description']} at {a['file']}:{a['start_line']} (severity: {a['severity']})"
-                  )
-              summary = "\n".join(summary_lines)
-              details = json.dumps(batch, indent=2)
-
-              prompt = (
-                  f"You are a security engineer fixing pre-existing vulnerabilities found by CodeQL in repository {repo}.\n\n"
-                  f"These alerts exist on the main branch and were detected during review of PR #{pr_number}:\n\n"
-                  f"{summary}\n\n"
-                  f"Detailed alert information:\n{details}\n\n"
-                  "Instructions:\n"
-                  f"1. Clone the repository: https://github.com/{repo}.git\n"
-                  f"2. Create and checkout branch '{fix_branch}' from main (or pull --rebase if it already exists)\n"
-                  "3. For each alert, read the surrounding code and understand the full context\n"
-                  "4. Fix each alert ONE AT A TIME. For each alert:\n"
-                  "   a. Apply a minimal, focused fix following the codebase's existing conventions\n"
-                  "   b. VERIFY the fix locally using CodeQL CLI before committing:\n"
-                  "      - Install CodeQL CLI: wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -q codeql-linux64.zip\n"
-                  "      - Create database: ./codeql/codeql database create /tmp/codeql-db --language=python --source-root=. --overwrite\n"
-                  "      - Run analysis: ./codeql/codeql database analyze /tmp/codeql-db codeql/python-queries:codeql-suites/python-security-and-quality.qls --format=sarif-latest --output=/tmp/results.sarif --download\n"
-                  "      - Check if the specific alert rule ID still appears for the same file and line\n"
-                  "   c. If the alert STILL appears after your fix, revise and re-run CodeQL (max 2 attempts)\n"
-                  "   d. If after 2 attempts the alert persists, SKIP it - do NOT commit a broken fix. Note it as unfixable.\n"
-                  "   e. If the fix resolves the alert, commit with message: fix: [rule_id] description (file:line)\n"
-                  "5. Conventions to follow:\n"
-                  "   - If the project uses an ORM, use parameterized queries via the ORM\n"
-                  "   - If there are existing sanitization utilities, reuse them\n"
-                  "   - Do not introduce new dependencies unless absolutely necessary\n"
-                  "6. If the repository has tests, run them to ensure no regressions\n"
-                  f"7. Before pushing, run: git pull --rebase origin '{fix_branch}' (handle conflicts if any)\n"
-                  f"8. Push all commit(s) to branch '{fix_branch}'\n\n"
-                  "IMPORTANT:\n"
-                  "- Each security issue MUST be a separate commit\n"
-                  "- Do NOT just suppress or ignore alerts - fix the root cause\n"
-                  f"- Do NOT create a new PR - just push to branch '{fix_branch}'\n"
-                  "- Keep fixes minimal and surgical - do not refactor unrelated code\n"
-                  "- If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it and continue\n"
-                  "- At the end, report which alerts were fixed and which were unfixable"
-              )
-
-              body_bytes = json.dumps({
-                  "prompt": prompt,
-                  "max_acu_limit": 10
-              }).encode()
-
-              req = urllib.request.Request(
-                  "https://api.devin.ai/v1/sessions",
-                  data=body_bytes,
-                  headers={
-                      "Authorization": f"Bearer {api_key}",
-                      "Content-Type": "application/json"
-                  },
-                  method="POST"
-              )
-
-              # Retry with exponential backoff on rate limits
-              max_retries = 3
-              for attempt in range(max_retries):
-                  try:
-                      resp = urllib.request.urlopen(req)
-                      result = json.loads(resp.read())
-                      sid = result.get("session_id", "")
-                      if sid:
-                          session_ids.append(sid)
-                          surl = result.get("url", f"https://app.devin.ai/sessions/{sid}")
-                          session_urls.append(surl)
-                          print(f"Batch {i+1}/{min(len(batches), max_total_sessions)}: Session {sid} created")
-                      else:
-                          print(f"Batch {i+1}: Failed - {result}")
-                      break
-                  except urllib.error.HTTPError as e:
-                      if e.code == 429 and attempt < max_retries - 1:
-                          wait_time = 30 * (2 ** attempt)
-                          print(f"Batch {i+1}: Rate limited (429). Waiting {wait_time}s...")
-                          time.sleep(wait_time)
-                      else:
-                          print(f"Batch {i+1}: Error {e.code} - {e.read().decode()[:200]}")
-                          break
-                  except Exception as e:
-                      print(f"Batch {i+1}: Error - {e}")
-                      break
-
-              # Pause between concurrent waves
-              if (i + 1) % max_concurrent == 0 and i + 1 < len(batches):
-                  print(f"Concurrency pause (30s)...")
-                  time.sleep(30)
-
-          with open("/tmp/preexisting_session_ids.txt", "w") as f:
-              f.write("\n".join(session_ids))
-          with open("/tmp/preexisting_session_urls.txt", "w") as f:
-              f.write("\n".join(session_urls))
-
-          print(f"\nCreated {len(session_ids)} session(s) for {len(alerts)} pre-existing alert(s)")
-          BATCH_EOF
-
-          SESSION_COUNT=$(wc -l < /tmp/preexisting_session_ids.txt 2>/dev/null || echo "0")
-          FIRST_URL=$(head -1 /tmp/preexisting_session_urls.txt 2>/dev/null || echo "")
-          echo "session_count=$SESSION_COUNT" >> $GITHUB_OUTPUT
-          echo "first_session_url=$FIRST_URL" >> $GITHUB_OUTPUT
-          echo "sessions_created=true" >> $GITHUB_OUTPUT
+          PRE_COUNT="${{ steps.classify-alerts.outputs.preexisting_count }}"
+          echo "Pre-existing alerts on main: $PRE_COUNT"
+          echo "These will be handled by the scheduled backlog workflow (devin-security-backlog.yml)."
+          echo "The PR workflow only fixes NEW alerts introduced by this PR."
+          echo "sessions_created=false" >> $GITHUB_OUTPUT
+          echo "session_count=0" >> $GITHUB_OUTPUT
+          echo "first_session_url=" >> $GITHUB_OUTPUT
+          echo "fix_branch=" >> $GITHUB_OUTPUT
 
       # ------------------------------------------------------------------
       # STEP 8: Find-or-update the PR comment.
@@ -1267,39 +1107,18 @@ jobs:
                       lines.append(f"| :white_check_mark: | `{rule}` | `{fpath}:{fline}` | **Fixed** | {att}/2 |")
               lines.append("")
 
-          # Pre-existing section
+          # Pre-existing section (informational only — handled by backlog workflow)
           if pre_count != "0" and pre_count:
               lines.append(f"### Pre-existing Alerts (already on main): {pre_count}\n")
               lines.append("These exist on main and were not introduced by this PR.\n")
-              if pre_sessions_created == "true":
-                  lines.append(f"**Devin is fixing these on branch `{fix_branch}`.** A separate PR will be created.\n")
-                  lines.append("| Session | Link |")
-                  lines.append("|---------|------|")
-                  try:
-                      with open("/tmp/preexisting_session_urls.txt") as f:
-                          for j, url in enumerate(f.read().strip().split("\n"), 1):
-                              if url:
-                                  lines.append(f"| Batch {j} | [Watch Devin work]({url}) |")
-                  except Exception:
-                      pass
-                  lines.append("")
+              lines.append("**Handled by the scheduled backlog workflow** (`devin-security-backlog.yml`). ")
+              lines.append("Pre-existing alerts are processed in batches on a separate schedule, each producing its own PR.\n")
 
-              # Per-alert status table for pre-existing
-              lines.append("| Severity | Rule | File | Status | Attempts |")
-              lines.append("|----------|------|------|--------|----------|")
+              # Per-alert status table for pre-existing (informational)
+              lines.append("| Severity | Rule | File |")
+              lines.append("|----------|------|------|")
               for a in all_pre_alerts:
-                  key = a.get("key", f"{a['rule_id']}:{a['file']}:{a['start_line']}")
-                  rf_key = f"{a['rule_id']}:{a['file']}"
-                  att = history["attempts"].get(key, rf_max_display.get(rf_key, 0))
-                  if key in unfixable_set or rf_key in {u.rsplit(':', 1)[0] for u in unfixable_set}:
-                      status = "Needs Manual Fix"
-                  elif att >= 2:
-                      status = "Final Attempt"
-                  elif att > 0:
-                      status = "In Progress"
-                  else:
-                      status = "Queued"
-                  lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` | **{status}** | {att}/2 |")
+                  lines.append(f"| {a['severity']} | `{a['rule_id']}` | `{a['file']}:{a['start_line']}` |")
               lines.append("")
 
           # Unfixable alerts section(critical for developer visibility)
@@ -1607,7 +1426,6 @@ jobs:
           echo "- **Created**: ${{ steps.devin-new-pr.outputs.session_created }}" >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: ${{ steps.devin-new-pr.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Pre-existing Sessions" >> $GITHUB_STEP_SUMMARY
-          echo "- **Created**: ${{ steps.devin-preexisting.outputs.sessions_created }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Count**: ${{ steps.devin-preexisting.outputs.session_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Fix branch**: ${{ steps.devin-preexisting.outputs.fix_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Pre-existing Alerts" >> $GITHUB_STEP_SUMMARY
+          echo "- **Count**: ${{ steps.classify-alerts.outputs.preexisting_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Handled by**: Scheduled backlog workflow (devin-security-backlog.yml)" >> $GITHUB_STEP_SUMMARY
