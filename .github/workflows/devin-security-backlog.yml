@@ -18,8 +18,8 @@
 # 2. STREAMING PR CREATION: PRs are created by child workflows as they complete,
 #    not waiting for all batches. First PR available in ~10 minutes.
 #
-# 3. SESSION RESERVATION: Self-limits to 3 concurrent children, reserving 2
-#    slots for PR workflows that may fire at any time.
+# 3. CHILD-COUNT CONCURRENCY: Self-limits to max_concurrent active children
+#    (default 3). Configurable up to 5 via workflow_dispatch input.
 #
 # 4. CURSOR-BASED STATELESS PICKUP: A GitHub issue comment stores processed
 #    alert IDs so the next run skips already-handled alerts.
@@ -1024,16 +1024,29 @@ jobs:
           def create_and_dispatch(batch):
               """Batch mode: create Devin session first, then dispatch child with session_id.
               Bug #51 fix: if session creation fails after all retries, do NOT dispatch
-              the child (it would also fail on 429). Return False to re-queue the batch."""
+              the child (it would also fail on 429). Return False to re-queue the batch.
+              Bug #56 fix: if a previous attempt already created a session for this batch
+              (stored in batch['_session_id']), reuse it instead of creating a new one.
+              Without this, dispatch failures orphan running Devin sessions (consuming
+              ACU) because re-queue + retry creates a duplicate session."""
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
               print(f"[BATCH] Creating session + dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
 
-              session_id, session_url = create_devin_session(batch)
-              if not session_id:
-                  print(f"  Session creation failed after retries — re-queuing batch (not dispatching child)")
-                  return False
-              _counters["sessions_created"] += 1
+              # Bug #56 fix: reuse session from a previous failed dispatch attempt
+              session_id = batch.get("_session_id")
+              session_url = batch.get("_session_url", "")
+              if session_id:
+                  print(f"  Reusing previously created session {session_id} (Bug #56 fix)")
+              else:
+                  session_id, session_url = create_devin_session(batch)
+                  if not session_id:
+                      print(f"  Session creation failed after retries — re-queuing batch (not dispatching child)")
+                      return False
+                  _counters["sessions_created"] += 1
+                  # Persist on the batch dict so re-queue preserves it
+                  batch["_session_id"] = session_id
+                  batch["_session_url"] = session_url
 
               success = dispatch_child(batch, session_id=session_id, session_url=session_url)
 
@@ -1048,11 +1061,10 @@ jobs:
                       "session_id": session_id,
                       "session_url": session_url
                   }
-                  mode = "BATCH" if session_id else "STANDALONE"
-                  print(f"  Dispatched successfully ({mode} mode)")
+                  print(f"  Dispatched successfully (BATCH mode)")
                   return True
               else:
-                  print(f"  Dispatch FAILED — will retry later")
+                  print(f"  Dispatch FAILED — session preserved on batch for retry")
                   return False
 
           # Initial fill: create sessions + dispatch up to max_concurrent children
@@ -1237,7 +1249,21 @@ jobs:
                       if age > max_child_runtime:
                           print(f"  Batch {child['batch']['batch_id']}: STALE ({int(age)}s > {max_child_runtime}s) — evicting")
                           failed_batches.append({**child["batch"], "conclusion": "timeout_evicted"})
+                          # Bug #57 fix: mark evicted children's alerts as attempted in cursor.
+                          # Without this, the next orchestrator run treats them as unprocessed
+                          # and re-dispatches them, creating an infinite retry loop.
+                          for aid in child["batch"]["alert_ids"]:
+                              if aid not in cursor.get("attempted_alert_ids", []):
+                                  cursor.setdefault("attempted_alert_ids", []).append(aid)
+                          cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                           del active_children[key]
+                          # Bug #57 fix: update cursor + backfill after eviction
+                          update_cursor(cursor)
+                          if pending_batches and len(active_children) < max_concurrent:
+                              next_batch = pending_batches.pop(0)
+                              print(f"  [BACKFILL] Batch {next_batch['batch_id']}...")
+                              if not create_and_dispatch(next_batch):
+                                  pending_batches.insert(0, next_batch)
                       else:
                           print(f"  Batch {child['batch']['batch_id']}: {run_status} ({int(age)}s)")
 
@@ -1248,7 +1274,18 @@ jobs:
                       if age > max_child_runtime:
                           print(f"  Batch {child['batch']['batch_id']}: evicting after {int(age)}s with status '{run_status}'")
                           failed_batches.append({**child["batch"], "conclusion": f"unknown_status_{run_status}"})
+                          # Bug #57 fix: mark evicted children's alerts as attempted
+                          for aid in child["batch"]["alert_ids"]:
+                              if aid not in cursor.get("attempted_alert_ids", []):
+                                  cursor.setdefault("attempted_alert_ids", []).append(aid)
+                          cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                           del active_children[key]
+                          update_cursor(cursor)
+                          if pending_batches and len(active_children) < max_concurrent:
+                              next_batch = pending_batches.pop(0)
+                              print(f"  [BACKFILL] Batch {next_batch['batch_id']}...")
+                              if not create_and_dispatch(next_batch):
+                                  pending_batches.insert(0, next_batch)
 
           # ============================================================
           # FINAL CURSOR UPDATE

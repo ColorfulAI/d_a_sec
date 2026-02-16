@@ -1720,6 +1720,49 @@ Sessions go `blocked` when Devin completes its work and sends a final message wi
 
 ---
 
+### Bug #56: Orphaned Devin Sessions on Re-queued Batches
+
+**Problem discovered**: In `create_and_dispatch()`, the orchestrator creates a Devin session BEFORE dispatching the child workflow. If session creation succeeds but `dispatch_child()` fails (e.g., GitHub API returns 500), the function returns `False` and the batch is re-queued. On retry, `create_and_dispatch()` creates a SECOND Devin session for the same batch. The first session is orphaned — still running, consuming ACU, doing duplicate work with no child workflow to poll it.
+
+The same issue occurs in two other re-queue paths:
+1. **Stuck dispatch detection** (5-min timeout): A child with no resolved `run_id` is evicted and re-queued, but its session_id is not preserved on the batch dict.
+2. **Backfill failure**: Re-inserted batches lose their session association.
+
+**Impact**: Each orphaned session consumes ACU budget until it finishes or expires. In a Fortune 500 production setting with 34 batches and transient GitHub API failures, multiple orphaned sessions could run in parallel doing identical work. With `max_acu_limit=10` per session and 5 concurrent slots, a burst of dispatch failures could waste 50 ACU on duplicate sessions. The orphaned sessions also count against the 5-session concurrent limit, potentially blocking legitimate new sessions.
+
+**Root cause**: The batch dict passed to `create_and_dispatch()` had no mechanism to remember that a session was already created. When the batch was re-queued (re-inserted into `pending_batches`), the session_id was lost — it only existed in the function's local scope.
+
+**Fix**: Store `_session_id` and `_session_url` on the batch dict itself when a session is successfully created. On retry, `create_and_dispatch()` checks for an existing `_session_id` and skips session creation, going straight to dispatch. This ensures each batch creates at most one Devin session, regardless of how many dispatch retries occur.
+
+---
+
+### Bug #57: Evicted/Timed-Out Children Don't Update Cursor or Trigger Backfill
+
+**Problem discovered**: When a child workflow is evicted due to exceeding `max_child_runtime` (timeout eviction) or having an unexpected status after max runtime, its alerts are added to `failed_batches` but NOT recorded in the cursor. Additionally, no backfill is triggered after eviction, leaving the freed slot empty until the next poll cycle's top-of-loop backfill.
+
+The cursor only gets updated for `completed` children (inside the `if run_status == "completed"` block). For evicted children, the code flow is:
+1. `failed_batches.append(...)` — records failure for summary reporting
+2. `del active_children[key]` — frees the slot
+3. (nothing else) — no cursor update, no backfill
+
+**Impact**: The next orchestrator run loads the cursor and finds no record of the evicted batch's alerts. It treats them as unprocessed and re-dispatches them, creating a new Devin session. If the same alerts keep timing out (e.g., complex multi-file fix that exceeds 60 min), this creates an infinite retry loop across orchestrator runs: dispatch → timeout → evict → no cursor record → next run re-dispatches → timeout → evict → repeat. Each cycle wastes a full Devin session's ACU budget. Additionally, the freed slot sits empty until the next poll cycle instead of being immediately backfilled, reducing throughput.
+
+**Root cause**: The eviction paths (timeout and unknown status) were added as simple cleanup (`append to failed + delete from active`) without the cursor-update and backfill logic that exists in the completion path.
+
+**Fix**: Added cursor update (marking alerts as "attempted") and backfill dispatch to both eviction paths (timeout eviction and unknown-status eviction). The cursor update ensures the next run knows these alerts were attempted, preventing infinite re-dispatch. The backfill immediately fills the freed slot, maintaining throughput.
+
+---
+
+### Bug #58: Stale Header Comment — "SESSION RESERVATION" References Removed Design
+
+**Problem discovered**: The orchestrator's file header (line 21-22) states: "SESSION RESERVATION: Self-limits to 3 concurrent children, reserving 2 slots for PR workflows that may fire at any time." This description references the session reservation gate design that was removed in Bug #14. The orchestrator now uses child-count concurrency (`max_concurrent` input, default 3, max 5) with no slot reservation for PR workflows.
+
+**Impact**: A developer reading the header gets a misleading mental model of how concurrency works. They might think 2 of 5 Devin session slots are reserved for PR workflows (they're not). In a production context, this could lead to incorrect capacity planning — someone might set `max_concurrent=5` thinking "5 total minus 2 reserved = 3 for backlog" when actually all 5 are used for backlog batches.
+
+**Fix**: Updated the header comment to accurately describe the current child-count concurrency model.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
