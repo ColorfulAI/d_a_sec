@@ -1,6 +1,7 @@
 import os
 import subprocess
 from flask import request, Flask, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -24,7 +25,7 @@ def view_logs():
         ["cat", log_file],
         text=True
     )
-    response = make_response(result)
+    response = make_response(str(escape(result)))
     response.headers["Content-Type"] = "text/html"
     return response
 
