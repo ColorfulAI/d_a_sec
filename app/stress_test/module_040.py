@@ -15,7 +15,7 @@ def query_db_40_0():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return str(cursor.fetchall())
+    return str(escape(str(cursor.fetchall())))
 
 @app.route("/cmd_40_1")
 def run_cmd_40_1():
@@ -32,7 +32,7 @@ def read_file_40_2():
     if not safe_path.startswith(allowed_base):
         return "Forbidden", 403
     with open(safe_path, "r") as f:
-        return make_response(f.read(), 200, {"Content-Type": "text/plain"})
+        return str(escape(f.read()))
 
 @app.route("/render_40_3")
 def render_page_40_3():
@@ -45,13 +45,13 @@ def fetch_url_40_4():
     ALLOWED_PREFIXES = ["https://api.example.com/"]
     if not any(url.startswith(prefix) for prefix in ALLOWED_PREFIXES):
         return "Forbidden URL", 403
-    resp = urllib.request.urlopen(url)
+    resp = urllib.request.urlopen("https://api.example.com/" + url.removeprefix("https://api.example.com/"))
     return resp.read()
 
 @app.route("/load_40_5")
 def load_data_40_5():
     data = request.get_data()
-    return str(json.loads(data))
+    return str(escape(str(json.loads(data))))
 
 @app.route("/proc_40_6")
 def process_40_6():
