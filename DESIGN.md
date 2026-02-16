@@ -1091,6 +1091,26 @@ The split can be implemented incrementally:
 
 ---
 
+## Backlog Architecture — Testing Findings
+
+### Iteration 1: First Real Run (Bugs #5–#7)
+
+**What was tested**: Orchestrator dispatched 1 child batch workflow with 3 alert IDs. The child created a Devin session that ran for ~36 minutes before transitioning to `suspended` status.
+
+**What was found**:
+
+| Bug | Root Cause | Impact | Fix (PR #110) |
+|-----|-----------|--------|---------------|
+| **#5: `suspended` not handled** | Polling `case` statement only had `finished`, `stopped`, `blocked`, `failed`, `error`. `suspended` fell through to default (no-op). | 7 wasted polls (7 min) after session went suspended, then API returned non-JSON → crash. | Added `suspended` to the `blocked` case (both need manual intervention). |
+| **#6: jq crash on non-JSON API response** | `jq -r '.status // "unknown"'` called on raw API response without validating it's JSON first. HTML error pages, rate limit responses, or transient failures crash jq with exit code 5. | Entire workflow fails with cryptic `parse error: Invalid numeric literal at line 1, column 7`. No recovery. | Added `jq empty` guard before parsing. Non-JSON responses log a warning and retry on next poll cycle. |
+| **#7: Operator precedence in collect-results** | `[ -n "$BRANCH_NAME" ] && [ "$STATUS" = "finished" ] \|\| [ "$STATUS" = "stopped" ]` evaluates as `(BRANCH && finished) \|\| stopped`. | If status is `stopped` but branch is empty, the commit-counting block runs and queries a non-existent branch. | Fixed with explicit grouping: `&& { [ ... ] \|\| [ ... ]; }`. |
+
+**How these were discovered**: By reading the CI job logs line-by-line after the batch workflow failed at poll 43/45. The session status transition pattern (`running` → `suspended` at poll 37) was visible in the poll output. The jq crash was the proximate cause of failure, but the root cause was the missing `suspended` handler — if handled, the workflow would have exited gracefully 6 polls earlier.
+
+**Why these matter in production**: At Fortune 500 scale with dozens of concurrent batch workflows, any unhandled Devin session status is a ticking time bomb. The Devin API may return `suspended`, `paused`, or other statuses not in our original design. Defensive parsing (validate JSON before jq) prevents cascading failures from API transients.
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
