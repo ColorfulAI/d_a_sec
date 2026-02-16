@@ -279,6 +279,8 @@ jobs:
           MAX_POLLS=45
           POLL_INTERVAL=60
           POLL=0
+          UNBLOCK_ATTEMPTS=0
+          MAX_UNBLOCK_ATTEMPTS=2
 
           echo "Polling session $SESSION_ID every ${POLL_INTERVAL}s (max ${MAX_POLLS} polls = $(( MAX_POLLS * POLL_INTERVAL / 60 )) min)..."
 
@@ -289,7 +291,6 @@ jobs:
                 -H "Authorization: Bearer $DEVIN_API_KEY" \
                 "https://api.devin.ai/v1/sessions/$SESSION_ID")
 
-              # Guard against non-JSON responses (API errors, rate limits, HTML error pages)
               if ! echo "$RESP" | jq empty 2>/dev/null; then
                 echo "Poll $POLL/$MAX_POLLS: API returned non-JSON response (${#RESP} bytes). Retrying..."
                 if [ $POLL -lt $MAX_POLLS ]; then
@@ -302,10 +303,6 @@ jobs:
               STATUS_ENUM=$(echo "$RESP" | jq -r '.status_enum // "unknown"')
               echo "Poll $POLL/$MAX_POLLS: status=$STATUS status_enum=$STATUS_ENUM"
 
-              # Check status_enum first (well-defined API enum), then fall back to status (free-form string).
-              # Devin API status_enum values: working, blocked, expired, finished,
-              # suspend_requested, suspend_requested_frontend, resume_requested,
-              # resume_requested_frontend, resumed
               EFFECTIVE_STATUS="$STATUS_ENUM"
               if [ "$EFFECTIVE_STATUS" = "unknown" ] || [ "$EFFECTIVE_STATUS" = "null" ]; then
                 EFFECTIVE_STATUS="$STATUS"
@@ -324,7 +321,31 @@ jobs:
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
-                blocked|suspended|suspend_requested|suspend_requested_frontend)
+                blocked)
+                  if [ $UNBLOCK_ATTEMPTS -lt $MAX_UNBLOCK_ATTEMPTS ]; then
+                    UNBLOCK_ATTEMPTS=$((UNBLOCK_ATTEMPTS + 1))
+                    echo "Session blocked — sending unblock message (attempt $UNBLOCK_ATTEMPTS/$MAX_UNBLOCK_ATTEMPTS)..."
+                    UNBLOCK_MSG="Continue working on the remaining security alerts. Do not ask questions or wait for input. This is an unattended automated run. If you are unsure about a fix, skip the alert and mark it as unfixable. Push your changes and finish."
+                    MSG_JSON=$(echo "$UNBLOCK_MSG" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))")
+                    MSG_RESP=$(curl -s -w "\n%{http_code}" \
+                      -X POST "https://api.devin.ai/v1/sessions/$SESSION_ID/message" \
+                      -H "Authorization: Bearer $DEVIN_API_KEY" \
+                      -H "Content-Type: application/json" \
+                      -d "{\"message\": $MSG_JSON}")
+                    MSG_HTTP=$(echo "$MSG_RESP" | tail -1)
+                    echo "Unblock message sent (HTTP $MSG_HTTP). Continuing to poll..."
+                    if [ $POLL -lt $MAX_POLLS ]; then
+                      sleep $POLL_INTERVAL
+                    fi
+                    continue
+                  else
+                    echo "::warning::Session blocked after $MAX_UNBLOCK_ATTEMPTS unblock attempts — accepting as terminal"
+                    echo "status=blocked" >> $GITHUB_OUTPUT
+                    echo "completed=true" >> $GITHUB_OUTPUT
+                    exit 0
+                  fi
+                  ;;
+                suspended|suspend_requested|suspend_requested_frontend)
                   echo "::warning::Session is $EFFECTIVE_STATUS — may need manual intervention"
                   echo "status=$EFFECTIVE_STATUS" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
@@ -430,7 +451,6 @@ jobs:
           PR_URL=$(echo "$RESP" | jq -r '.html_url // empty')
 
           if [ -z "$PR_NUMBER" ]; then
-            # PR may already exist for this branch
             EXISTING=$(curl -s -L \
               -H "Authorization: token $GH_PAT" \
               "https://api.github.com/repos/$REPO/pulls?head=${{ github.repository_owner }}:$BRANCH_NAME&state=open")
@@ -438,6 +458,22 @@ jobs:
             PR_URL=$(echo "$EXISTING" | jq -r '.[0].html_url // empty')
             if [ -n "$PR_NUMBER" ]; then
               echo "PR already exists: $PR_URL"
+              echo "Updating PR body with structured batch metadata..."
+              UPDATE_RESP=$(curl -s -L \
+                -X PATCH \
+                -H "Authorization: token $GH_PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
+                -d "{
+                  \"title\": \"fix(security): Batch ${BATCH_ID} — ${ALERT_COUNT} CodeQL alerts in ${PRIMARY_FILES}\",
+                  \"body\": $PR_BODY_JSON
+                }")
+              UPDATE_OK=$(echo "$UPDATE_RESP" | jq -r '.number // empty')
+              if [ -n "$UPDATE_OK" ]; then
+                echo "PR body updated with structured batch metadata"
+              else
+                echo "::warning::Could not update PR body (non-critical)"
+              fi
             else
               echo "::warning::Failed to create PR for batch $BATCH_ID"
               echo "$RESP" | jq . 2>/dev/null || echo "$RESP"
