@@ -550,6 +550,19 @@ These parsed values are passed to both:
 
 **Evidence this would have caught PR #159's issue**: The unused import `#228` in `auth_handler.py` would have been detected by Layer 2's "new alerts in modified files" check, and the PR would have been labeled `codeql-verification-failed` instead of appearing clean.
 
+### Bug #47: CodeQL Verification Uses Wrong Language (`actions` Instead of `python`)
+
+**Problem discovered**: The post-session CodeQL verification gate (Layer 2) and the Devin prompt's verification commands both used `PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)` to select the language for CodeQL database creation. When the repo's CodeQL config includes multiple languages (`actions,python`), the comma-separated list is sorted alphabetically, so `actions` comes first. This caused the verification to create a CodeQL database for GitHub Actions YAML files instead of Python source code — completely missing all Python vulnerabilities.
+
+**Impact**: The verification gate reported "PASSED" and "Total SARIF results: 1" (a YAML finding) while 12 Python alerts were never checked. This is why PRs #111, #112, and #167 all showed "CodeQL Verification: PASSED" in the PR body but still failed CodeQL in CI — the verification was checking the wrong language entirely.
+
+**Root cause**: The `actions` language in CodeQL scans `.github/workflows/*.yml` files. It is never relevant for application security vulnerability verification. When the repo's `codeql.yml` matrix includes `[actions, python]`, the sorted output is `actions,python`, and `cut -d',' -f1` picks `actions`.
+
+**Fix**: Filter out `actions` from the language list before selecting the primary language. If real code languages exist (python, javascript, go, etc.), use the first one. Fall back to `actions` only if it's the sole language (unlikely for security workflows). Applied in 3 locations:
+1. Batch workflow — standalone mode session prompt (line 329)
+2. Batch workflow — post-session verification gate (line 591)
+3. Orchestrator — `build_session_prompt()` function (line 818)
+
 ### Why Not Multiple Sessions?
 
 | Approach | Sessions Created | Real Attempts | Latency | Cost |

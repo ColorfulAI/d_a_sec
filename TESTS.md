@@ -676,6 +676,42 @@ Each test case follows these rules:
 
 ---
 
+### TC-BL-BATCH-7: CodeQL Verification Uses Correct Language (Not `actions`)
+
+**Setup**: Trigger backlog workflow on a repo whose `codeql.yml` has `languages: [actions, python]` in the matrix. Let batch workflow complete and inspect the "Verify fixes with CodeQL" step logs.
+
+**Expected**:
+1. Logs show `Creating CodeQL database (language=python)...` — NOT `language=actions`
+2. SARIF results contain Python-specific rules (e.g., `py/sql-injection`, `py/reflective-xss`)
+3. Post-session verification correctly identifies remaining Python alerts
+4. The PR body's "CodeQL Verification" section reflects Python analysis, not YAML analysis
+
+**Validates**: Bug #47 fix — filtering out `actions` language when real code languages exist.
+
+**Production scenario**: A Fortune 500 monorepo with `languages: [actions, csharp, javascript, python]` in the CodeQL matrix. Before the fix, verification would create a database for `actions` (alphabetically first), scan only YAML workflow files, report "0 alerts found" for all Python/JS/C# vulnerabilities, and stamp every PR as "CodeQL Verification: PASSED" — completely defeating the verification gate. Every fix PR would appear verified but actually fail CI.
+
+**Worry**: If the `actions` language is the only language (repo with no application code, only workflow files), filtering it out would leave an empty list. The fix must fall back to `actions` in this edge case. Also, if a NEW language is added to the CodeQL config between the orchestrator parsing and the child's verification step, the language list could be stale.
+
+---
+
+### TC-BL-BATCH-8: Multi-Language Repo CodeQL Verification
+
+**Setup**: Modify the repo's `codeql.yml` to include `languages: [python, javascript]`. Push vulnerable Python and JavaScript code. Trigger backlog workflow.
+
+**Expected**:
+1. Orchestrator parses both languages from CodeQL config
+2. Batch session prompt includes both languages
+3. Post-session verification uses `python` (first real code language) for database creation
+4. Python alerts are correctly verified
+
+**Validates**: Language selection logic works correctly with multiple real code languages (no `actions` in the mix).
+
+**Production scenario**: A full-stack monorepo with Python backend and JavaScript frontend. The backlog workflow should verify fixes against the correct language for each batch's alerts, not just the first one alphabetically.
+
+**Worry**: If a batch contains alerts from BOTH Python and JavaScript files, the verification only runs with one language. This means JavaScript alerts in a mixed batch won't be verified. Future improvement: run verification for each language that has alerts in the batch.
+
+---
+
 ## Integration with PR-Triggered Tests
 
 The following test cases from [PR_triggered_tests.md](./PR_triggered_tests.md) remain relevant to the backlog workflow and should be validated in the backlog context:

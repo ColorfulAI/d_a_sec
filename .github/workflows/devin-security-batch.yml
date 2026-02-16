@@ -323,7 +323,11 @@ jobs:
           ALERT_SUMMARY=$(cat /tmp/batch_summary.txt)
           ALERT_DETAILS=$(cat /tmp/batch_details.json)
 
-          PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)
+          # Bug #47 fix: filter out 'actions' language (scans YAML only) when real
+          # code languages are present — otherwise CodeQL verifies workflow files
+          # instead of application source code.
+          CODE_LANGS=$(echo "$CODEQL_LANGUAGES" | tr ',' '\n' | grep -v '^actions$' | head -1)
+          PRIMARY_LANG=${CODE_LANGS:-$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)}
           QUERY_PACK="codeql/${PRIMARY_LANG}-queries:codeql-suites/${PRIMARY_LANG}-${CODEQL_QUERY_SUITE}.qls"
 
           THREAT_FLAGS=""
@@ -581,8 +585,11 @@ jobs:
           wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip
           unzip -qo codeql-linux64.zip
 
-          # Build dynamic commands from parsed repo config
-          PRIMARY_LANG=$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)
+          # Bug #47 fix: filter out 'actions' language (scans YAML only) when real
+          # code languages are present — otherwise CodeQL verifies workflow files
+          # instead of application source code.
+          CODE_LANGS=$(echo "$CODEQL_LANGUAGES" | tr ',' '\n' | grep -v '^actions$' | head -1)
+          PRIMARY_LANG=${CODE_LANGS:-$(echo "$CODEQL_LANGUAGES" | cut -d',' -f1)}
           QUERY_PACK="codeql/${PRIMARY_LANG}-queries:codeql-suites/${PRIMARY_LANG}-${CODEQL_QUERY_SUITE}.qls"
 
           # Build threat model flags
