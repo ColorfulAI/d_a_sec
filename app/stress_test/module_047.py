@@ -1,7 +1,6 @@
 """Stress test module 47 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
 import os
-import subprocess
 import json
 from flask import Flask, request, make_response
 from markupsafe import escape
