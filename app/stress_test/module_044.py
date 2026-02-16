@@ -27,8 +27,16 @@ def run_cmd_44_1():
 @app.route("/read_44_2")
 def read_file_44_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    ALLOWED_FILES = {
+        "readme.txt": "/var/data/readme.txt",
+        "config.txt": "/var/data/config.txt",
+        "data.txt": "/var/data/data.txt",
+    }
+    safe_path = ALLOWED_FILES.get(os.path.basename(path))
+    if safe_path is None:
+        return "File not allowed", 403
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_44_3")
 def render_page_44_3():
