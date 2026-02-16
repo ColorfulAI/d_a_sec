@@ -29,8 +29,13 @@ def run_cmd_48_1():
 @app.route("/read_48_2")
 def read_file_48_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_base = os.path.abspath("/var/data")
+    safe_path = os.path.abspath(os.path.join(safe_base, path))
+    if not safe_path.startswith(safe_base + os.sep):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        resp = make_response(escape(f.read()))
+        return resp
 
 @app.route("/render_48_3")
 def render_page_48_3():
