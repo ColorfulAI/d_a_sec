@@ -1391,6 +1391,40 @@ When 2+ batches are dispatched within seconds of each other, the orchestrator's 
 1. **Chronological matching**: Collect ALL unresolved children in one pass. Sort both the API runs and unresolved children oldest-first by timestamp. Match 1:1 in dispatch order. Add `already_matched.add(run_id)` within the loop to prevent double-matching (was also a latent bug in the old code).
 2. **Unknown status handler**: Added `else` branch in the polling loop for unexpected statuses. Logs the unexpected status and evicts the child after `max_child_runtime` seconds, preventing infinite hang.
 
+**Worry: PR creation step skips `blocked` sessions — PR URL lost (Bug #23 — CONFIRMED)**
+
+Devin sessions frequently end in `blocked` status instead of `finished`. This happens when Devin completes its work but the session transitions to `blocked` (waiting for human confirmation or hitting an internal limit). The batch workflow's "Create PR" step had an `if` condition that listed specific statuses (`finished`, `stopped`, `suspended`, `suspend_requested`, `suspend_requested_frontend`, `expired`) but NOT `blocked`. When the session went `blocked`:
+
+1. The polling loop correctly detected `blocked` and exited with `status=blocked`
+2. The "Create PR" step's `if` condition didn't match → step was SKIPPED
+3. Devin had already created a PR inside the session (PRs #134, #135 exist)
+4. The result artifact recorded `pr_url: ""` and `pr_number: ""`
+5. The orchestrator could not report which PRs were created
+
+**Observed behavior (iteration 4 re-run, batches 22061015908 and 22061018778)**:
+- Both sessions ended with `status_enum=blocked` after ~16-17 polls (~16 min)
+- Both Devin sessions pushed code and created PRs (#134, #135)
+- Both result artifacts had empty `pr_url` and `pr_number`
+- The "Create PR" step was skipped for both batches
+
+**Why this is critical in production**: Every batch that ends `blocked` loses its PR URL linkage. The orchestrator summary has no PR URLs to report. Engineers reviewing the tracking issue see alert counts but no links to the actual fix PRs. For an enterprise team reviewing 34 batch PRs, missing links means manual searching through GitHub to find the fixes.
+
+**Solution (Bug #23 fix)**: Added `blocked` to the "Create PR" step's `if` condition. The step already handles existing PRs (lines 431-445): if Devin created a PR inside the session, the step detects it via the GitHub API and captures its URL instead of creating a duplicate.
+
+**Worry: Artifact download failure falsely marks alerts as "processed" (Bug #24 — CONFIRMED)**
+
+When the orchestrator cannot download a child batch's result artifact (network error, artifact expired, malformed JSON), the fallback code marked ALL alerts in that batch as `processed`. This is wrong — `processed` means "confirmed fixed on main." Without artifact data, the orchestrator has no evidence that any fix was applied. Marking as `processed` prevents the next orchestrator run from re-verifying these alerts.
+
+**Impact in production**: If GitHub Artifacts has a brief outage during the orchestrator's result collection phase, every batch whose artifact can't be downloaded gets its alerts marked as `processed`. These alerts are permanently skipped in future runs, even if Devin's fix didn't actually work. The backlog appears "cleared" but the vulnerabilities remain.
+
+**Solution (Bug #24 fix)**: Changed the fallback from `processed` to `attempted`. Alerts marked as `attempted` are re-verified on the next orchestrator run (Bug #18b re-verification logic). If the fix PR was merged and CodeQL confirms the alert is resolved, the alert moves from `attempted` to `processed`. If not, it stays in `attempted` for another attempt.
+
+**Worry: Orchestrator summary doesn't report batch PR URLs (Bug #25 — CONFIRMED)**
+
+The orchestrator's final summary logged alert counts, attempted IDs, and unfixable IDs, but did not report which PRs were created by each batch. For an enterprise team, the summary is the primary output — it should link to every fix PR so reviewers can start merging immediately.
+
+**Solution (Bug #25 fix)**: The orchestrator now extracts `pr_url` from each batch's result artifact and stores it on the batch object. The final summary includes a "PRs created" section listing all batch PR URLs.
+
 ---
 
 ## Limitations and Future Work

@@ -298,24 +298,40 @@ jobs:
               fi
 
               STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
-              echo "Poll $POLL/$MAX_POLLS: status=$STATUS"
+              STATUS_ENUM=$(echo "$RESP" | jq -r '.status_enum // "unknown"')
+              echo "Poll $POLL/$MAX_POLLS: status=$STATUS status_enum=$STATUS_ENUM"
 
-              case "$STATUS" in
+              # Check status_enum first (well-defined API enum), then fall back to status (free-form string).
+              # Devin API status_enum values: working, blocked, expired, finished,
+              # suspend_requested, suspend_requested_frontend, resume_requested,
+              # resume_requested_frontend, resumed
+              EFFECTIVE_STATUS="$STATUS_ENUM"
+              if [ "$EFFECTIVE_STATUS" = "unknown" ] || [ "$EFFECTIVE_STATUS" = "null" ]; then
+                EFFECTIVE_STATUS="$STATUS"
+              fi
+
+              case "$EFFECTIVE_STATUS" in
                 finished|stopped)
-                  echo "Session completed with status=$STATUS"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                  echo "Session completed with status=$STATUS status_enum=$STATUS_ENUM"
+                  echo "status=finished" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
-                blocked|suspended)
-                  echo "::warning::Session is $STATUS — may need manual intervention"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                expired)
+                  echo "::warning::Session expired (status=$STATUS status_enum=$STATUS_ENUM)"
+                  echo "status=expired" >> $GITHUB_OUTPUT
+                  echo "completed=true" >> $GITHUB_OUTPUT
+                  exit 0
+                  ;;
+                blocked|suspended|suspend_requested|suspend_requested_frontend)
+                  echo "::warning::Session is $EFFECTIVE_STATUS — may need manual intervention"
+                  echo "status=$EFFECTIVE_STATUS" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
                 failed|error)
-                  echo "::error::Session failed with status=$STATUS"
-                  echo "status=$STATUS" >> $GITHUB_OUTPUT
+                  echo "::error::Session failed with status=$STATUS status_enum=$STATUS_ENUM"
+                  echo "status=failed" >> $GITHUB_OUTPUT
                   echo "completed=true" >> $GITHUB_OUTPUT
                   exit 0
                   ;;
@@ -335,7 +351,7 @@ jobs:
       # ----------------------------------------------------------------
       - name: Create PR for batch fixes
         id: create-pr
-        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended'
+        if: steps.poll-session.outputs.status == 'finished' || steps.poll-session.outputs.status == 'stopped' || steps.poll-session.outputs.status == 'suspended' || steps.poll-session.outputs.status == 'suspend_requested' || steps.poll-session.outputs.status == 'suspend_requested_frontend' || steps.poll-session.outputs.status == 'expired' || steps.poll-session.outputs.status == 'blocked'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -442,19 +458,32 @@ jobs:
         if: always()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          SESSION_STATUS: ${{ steps.poll-session.outputs.status }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create-pr.outputs.pr_url }}
+          SESSION_URL: ${{ steps.create-session.outputs.session_url }}
+          SESSION_ID: ${{ steps.create-session.outputs.session_id }}
         run: |
-          REPO="${{ github.repository }}"
-          SESSION_STATUS="${{ steps.poll-session.outputs.status }}"
-          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
-          PR_URL="${{ steps.create-pr.outputs.pr_url }}"
-          SESSION_URL="${{ steps.create-session.outputs.session_url }}"
-          SESSION_ID="${{ steps.create-session.outputs.session_id }}"
-
-          # Determine which specific alerts were fixed vs unfixable
-          # by re-querying CodeQL for each alert in this batch.
-          # This is the source of truth — not commit counting.
+          # Determine which specific alerts were fixed vs unfixable.
+          #
+          # Bug #18 fix: We cannot rely on querying CodeQL alert state on main
+          # because the fix is on a PR branch (not yet merged). All alerts will
+          # show state=open on main, leading to ALL being marked unfixable.
+          #
+          # Instead, we use a two-tier approach:
+          # 1. Check which files were modified in the branch vs main (file-modification heuristic)
+          # 2. For modified files: mark alerts as "attempted" (likely fixed, pending PR merge)
+          # 3. For unmodified files: mark alerts as "unfixable" (Devin didn't touch them)
+          # 4. Also check CodeQL — if an alert IS already fixed on main, mark it fixed
+          #
+          # The definitive fixed/unfixable determination happens on subsequent
+          # orchestrator runs after the PR is merged and CodeQL re-runs on main.
           python3 << 'RESULT_EOF'
-          import json, os, subprocess, time, urllib.request
+          import json, os, sys, subprocess, time, urllib.request, urllib.error
+
+          sys.stdout.reconfigure(line_buffering=True)
+          HTTP_TIMEOUT = 30
 
           repo = os.environ.get("REPO", "")
           gh_pat = os.environ.get("GH_PAT", "")
@@ -471,35 +500,77 @@ jobs:
           total = len(batch_alert_ids)
 
           fixed_ids = []
+          attempted_ids = []
           unfixable_ids = []
 
-          if session_status in ("finished", "stopped") and branch_name:
-              print(f"Verifying {total} alerts against CodeQL API...")
-              headers = {
-                  "Authorization": f"token {gh_pat}",
-                  "Accept": "application/vnd.github+json"
-              }
+          headers = {
+              "Authorization": f"token {gh_pat}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          print(f"Session status: {session_status}, branch: {branch_name}")
+
+          if session_status in ("finished", "stopped", "expired", "blocked") and branch_name:
+              # Step 1: Get list of files modified in the branch vs main
+              modified_files = set()
+              try:
+                  compare_url = f"https://api.github.com/repos/{repo}/compare/main...{branch_name}"
+                  req = urllib.request.Request(compare_url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                      compare_data = json.loads(resp.read())
+                  for f in compare_data.get("files", []):
+                      modified_files.add(f.get("filename", ""))
+                  print(f"Branch {branch_name} modified {len(modified_files)} files vs main:")
+                  for mf in sorted(modified_files):
+                      print(f"  - {mf}")
+              except Exception as e:
+                  print(f"  Warning: Could not fetch branch comparison: {e}")
+                  print(f"  Falling back to CodeQL-only check")
+
+              # Step 2: Load alert details to get file paths
+              alert_files = {}
+              try:
+                  with open("/tmp/batch_details.json") as f:
+                      details = json.load(f)
+                  for d in details:
+                      alert_files[d.get("number")] = d.get("file", "")
+              except Exception:
+                  pass
+
+              # Step 3: Classify each alert
+              print(f"\nClassifying {total} alerts...")
               for aid in batch_alert_ids:
                   try:
                       url = f"https://api.github.com/repos/{repo}/code-scanning/alerts/{aid}"
                       req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req) as resp:
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                           alert = json.loads(resp.read())
                       state = alert.get("state", "unknown")
+
                       if state == "fixed":
                           fixed_ids.append(aid)
-                          print(f"  Alert #{aid}: FIXED")
+                          print(f"  Alert #{aid}: FIXED on main (confirmed)")
                       elif state == "dismissed":
                           fixed_ids.append(aid)
                           print(f"  Alert #{aid}: DISMISSED (counts as resolved)")
                       else:
-                          unfixable_ids.append(aid)
-                          print(f"  Alert #{aid}: STILL OPEN (state={state}) — marking unfixable")
+                          # Alert still open on main — check if Devin modified the file
+                          alert_file = alert_files.get(aid, "")
+                          if not alert_file:
+                              loc = alert.get("most_recent_instance", {}).get("location", {})
+                              alert_file = loc.get("path", "")
+                          if alert_file and alert_file in modified_files:
+                              attempted_ids.append(aid)
+                              print(f"  Alert #{aid}: ATTEMPTED (file {alert_file} was modified in branch — pending PR merge)")
+                          else:
+                              unfixable_ids.append(aid)
+                              reason = "file not modified by Devin" if alert_file else "file path unknown"
+                              print(f"  Alert #{aid}: UNFIXABLE ({reason}, state={state})")
                   except Exception as e:
                       print(f"  Alert #{aid}: ERROR checking ({e}) — marking unfixable")
                       unfixable_ids.append(aid)
-                  time.sleep(0.5)  # rate limit courtesy
-          elif session_status in ("failed", "error"):
+                  time.sleep(0.5)
+          elif session_status in ("failed", "error", "timeout"):
               print(f"Session {session_status} — all {total} alerts marked unfixable")
               unfixable_ids = list(batch_alert_ids)
           else:
@@ -507,14 +578,16 @@ jobs:
               unfixable_ids = list(batch_alert_ids)
 
           fixed_count = len(fixed_ids)
+          attempted_count = len(attempted_ids)
           failed_count = len(unfixable_ids)
 
-          print(f"\nResults: {fixed_count} fixed, {failed_count} unfixable out of {total} total")
+          print(f"\nResults: {fixed_count} confirmed fixed, {attempted_count} attempted (pending merge), {failed_count} unfixable out of {total} total")
 
           result = {
               "batch_id": batch_id,
               "alert_ids": [str(a) for a in batch_alert_ids],
               "fixed_alert_ids": [str(a) for a in fixed_ids],
+              "attempted_alert_ids": [str(a) for a in attempted_ids],
               "unfixable_alert_ids": [str(a) for a in unfixable_ids],
               "session_id": session_id,
               "session_url": session_url,
@@ -522,6 +595,7 @@ jobs:
               "pr_number": pr_number,
               "pr_url": pr_url,
               "fixed_count": fixed_count,
+              "attempted_count": attempted_count,
               "failed_count": failed_count,
               "branch_name": branch_name
           }
@@ -532,8 +606,10 @@ jobs:
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
           with open(gh_out, "a") as f:
               f.write(f"fixed_count={fixed_count}\n")
+              f.write(f"attempted_count={attempted_count}\n")
               f.write(f"failed_count={failed_count}\n")
               f.write(f"fixed_alert_ids={','.join(str(a) for a in fixed_ids)}\n")
+              f.write(f"attempted_alert_ids={','.join(str(a) for a in attempted_ids)}\n")
               f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
               compact = json.dumps(result)
               f.write(f"result_json={compact}\n")
@@ -558,7 +634,8 @@ jobs:
           echo "- **Session**: ${{ steps.create-session.outputs.session_url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Status**: ${{ steps.poll-session.outputs.status }}" >> $GITHUB_STEP_SUMMARY
           echo "- **PR**: ${{ steps.create-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Fixed**: ${{ steps.collect-results.outputs.fixed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fixed (confirmed)**: ${{ steps.collect-results.outputs.fixed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Attempted (pending PR merge)**: ${{ steps.collect-results.outputs.attempted_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Unfixable (needs human review)**: ${{ steps.collect-results.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
           if [ -n "${{ steps.collect-results.outputs.unfixable_alert_ids }}" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -568,6 +645,19 @@ jobs:
             for aid in "${UNFIXABLE[@]}"; do
               if [ -n "$aid" ]; then
                 echo "- [ ] Alert [#${aid}](https://github.com/${{ github.repository }}/security/code-scanning/${aid})" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
+          if [ -n "${{ steps.collect-results.outputs.attempted_alert_ids }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Alerts Pending PR Merge Verification" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_These alerts' files were modified by Devin. They will be confirmed fixed after the PR is merged and CodeQL re-runs._" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            IFS=',' read -ra ATTEMPTED <<< "${{ steps.collect-results.outputs.attempted_alert_ids }}"
+            for aid in "${ATTEMPTED[@]}"; do
+              if [ -n "$aid" ]; then
+                echo "- Alert [#${aid}](https://github.com/${{ github.repository }}/security/code-scanning/${aid})" >> $GITHUB_STEP_SUMMARY
               fi
             done
           fi

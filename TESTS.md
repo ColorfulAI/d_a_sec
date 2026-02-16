@@ -1136,3 +1136,58 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: The simplest invariant: if all children are done, the orchestrator should be done too. Any violation of this invariant means the backlog sweep never reports results, the cursor is never updated, unfixable alerts are never surfaced to humans, and the GitHub Actions job runs until the 6-hour timeout (costing compute minutes and blocking subsequent scheduled runs).
 
 **Worry**: Even with the Bug #22 fix, there are other paths that could cause the polling loop to hang: (a) a child's status transitions through an unexpected GitHub Actions state (e.g., "cancelled" before the orchestrator polls), (b) the safety timeout is set too high (currently 5400s = 90 minutes), or (c) a child is evicted but the orchestrator fails to update the cursor before the safety timeout. This test validates the happy path; TC-BL-REG-26 covers the API failure path.
+
+### TC-BL-REG-28: PR Creation Runs for Blocked Sessions (Bug #23)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`. Let the child batch workflow run. The Devin session will likely end in `blocked` status (observed pattern: sessions go blocked after ~15-17 min of work). Monitor the child workflow's "Create PR for batch fixes" step.
+
+**Expected**:
+1. The Devin session ends with `status_enum=blocked`
+2. The "Create PR for batch fixes" step RUNS (not skipped)
+3. If Devin already created a PR inside the session, the step detects the existing PR and captures its URL
+4. If no PR exists, the step creates one
+5. The result artifact contains a non-empty `pr_url` and `pr_number`
+6. The orchestrator summary includes the PR URL
+
+**Validates**: Bug #23 — The "Create PR" step's `if` condition previously excluded `blocked` status. When sessions ended `blocked` (which is the COMMON case in practice), the step was skipped, causing `pr_url: ""` in the result artifact. The orchestrator could not report which PRs were created.
+
+**Production scenario**: At a Fortune 500 company, the security engineering team relies on the orchestrator's tracking issue for a dashboard of all fix PRs. If PR URLs are missing for half the batches (because sessions went `blocked`), the team has to manually search GitHub for PRs matching `devin/security-batch-*` branches. With 34 batches across a 500-alert backlog, this manual search is unacceptable. The fix ensures every batch that pushed code gets its PR URL captured regardless of session terminal status.
+
+**Worry**: Even with `blocked` added to the condition, other terminal statuses could emerge from the Devin API in the future (e.g., `cancelled`, `timed_out`). A more robust approach would be `if: steps.poll-session.outputs.completed == 'true'` instead of listing every possible status. But that changes the step's semantics — currently, `completed=true` is set for ALL terminal statuses including `failed` and `error`, where PR creation would be pointless. The current explicit list is safer but requires updating when new API statuses are added.
+
+### TC-BL-REG-29: Artifact Download Failure Marks Alerts as Attempted, Not Processed (Bug #24)
+
+**Setup**: Trigger the orchestrator with `max_batches=1`, `reset_cursor=true`. After the child batch completes, check the orchestrator logs for the artifact download step. If the artifact download succeeds, verify normal three-state classification. To test the failure path: examine the fallback code path in the orchestrator that runs when `artifact_fetched` is `False`.
+
+**Expected (normal path)**:
+1. Artifact download succeeds → `artifact_fetched = True`
+2. Alerts classified as fixed/attempted/unfixable based on artifact data
+3. Cursor updated with three-state classification
+
+**Expected (failure path)**:
+1. Artifact download fails (exception caught) → `artifact_fetched = False`
+2. ALL alerts in the batch are marked as `attempted` (NOT `processed`)
+3. The cursor's `attempted_alert_ids` list grows by the batch's alert count
+4. The cursor's `processed_alert_ids` list does NOT grow
+5. On the next orchestrator run, these alerts are re-verified via Bug #18b logic
+6. If the fix PR was merged and CodeQL confirms fixed, the alert moves from attempted → processed
+
+**Validates**: Bug #24 — The old fallback marked all alerts as `processed` when artifact download failed. `processed` means "confirmed fixed on main." Without artifact data, there's no evidence the fix worked. Marking as `processed` permanently removes alerts from future sweeps, potentially leaving vulnerabilities unpatched.
+
+**Production scenario**: GitHub Artifacts has a documented SLA of 99.9% availability. For a 500-alert backlog (34 batches), 0.1% downtime during a 70-minute sweep means ~4 seconds of unavailability. If an artifact download happens to hit that window, the old behavior would permanently mark 15 alerts as "processed" without verification. Over time, with weekly sweeps, this data loss accumulates. The fix ensures no alert is ever marked as permanently resolved without evidence.
+
+**Worry**: The fallback marks alerts as `attempted`, which means they'll be re-processed on the next run. If the artifact download failure is persistent (e.g., the artifact expired after 30 days), these alerts get re-processed every run, potentially creating duplicate Devin sessions and fix PRs for already-fixed code. The re-verification logic (Bug #18b) should catch this by checking CodeQL alert state on main, but if the PR was never merged, the alert stays open and gets re-batched.
+
+### TC-BL-REG-30: Orchestrator Summary Includes Batch PR URLs (Bug #25)
+
+**Setup**: Trigger the orchestrator with `max_batches=2`, `reset_cursor=true`. Let both child batch workflows complete. Check the orchestrator's final summary output for PR URLs.
+
+**Expected**:
+1. The orchestrator extracts `pr_url` from each batch's result artifact
+2. The final summary includes a "PRs created" section
+3. Each completed batch with a PR URL is listed in the summary
+4. The PR URLs are valid GitHub PR links
+
+**Validates**: Bug #25 — The orchestrator summary previously only reported alert counts and IDs, not PR URLs. For enterprise teams, the summary is the primary output — it should link to every fix PR so reviewers can start merging immediately without manual GitHub searches.
+
+**Production scenario**: The security team lead runs the weekly backlog sweep on Friday evening. Monday morning, they check the tracking issue for the sweep results. The summary says "22 alerts attempted across 2 batches" but doesn't say WHERE the fix PRs are. The lead has to search GitHub for `devin/security-batch-*` branches, find the PRs, and distribute them to reviewers. With the fix, the summary lists every PR URL, and the lead can assign reviewers directly from the tracking issue.

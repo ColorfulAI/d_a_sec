@@ -237,7 +237,7 @@ jobs:
 
           if [ "$RESET_CURSOR" = "true" ]; then
             echo "Cursor reset requested. Starting fresh."
-            echo '{"processed_alert_ids":[],"unfixable_alert_ids":[],"in_progress":{},"total_fixed":0,"total_unfixable":0}' > /tmp/cursor.json
+            echo '{"processed_alert_ids":[],"unfixable_alert_ids":[],"attempted_alert_ids":[],"in_progress":{},"total_fixed":0,"total_unfixable":0,"total_attempted":0}' > /tmp/cursor.json
             echo "cursor_found=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -279,16 +279,18 @@ jobs:
                           print("WARNING: Cursor JSON corrupted. Starting fresh.")
 
           if cursor is None:
-              cursor = {
-                  "processed_alert_ids": [],
-                  "unfixable_alert_ids": [],
-                  "in_progress": {},
-                  "total_fixed": 0,
-                  "total_unfixable": 0
-              }
+                  cursor = {
+                      "processed_alert_ids": [],
+                      "unfixable_alert_ids": [],
+                      "attempted_alert_ids": [],
+                      "in_progress": {},
+                      "total_fixed": 0,
+                      "total_unfixable": 0,
+                      "total_attempted": 0
+                  }
               print("No cursor found. Starting fresh scan.")
           else:
-              print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable")
+              print(f"Cursor loaded: {len(cursor.get('processed_alert_ids', []))} processed, {len(cursor.get('unfixable_alert_ids', []))} unfixable, {len(cursor.get('attempted_alert_ids', []))} attempted")
 
           with open("/tmp/cursor.json", "w") as f:
               json.dump(cursor, f, indent=2)
@@ -305,6 +307,8 @@ jobs:
       - name: Filter and batch alerts
         id: batch-alerts
         if: steps.fetch-alerts.outputs.skip != 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python3 << 'BATCH_EOF'
           import json, os, time
@@ -321,25 +325,106 @@ jobs:
 
           processed = set(cursor.get("processed_alert_ids", []))
           unfixable = set(cursor.get("unfixable_alert_ids", []))
+          attempted = set(cursor.get("attempted_alert_ids", []))
 
-          # Filter out already-processed and unfixable alerts
+          # Bug #18b fix: Re-verify unfixable alerts before skipping them.
+          # After a fix PR is merged and CodeQL re-runs, previously "unfixable"
+          # alerts may now be fixed. Re-query CodeQL to check.
+          import urllib.request, urllib.error
+          HTTP_TIMEOUT = 30
+          gh_pat = os.environ.get("GH_PAT", "")
+          repo_name = os.environ.get("GITHUB_REPOSITORY", "")
+          re_headers = {
+              "Authorization": f"token {gh_pat}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          reverified_fixed = []
+          if unfixable:
+              print(f"\nRe-verifying {len(unfixable)} unfixable alerts...")
+              for uid in list(unfixable):
+                  try:
+                      url = f"https://api.github.com/repos/{repo_name}/code-scanning/alerts/{uid}"
+                      req = urllib.request.Request(url, headers=re_headers)
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                          alert_data = json.loads(resp.read())
+                      state = alert_data.get("state", "open")
+                      if state in ("fixed", "dismissed"):
+                          reverified_fixed.append(uid)
+                          print(f"  Alert #{uid}: now {state} on main -> moving to processed")
+                      else:
+                          print(f"  Alert #{uid}: still {state} -> remains unfixable")
+                  except Exception as e:
+                      print(f"  Alert #{uid}: re-verify error ({e}) -> remains unfixable")
+                  time.sleep(0.3)
+
+          # Also re-verify attempted alerts (fix PRs may have been merged)
+          reverified_attempted = []
+          if attempted:
+              print(f"\nRe-verifying {len(attempted)} attempted alerts...")
+              for uid in list(attempted):
+                  try:
+                      url = f"https://api.github.com/repos/{repo_name}/code-scanning/alerts/{uid}"
+                      req = urllib.request.Request(url, headers=re_headers)
+                      with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                          alert_data = json.loads(resp.read())
+                      state = alert_data.get("state", "open")
+                      if state in ("fixed", "dismissed"):
+                          reverified_attempted.append(uid)
+                          print(f"  Alert #{uid}: now {state} on main -> moving to processed")
+                      else:
+                          print(f"  Alert #{uid}: still {state} -> remains attempted")
+                  except Exception as e:
+                      print(f"  Alert #{uid}: re-verify error ({e}) -> remains attempted")
+                  time.sleep(0.3)
+
+          # Apply re-verification results to cursor
+          for uid in reverified_fixed:
+              unfixable.discard(uid)
+              processed.add(uid)
+              if uid not in cursor["processed_alert_ids"]:
+                  cursor["processed_alert_ids"].append(uid)
+              if uid in cursor.get("unfixable_alert_ids", []):
+                  cursor["unfixable_alert_ids"].remove(uid)
+          for uid in reverified_attempted:
+              attempted.discard(uid)
+              processed.add(uid)
+              if uid not in cursor["processed_alert_ids"]:
+                  cursor["processed_alert_ids"].append(uid)
+              if uid in cursor.get("attempted_alert_ids", []):
+                  cursor["attempted_alert_ids"].remove(uid)
+
+          if reverified_fixed or reverified_attempted:
+              print(f"\nRe-verification results: {len(reverified_fixed)} unfixable->fixed, {len(reverified_attempted)} attempted->fixed")
+              cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
+              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
+              # Save updated cursor so orchestrator step sees re-verified state
+              with open("/tmp/cursor.json", "w") as f:
+                  json.dump(cursor, f, indent=2)
+
+          # Filter out already-processed, unfixable, and attempted alerts
           remaining = []
           skipped_processed = 0
           skipped_unfixable = 0
+          skipped_attempted = 0
 
           for a in all_alerts:
               alert_num = a.get("number")
-              if alert_num in processed or alert_num in unfixable:
-                  if alert_num in unfixable:
-                      skipped_unfixable += 1
-                  else:
-                      skipped_processed += 1
+              if alert_num in processed:
+                  skipped_processed += 1
+                  continue
+              if alert_num in unfixable:
+                  skipped_unfixable += 1
+                  continue
+              if alert_num in attempted:
+                  skipped_attempted += 1
                   continue
               remaining.append(a)
 
-          print(f"Total open alerts: {len(all_alerts)}")
-          print(f"Already processed: {skipped_processed}")
-          print(f"Unfixable (skipped): {skipped_unfixable}")
+          print(f"\nTotal open alerts: {len(all_alerts)}")
+          print(f"Already processed (confirmed fixed): {skipped_processed}")
+          print(f"Unfixable (skipped, needs human review): {skipped_unfixable}")
+          print(f"Attempted (skipped, pending PR merge): {skipped_attempted}")
           print(f"Remaining to process: {len(remaining)}")
 
           if not remaining:
@@ -465,9 +550,15 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
           ISSUE_NUM: ${{ steps.tracking-issue.outputs.issue_number }}
           CURSOR_COMMENT_ID: ${{ steps.read-cursor.outputs.cursor_comment_id }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python3 << 'ORCHESTRATE_EOF'
-          import json, os, time, urllib.request, urllib.error
+          import json, os, sys, time, urllib.request, urllib.error
+
+          # Force unbuffered stdout so logs appear in real-time (Bug #11 fix)
+          sys.stdout.reconfigure(line_buffering=True)
+
+          HTTP_TIMEOUT = 30  # seconds — prevent hanging on slow API responses (Bug #12 fix)
 
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           gh_pat = os.environ["GH_PAT"]
@@ -510,8 +601,12 @@ jobs:
                   method=method
               )
               try:
-                  resp = urllib.request.urlopen(req)
-                  return json.loads(resp.read()), resp.status
+                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+                  body = resp.read()
+                  status_code = resp.status
+                  if not body or status_code == 204:
+                      return {}, status_code
+                  return json.loads(body), status_code
               except urllib.error.HTTPError as e:
                   body = e.read().decode()[:500]
                   return {"error": body, "status": e.code}, e.code
@@ -524,13 +619,51 @@ jobs:
                       "https://api.devin.ai/v1/sessions?status_in=running,started",
                       headers={"Authorization": f"Bearer {devin_key}"}
                   )
-                  resp = urllib.request.urlopen(req)
+                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
                   data = json.loads(resp.read())
                   sessions = data.get("sessions", [])
-                  return len(sessions)
+                  count = len(sessions)
+                  print(f"  Active Devin sessions: {count}")
+                  return count
               except Exception as e:
                   print(f"  Warning: Could not check active sessions: {e}")
                   return 0
+
+          # Shared headers for direct urllib requests (artifact download, etc.)
+          # gh_api() has its own internal headers, but artifact download uses urllib directly.
+          headers = {
+              "Authorization": f"token {gh_pat}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          # Bug #20/#21 fix: GitHub artifact download URLs return 302 redirects
+          # to Azure Blob Storage. urllib forwards the Authorization header to
+          # Azure, causing 403 (bug #20). Custom redirect handler caused 400
+          # (bug #21). Solution: use curl which natively strips auth headers
+          # on cross-domain redirects (since curl 7.58+).
+          def download_artifact_zip(url, gh_token):
+              """Download artifact zip using curl (handles auth-stripping on redirect)."""
+              import subprocess, tempfile
+              tmp_path = tempfile.mktemp(suffix=".zip")
+              result = subprocess.run(
+                  ["curl", "-sL",
+                   "-H", f"Authorization: token {gh_token}",
+                   "-H", "Accept: application/vnd.github+json",
+                   "-o", tmp_path,
+                   "-w", "%{http_code}",
+                   url],
+                  capture_output=True, text=True, timeout=60
+              )
+              http_code = result.stdout.strip()
+              if http_code == "200" and os.path.exists(tmp_path):
+                  with open(tmp_path, "rb") as f:
+                      data = f.read()
+                  os.unlink(tmp_path)
+                  return data
+              else:
+                  if os.path.exists(tmp_path):
+                      os.unlink(tmp_path)
+                  raise Exception(f"curl returned HTTP {http_code}: {result.stderr[:200]}")
 
           dispatch_ref = os.environ.get("DISPATCH_REF", "main")
 
@@ -590,14 +723,13 @@ jobs:
           print(f"Starting orchestrator loop")
           print(f"{'='*60}\n")
 
-          # Initial fill: dispatch up to max_concurrent
+          # Initial fill: dispatch up to max_concurrent children
+          # NOTE (Bug #14 fix): We no longer gate on check_active_devin_sessions().
+          # The Devin API session count includes sessions from ALL workflows on the
+          # account (PR reviews, other repos, etc.), which blocks dispatch even when
+          # we have capacity. Instead, we control concurrency by tracking our own
+          # active children. Child workflows handle Devin API 429 rate limits internally.
           while len(active_children) < max_concurrent and pending_batches:
-              # Check session reservation: don't use all 5 Devin slots
-              active_sessions = check_active_devin_sessions()
-              if active_sessions >= max_concurrent:
-                  print(f"  Session reservation: {active_sessions} active sessions >= {max_concurrent} limit. Waiting...")
-                  break
-
               batch = pending_batches.pop(0)
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
@@ -635,23 +767,51 @@ jobs:
               poll_count += 1
               print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
 
+              # Re-dispatch pending batches if child slots are free (Bug #13 + #14 fix)
+              if pending_batches and len(active_children) < max_concurrent:
+                  batch = pending_batches.pop(0)
+                  dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                  print(f"  Re-dispatch: Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+                  if dispatch_child(batch):
+                      time.sleep(5)
+                      active_children[f"batch_{batch['batch_id']}"] = {
+                          "batch": batch,
+                          "dispatched_at": time.time(),
+                          "dispatch_time_str": dispatch_time,
+                          "run_id": None,
+                          "status": "dispatched"
+                      }
+                      print(f"  Re-dispatched successfully")
+                  else:
+                      print(f"  Re-dispatch failed — will retry next poll")
+                      pending_batches.insert(0, batch)
+
               # Resolve run IDs for newly dispatched children
-              # NOTE: workflow_dispatch runs always show head_branch="main" and
-              # display_title="Devin Security Batch" — they do NOT contain the
-              # batch branch name or batch ID in their metadata. We must use
-              # timestamp-based matching: find the first unmatched run created
-              # after our dispatch time, then verify via the run's job logs.
-              for key, child in list(active_children.items()):
-                  if child["run_id"] is None:
-                      url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=20&event=workflow_dispatch&created=>={child['dispatch_time_str'][:10]}"
-                      result, status = gh_api("GET", url)
-                      if status == 200:
-                          already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
-                          for run in result.get("workflow_runs", []):
+              # NOTE (Bug #22 fix): workflow_dispatch runs are returned newest-first
+              # by the API. When multiple batches are dispatched close together,
+              # iterating newest-first causes cross-matching (batch 1 grabs batch 2's
+              # run). Fix: sort runs oldest-first so dispatch order matches run order.
+              # Also resolve ALL unmatched children in one pass against the same
+              # sorted run list to ensure correct 1:1 matching.
+              unresolved = [(k, c) for k, c in active_children.items() if c["run_id"] is None]
+              if unresolved:
+                  # Use the earliest dispatch date for the query
+                  earliest_date = min(c["dispatch_time_str"][:10] for _, c in unresolved)
+                  url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/runs?per_page=30&event=workflow_dispatch&created=>={earliest_date}"
+                  result, status = gh_api("GET", url)
+                  if status == 200:
+                      already_matched = set(str(c.get("run_id")) for c in active_children.values() if c.get("run_id"))
+                      # Sort oldest-first to match dispatch order
+                      sorted_runs = sorted(result.get("workflow_runs", []), key=lambda r: r.get("created_at", ""))
+                      # Sort unresolved children by dispatch time (oldest first)
+                      unresolved_sorted = sorted(unresolved, key=lambda x: x[1]["dispatch_time_str"])
+                      for key, child in unresolved_sorted:
+                          for run in sorted_runs:
                               run_created = run.get("created_at", "")
                               run_id_val = run["id"]
                               if run_created >= child["dispatch_time_str"] and str(run_id_val) not in already_matched:
                                   child["run_id"] = run_id_val
+                                  already_matched.add(str(run_id_val))
                                   print(f"  Resolved Batch {child['batch']['batch_id']} -> run {run_id_val} (timestamp match: created={run_created} >= dispatched={child['dispatch_time_str']})")
                                   break
 
@@ -682,52 +842,67 @@ jobs:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (success)")
                           completed_batches.append(batch)
 
-                          # Fetch batch result artifact to get per-alert fixed/unfixable breakdown
-                          # The child workflow outputs fixed_alert_ids and unfixable_alert_ids
+                          # Fetch batch result artifact to get per-alert breakdown
+                          # Bug #18 fix: Now includes attempted_alert_ids (file modified but not yet merged)
                           batch_unfixable = []
                           batch_fixed = []
+                          batch_attempted = []
+                          batch_pr_url = ""
+                          artifact_fetched = False
                           try:
                               run_id_val = child["run_id"]
                               artifacts_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id_val}/artifacts"
                               req = urllib.request.Request(artifacts_url, headers=headers)
-                              with urllib.request.urlopen(req) as resp:
+                              with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                                   artifacts = json.loads(resp.read())
                               for artifact in artifacts.get("artifacts", []):
                                   if artifact["name"].startswith(f"batch-{batch['batch_id']}-"):
                                       print(f"    Found result artifact: {artifact['name']}")
-                                      # Download and parse the artifact
                                       dl_url = artifact["archive_download_url"]
-                                      req2 = urllib.request.Request(dl_url, headers=headers)
-                                      with urllib.request.urlopen(req2) as resp2:
-                                          import zipfile, io
-                                          z = zipfile.ZipFile(io.BytesIO(resp2.read()))
-                                          for name in z.namelist():
-                                              if name.endswith(".json"):
-                                                  result_data = json.loads(z.read(name))
-                                                  batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
-                                                  batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
-                                                  print(f"    Fixed: {len(batch_fixed)}, Unfixable: {len(batch_unfixable)}")
-                                          z.close()
+                                      import zipfile, io
+                                      zip_data = download_artifact_zip(dl_url, gh_pat)
+                                      z = zipfile.ZipFile(io.BytesIO(zip_data))
+                                      for name in z.namelist():
+                                          if name.endswith(".json"):
+                                              result_data = json.loads(z.read(name))
+                                              batch_fixed = [int(x) for x in result_data.get("fixed_alert_ids", [])]
+                                              batch_attempted = [int(x) for x in result_data.get("attempted_alert_ids", [])]
+                                              batch_unfixable = [int(x) for x in result_data.get("unfixable_alert_ids", [])]
+                                              batch_pr_url = result_data.get("pr_url", "")
+                                              artifact_fetched = True
+                                              print(f"    Fixed: {len(batch_fixed)}, Attempted: {len(batch_attempted)}, Unfixable: {len(batch_unfixable)}, PR: {batch_pr_url or 'none'}")
+                                      z.close()
                           except Exception as e:
                               print(f"    Could not fetch batch result artifact: {e}")
-                              print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as processed")
+                              print(f"    Falling back: marking all {len(batch['alert_ids'])} alerts as attempted (not processed — status unknown)")
 
-                          # Update cursor with per-alert granularity
-                          if batch_fixed or batch_unfixable:
+                          # Update cursor with three-state classification (Bug #18 fix)
+                          if artifact_fetched and (batch_fixed or batch_attempted or batch_unfixable):
                               for aid in batch_fixed:
                                   if aid not in cursor["processed_alert_ids"]:
                                       cursor["processed_alert_ids"].append(aid)
+                              for aid in batch_attempted:
+                                  if aid not in cursor.get("attempted_alert_ids", []):
+                                      cursor.setdefault("attempted_alert_ids", []).append(aid)
                               for aid in batch_unfixable:
                                   if aid not in cursor.get("unfixable_alert_ids", []):
                                       cursor.setdefault("unfixable_alert_ids", []).append(aid)
                               cursor["total_fixed"] = cursor.get("total_fixed", 0) + len(batch_fixed)
+                              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                               cursor["total_unfixable"] = len(cursor.get("unfixable_alert_ids", []))
                           else:
-                              # Fallback: no artifact data, mark all as processed
+                              # Bug #24 fix: mark as attempted (not processed) when artifact is missing.
+                              # "processed" implies confirmed fixed. Without artifact data, we don't know
+                              # if the fix worked. Mark as attempted so the next run re-verifies.
                               for aid in batch["alert_ids"]:
-                                  if aid not in cursor["processed_alert_ids"]:
-                                      cursor["processed_alert_ids"].append(aid)
+                                  if aid not in cursor.get("attempted_alert_ids", []):
+                                      cursor.setdefault("attempted_alert_ids", []).append(aid)
+                              cursor["total_attempted"] = len(cursor.get("attempted_alert_ids", []))
                           cursor["total_processed"] = len(cursor["processed_alert_ids"])
+
+                          # Track batch PR URL for summary reporting (Bug #25 fix)
+                          if batch_pr_url:
+                              batch["pr_url"] = batch_pr_url
                       else:
                           print(f"  Batch {batch['batch_id']}: COMPLETED (conclusion={conclusion})")
                           failed_batches.append({**batch, "conclusion": conclusion})
@@ -735,9 +910,10 @@ jobs:
                       del active_children[key]
 
                       # Backfill: dispatch next pending batch
-                      if pending_batches:
-                          active_sessions = check_active_devin_sessions()
-                          if active_sessions < max_concurrent:
+                      # NOTE (Bug #14/#17 fix): Use child-count concurrency, not Devin session count.
+                      # check_active_devin_sessions() includes ALL sessions on the account,
+                      # which blocks backfill when external sessions are present.
+                      if pending_batches and len(active_children) < max_concurrent:
                               next_batch = pending_batches.pop(0)
                               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                               print(f"  Backfill: Dispatching Batch {next_batch['batch_id']}...")
@@ -760,9 +936,17 @@ jobs:
                           print(f"  Batch {child['batch']['batch_id']}: STALE ({int(age)}s > {max_child_runtime}s) — evicting")
                           failed_batches.append({**child["batch"], "conclusion": "timeout_evicted"})
                           del active_children[key]
-                          # Don't re-dispatch stale batches immediately
                       else:
                           print(f"  Batch {child['batch']['batch_id']}: {run_status} ({int(age)}s)")
+
+                  else:
+                      # Bug #22 fix: handle unexpected status (e.g. "unknown" from API failure)
+                      age = time.time() - child["dispatched_at"]
+                      print(f"  Batch {child['batch']['batch_id']}: unexpected status '{run_status}' ({int(age)}s)")
+                      if age > max_child_runtime:
+                          print(f"  Batch {child['batch']['batch_id']}: evicting after {int(age)}s with status '{run_status}'")
+                          failed_batches.append({**child["batch"], "conclusion": f"unknown_status_{run_status}"})
+                          del active_children[key]
 
           # ============================================================
           # FINAL CURSOR UPDATE
@@ -774,6 +958,7 @@ jobs:
           # Summary
           total_time = int(time.time() - start_time)
           unfixable_ids = cursor.get("unfixable_alert_ids", [])
+          attempted_ids = cursor.get("attempted_alert_ids", [])
           print(f"\n{'='*60}")
           print(f"Orchestrator complete")
           print(f"{'='*60}")
@@ -783,10 +968,18 @@ jobs:
           print(f"  Batches remaining: {len(pending_batches)}")
           print(f"  Total alerts processed: {sum(b['alert_count'] for b in completed_batches)}")
           print(f"  Total alerts failed: {sum(b['alert_count'] for b in failed_batches)}")
-          print(f"  Alerts fixed: {cursor.get('total_fixed', 0)}")
+          print(f"  Alerts fixed (confirmed): {cursor.get('total_fixed', 0)}")
+          print(f"  Alerts attempted (pending PR merge): {len(attempted_ids)}")
           print(f"  Alerts unfixable (human review): {len(unfixable_ids)}")
+          if attempted_ids:
+              print(f"  Attempted alert IDs: {attempted_ids}")
           if unfixable_ids:
               print(f"  Unfixable alert IDs: {unfixable_ids}")
+          batch_prs = [b.get("pr_url") for b in completed_batches if b.get("pr_url")]
+          if batch_prs:
+              print(f"  PRs created:")
+              for pr in batch_prs:
+                  print(f"    - {pr}")
 
           # Write summary for GitHub Actions
           gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
@@ -795,6 +988,8 @@ jobs:
               f.write(f"failed_count={len(failed_batches)}\n")
               f.write(f"remaining_count={len(pending_batches)}\n")
               f.write(f"total_time={total_time}\n")
+              f.write(f"attempted_count={len(attempted_ids)}\n")
+              f.write(f"attempted_alert_ids={','.join(str(a) for a in attempted_ids)}\n")
               f.write(f"unfixable_count={len(unfixable_ids)}\n")
               f.write(f"unfixable_alert_ids={','.join(str(a) for a in unfixable_ids)}\n")
 
@@ -803,6 +998,7 @@ jobs:
               "completed": [{"batch_id": b["batch_id"], "alert_ids": b["alert_ids"]} for b in completed_batches],
               "failed": [{"batch_id": b.get("batch_id"), "conclusion": b.get("conclusion")} for b in failed_batches],
               "remaining": [{"batch_id": b["batch_id"]} for b in pending_batches],
+              "attempted_alert_ids": attempted_ids,
               "unfixable_alert_ids": unfixable_ids
           }
           with open("/tmp/orchestrator_results.json", "w") as f:
@@ -823,6 +1019,7 @@ jobs:
           echo "- **Batches completed**: ${{ steps.orchestrate.outputs.completed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches failed**: ${{ steps.orchestrate.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Batches remaining**: ${{ steps.orchestrate.outputs.remaining_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Alerts attempted (pending PR merge)**: ${{ steps.orchestrate.outputs.attempted_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Alerts unfixable (human review)**: ${{ steps.orchestrate.outputs.unfixable_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Total time**: ${{ steps.orchestrate.outputs.total_time }}s" >> $GITHUB_STEP_SUMMARY
           echo "- **Tracking issue**: #${{ steps.tracking-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
@@ -843,7 +1040,7 @@ jobs:
 
           # Build the human review comment body
           BODY="## :warning: Alerts Requiring Human Review\n\n"
-          BODY+="**${UNFIXABLE_COUNT} alert(s)** could not be automatically fixed by Devin after internal CodeQL verification (2 attempts per alert inside the session).\n\n"
+          BODY+="**${UNFIXABLE_COUNT} alert(s)** could not be automatically fixed by Devin. The files containing these alerts were not modified by the Devin session, indicating the fix was not attempted or was too complex for automated resolution.\n\n"
           BODY+="These alerts need manual investigation by a security engineer.\n\n"
           BODY+="| Alert | Link | Action Needed |\n"
           BODY+="|-------|------|---------------|\n"
