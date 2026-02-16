@@ -439,6 +439,92 @@ Developer doesn't know when all fixes are applied and verified.
 **Production scenario**: Monday morning at a Fortune 500 — 30 developers push code within 15 minutes. Only 5 Devin sessions can run concurrently. The workflow must queue and retry, not fail.
 **Worry**: Without proper backoff, a PR burst will cause cascading failures where 80%+ of security reviews fail even though the issue is purely transient capacity.
 
+### TC-T: Split-Trigger — PR Workflow Only Creates Sessions for New-in-PR Alerts
+**Setup**: Merge vulnerable code to main (creating pre-existing alerts). Open a new PR that introduces 1 new vulnerability. Trigger the PR workflow.
+**Expected**:
+1. PR workflow detects both new-in-PR alerts and pre-existing alerts
+2. PR workflow creates exactly 1 Devin session — ONLY for the new-in-PR alert
+3. PR workflow does NOT create any sessions for pre-existing alerts
+4. PR comment shows new-in-PR alert table with Devin session link
+5. PR comment shows a "Note" section: "N pre-existing alerts on main are handled separately by the scheduled backlog workflow"
+6. PR workflow completes in <60 seconds (no time spent on pre-existing batch work)
+7. PR exit code is `0` if the new-in-PR session was created successfully
+**Validates**: Split-trigger Phase 1 — PR workflow is fast and scoped.
+**Production scenario**: Developer pushes a 2-line fix. Under the current architecture, the workflow spends 7+ minutes creating sessions for 100 pre-existing alerts. After the split, the workflow completes in seconds.
+**Worry**: If the PR workflow still processes pre-existing alerts, every concurrent PR creates redundant sessions for the same tech debt, causing session explosion and rate limit cascades (stress test showed 41% failure rate with 99 PRs).
+
+### TC-U: Split-Trigger — Backlog Workflow Incremental Progress (Cursor Pickup)
+**Setup**: Seed main with 30+ open CodeQL alerts. Run the backlog workflow once (processes first batch of 15). Run it again.
+**Expected**:
+1. Run 1: Reads cursor (empty/initial), fetches 30 alerts, picks first 15, creates 1 Devin session, updates cursor with processed alert IDs and offset
+2. Run 2: Reads cursor (offset=15), fetches remaining alerts, picks next 15, creates 1 session, updates cursor
+3. Run 2 does NOT re-process the alerts from Run 1
+4. If Run 1's Devin session is still running when Run 2 starts, Run 2 skips those alerts (checks session status)
+5. Cursor survives between runs (stored in GitHub issue comment or repo variable)
+**Validates**: Stateless pickup — the backlog workflow resumes from where it left off.
+**Production scenario**: Fortune 500 repo with 500 pre-existing alerts. The backlog workflow runs every 6 hours. After 7 runs (42 hours), the full backlog is processed. Without cursor pickup, each run would re-process the same alerts and never make progress.
+**Worry**: If the cursor is lost or corrupted, the backlog workflow re-processes everything from scratch, creating duplicate sessions and wasting resources. The compare-and-set pattern on cursor update prevents this.
+
+### TC-V: Split-Trigger — Backlog Does Not Block PR Workflows (Session Reservation)
+**Setup**: Start a backlog workflow run that creates 3 sessions (using 3 of 5 concurrent slots). While the backlog is running, push code to a PR to trigger the PR workflow.
+**Expected**:
+1. Backlog workflow creates 3 sessions (3/5 slots used)
+2. PR workflow triggers, needs 1 session (would use 4/5 slots)
+3. PR workflow creates its session successfully (slot available)
+4. If the backlog had used all 5 slots, the PR workflow's exponential backoff would handle the 429 gracefully
+5. Backlog workflow should self-limit to 3 concurrent sessions, reserving 2 slots for PR workflows
+**Validates**: Concurrency management — backlog never starves PR workflows.
+**Production scenario**: The backlog runs overnight processing 200 alerts. A developer pushes an urgent hotfix at 3 AM. The PR workflow must not be blocked by the backlog's batch work.
+**Worry**: If both workflows compete for the same 5 session slots without coordination, PR workflows get 429s and developers see "security review failed" on their urgent hotfix — destroying trust in the system.
+
+### TC-W: Split-Trigger — Concurrent PRs No Longer Cause Session Explosion
+**Setup**: Open 20 PRs simultaneously, each introducing 1 new vulnerability. All PRs also see the same 50 pre-existing alerts on main.
+**Expected**:
+1. Each PR workflow creates exactly 1 session (20 total session attempts)
+2. NO sessions created for pre-existing alerts by any PR workflow
+3. With exponential backoff, all 20 PRs eventually get their session (within ~7 minutes as sessions complete)
+4. Compare to current architecture: 20 PRs × 4 pre-existing sessions = 80+ session attempts → massive 429 cascade
+5. The backlog workflow (running separately on its own schedule) handles the 50 pre-existing alerts in a single run
+**Validates**: Session explosion prevention under concurrent PR load.
+**Production scenario**: Release day — 20 developers merge feature branches within 30 minutes. Under the current architecture, this creates 400+ session attempts. After the split, it creates 20 + ~4 (backlog) = 24 total.
+**Worry**: Without the split, the stress test showed 41% workflow failure rate with 99 PRs. The split should reduce this to near 0% for PR workflows (only 1 session each) while the backlog processes pre-existing alerts at its own pace.
+
+### TC-X: Split-Trigger — Backlog Workflow Handles Crashed/Stuck Sessions
+**Setup**: Run the backlog workflow. Simulate a Devin session that times out or fails (wait for a session to reach `max_acu_limit` timeout). Run the backlog workflow again.
+**Expected**:
+1. Run 1: Creates session for alerts A, B, C. Session starts running. Cursor updated with session ID.
+2. Session times out or fails (status = `failed` or `timed_out`)
+3. Run 2: Reads cursor, checks session status → detects failure
+4. Run 2: Marks alerts A, B, C as retryable (unless they've already hit max attempts)
+5. Run 2: Creates new session for A, B, C (retry) plus picks up next batch D, E, F
+6. If session has been "in progress" for >1 hour, Run 2 assumes it failed and retries
+**Validates**: Fault tolerance — the backlog workflow recovers from session failures without human intervention.
+**Production scenario**: A Devin session hangs due to a complex codebase that takes too long to clone. The next backlog run detects this and retries the alerts in a new session. No alerts are permanently lost.
+**Worry**: If failed sessions are never retried, the backlog accumulates "stuck" alerts that are neither fixed nor marked unfixable — a silent data loss that only surfaces during an audit.
+
+### TC-Y: Split-Trigger — Backlog Concurrency Guard (Only 1 Run at a Time)
+**Setup**: Trigger the backlog workflow manually. Before it completes, trigger it again (via `workflow_dispatch` or cron).
+**Expected**:
+1. Run 1 starts processing backlog
+2. Run 2 is queued (NOT cancelling Run 1) due to `concurrency` group with `cancel-in-progress: false`
+3. Run 1 completes, updates cursor
+4. Run 2 starts, reads updated cursor, continues from where Run 1 left off
+5. No duplicate sessions created (Run 2 sees Run 1's processed alerts in the cursor)
+**Validates**: Concurrency group prevents overlapping backlog runs.
+**Production scenario**: Cron fires every 6 hours. A previous run is slow (processing 200 alerts with rate limit backoff). The next cron fires while it's still running. Without the concurrency guard, both runs process the same alerts → duplicate sessions → wasted resources → potential merge conflicts.
+**Worry**: If `cancel-in-progress: true` were used instead of `false`, the second run would cancel the first, potentially losing in-progress work and leaving the cursor in an inconsistent state.
+
+### TC-Z: Split-Trigger — PR Comment Cross-Links to Backlog PR
+**Setup**: Open a PR on a codebase with pre-existing alerts. Ensure the backlog workflow has created a backlog fix PR.
+**Expected**:
+1. PR workflow detects pre-existing alerts but does NOT create sessions for them
+2. PR comment includes: "N pre-existing alerts on main are handled separately. See [Security Backlog Fixes PR #X] for progress."
+3. The link points to the actual backlog PR (not a dead link)
+4. If no backlog PR exists yet, the comment says: "These will be addressed by the next scheduled backlog run."
+**Validates**: Developer experience — clear communication about what's being handled and where.
+**Production scenario**: Developer opens a PR, sees "50 pre-existing alerts on main" in the comment. Without the cross-link, they think "this tool found 50 issues and isn't doing anything about them." With the cross-link, they see the backlog PR with 30 of those already fixed.
+**Worry**: If the PR comment just says "pre-existing alerts exist" without context on how they're being handled, developers lose confidence in the security workflow and start ignoring it entirely.
+
 ---
 
 ## Known Issues

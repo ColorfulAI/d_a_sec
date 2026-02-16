@@ -631,6 +631,273 @@ Pre-existing batch failures are logged but never affect the PR's pass/fail statu
 
 ---
 
+## Split-Trigger Architecture: PR-Scoped vs Scheduled Batch
+
+### The Problem: Single Workflow Doing Too Much
+
+The current architecture uses a single workflow triggered by `pull_request` that handles BOTH:
+1. **New-in-PR alerts** — vulnerabilities introduced by the PR's code changes
+2. **Pre-existing alerts** — accumulated tech debt on `main` that happens to be visible on the PR's merge ref
+
+This creates several production-critical problems:
+
+#### Problem 1: PR Workflows Blocked by Batch Work
+
+When a PR triggers the workflow, it creates Devin sessions for both new-in-PR and pre-existing alerts. If there are 100 pre-existing alerts, the workflow creates up to 20 sessions (15 alerts each). Each session creation takes time (API calls, rate limit backoff). The PR author's workflow run is now blocked for minutes handling tech debt they didn't create.
+
+**Real scenario**: Developer pushes a 2-line fix. The workflow spends 7+ minutes creating and rate-limit-retrying sessions for 100 pre-existing alerts. The developer sees "workflow running" for 10 minutes for what should be a 30-second check.
+
+#### Problem 2: Session Explosion Under Concurrent PRs
+
+If 20 PRs are open simultaneously, EACH PR's workflow run tries to create sessions for the SAME pre-existing alerts. That's 20 × 20 = 400 session creation attempts for identical work. With a concurrent session limit of 5, this causes cascading 429 failures.
+
+**Stress test evidence**: 99 PRs opened → 201 Devin Security Review runs → 83 failures (41%). Most failures were rate limits caused by redundant pre-existing session creation across PRs.
+
+#### Problem 3: Redundant Work
+
+PR #10 and PR #11 both detect the same 50 pre-existing alerts on main. Both create separate Devin sessions to fix them. Both sessions produce identical fixes targeting the same code on main. This is pure waste — double the sessions, double the cost, potential merge conflicts when both push to similar branches.
+
+#### Problem 4: No Incremental Progress on Backlog
+
+If a rate-limited workflow run fails to create a session for pre-existing alerts, those alerts are simply lost. There is no mechanism for the next run to "pick up where it left off." The backlog only gets retried when someone pushes new code to a PR — which may not happen for days or weeks.
+
+### The Solution: Two Separate Workflows
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    TRIGGER SPLIT                         │
+│                                                         │
+│  ┌───────────────────┐    ┌───────────────────────────┐ │
+│  │  PR Workflow       │    │  Backlog Workflow          │ │
+│  │  (per-PR trigger)  │    │  (scheduled trigger)       │ │
+│  │                    │    │                            │ │
+│  │  Trigger:          │    │  Trigger:                  │ │
+│  │  - pull_request    │    │  - schedule (cron)         │ │
+│  │  - workflow_run    │    │  - workflow_dispatch        │ │
+│  │    (after CodeQL)  │    │    (manual backlog run)     │ │
+│  │                    │    │                            │ │
+│  │  Scope:            │    │  Scope:                    │ │
+│  │  ONLY new-in-PR    │    │  ONLY pre-existing alerts  │ │
+│  │  alerts             │    │  on main/default branch    │ │
+│  │                    │    │                            │ │
+│  │  Sessions:         │    │  Sessions:                 │ │
+│  │  1 session max     │    │  Up to N sessions          │ │
+│  │  (just this PR's   │    │  (batched, rate-limited,   │ │
+│  │   new alerts)      │    │   picks up from cursor)    │ │
+│  │                    │    │                            │ │
+│  │  Output:           │    │  Output:                   │ │
+│  │  PR comment with   │    │  Dedicated backlog PR      │ │
+│  │  new-alert status  │    │  OR GitHub issue tracker   │ │
+│  │                    │    │                            │ │
+│  │  Exit code:        │    │  Exit code:                │ │
+│  │  Fails ONLY if     │    │  Always succeeds (backlog  │ │
+│  │  new-in-PR session │    │  is best-effort, never     │ │
+│  │  fails             │    │  blocks anything)          │ │
+│  └───────────────────┘    └───────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Workflow 1: PR Security Review (`devin-security-review.yml`)
+
+**Trigger**: `pull_request` (synchronize/opened) + `workflow_run` (after CodeQL)
+
+**Scope**: ONLY new-in-PR alerts. Pre-existing alerts are acknowledged in the PR comment (count + note) but NOT dispatched to Devin.
+
+**Session budget**: 1 Devin session maximum. A PR should never need more than 1 session because new-in-PR alerts are typically a small set (the developer just introduced them).
+
+**Exit code logic**:
+- `exit 0` (pass) — if no new-in-PR alerts, or if all new-in-PR alerts were dispatched to Devin
+- `exit 1` (fail) — ONLY if new-in-PR session creation failed (API error, rate limit exhaustion)
+- Pre-existing alert counts are displayed but NEVER affect the exit code
+
+**PR comment content**:
+- New-in-PR alert table with status
+- Devin session link for the new-in-PR fix
+- A "Note" section: "N pre-existing alerts detected on main. These are handled separately by the scheduled backlog workflow."
+- NO sessions created for pre-existing alerts
+
+**Why this is better**:
+- PR workflow completes in seconds (1 session creation, not 20)
+- No rate limit contention between PRs (each PR uses at most 1 session slot)
+- Developer's PR is never blocked by batch work
+- 20 concurrent PRs = 20 session attempts (manageable), not 400
+
+### Workflow 2: Backlog Security Sweep (`devin-security-backlog.yml`)
+
+**Trigger**: `schedule` (cron, e.g., every 6 hours or nightly) + `workflow_dispatch` (manual)
+
+**Scope**: ALL open CodeQL alerts on the default branch (`main`). Scans the full alert backlog, not tied to any specific PR.
+
+**Stateless pickup via cursor**:
+The backlog workflow must be able to run multiple times and incrementally make progress without re-processing already-handled alerts. It uses a **cursor** stored as a GitHub issue comment or repository variable:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Backlog State (stored in GitHub issue #N or          │
+│  repo variable SECURITY_BACKLOG_CURSOR)               │
+│                                                       │
+│  {                                                    │
+│    "last_run": "2026-02-16T00:00:00Z",               │
+│    "processed_alert_ids": [101, 102, 103, ...],      │
+│    "in_progress_session_ids": ["sess_abc", ...],     │
+│    "unfixable_alert_ids": [104, 105],                │
+│    "next_offset": 45,                                │
+│    "total_backlog": 200                               │
+│  }                                                    │
+│                                                       │
+│  Each run:                                            │
+│  1. Read cursor → know where to start                │
+│  2. Fetch alerts from offset → pick next batch       │
+│  3. Check in_progress sessions → skip if still       │
+│     running (don't create duplicates)                │
+│  4. Create sessions for unprocessed alerts           │
+│  5. Update cursor with new processed IDs + offset    │
+│  6. Exit (next cron run picks up from new offset)    │
+└──────────────────────────────────────────────────────┘
+```
+
+**Session budget**: Configurable, default 5 sessions per run. With 15 alerts per session, each run processes up to 75 alerts. A nightly run clears 75 alerts; a 6-hour cron clears 300/day.
+
+**Concurrency control**:
+```yaml
+concurrency:
+  group: security-backlog-${{ github.repository }}
+  cancel-in-progress: false
+```
+Only 1 backlog run at a time per repo. If a cron triggers while a previous run is still going, it queues (does NOT cancel the in-progress run, because that would lose work).
+
+**Output**: Pushes fixes to a long-lived branch `devin/security-backlog` and opens/updates a single "Security Backlog Fixes" PR. Each run adds commits to the same branch rather than creating new branches.
+
+**Exit code**: Always `0`. The backlog is best-effort. Failures are logged, and the cursor is updated so the next run retries failed alerts.
+
+### Concurrency Management
+
+#### Worry: What if the backlog workflow and a PR workflow both try to create sessions at the same time?
+
+**Mitigation**: The PR workflow creates at most 1 session. The backlog workflow creates up to 5. Total concurrent sessions: 6 (within the Devin API limit of 5 + exponential backoff handles overflow). In practice, the backlog runs on a schedule (nightly) when PR activity is low.
+
+**Design rule**: PR workflows ALWAYS have priority over backlog workflows. If the PR workflow hits a rate limit, the backlog workflow should be the one that backs off or defers.
+
+Implementation: The backlog workflow checks the Devin API's active session count before creating new sessions. If active sessions ≥ 3 (leaving room for PR workflows), it pauses.
+
+```
+Before each session creation:
+  1. GET /v1/sessions?status=running → count active sessions
+  2. If active >= 3: wait 120s and re-check (max 5 retries)
+  3. If active < 3: create session
+  4. This reserves ~2 slots for PR workflows at all times
+```
+
+#### Worry: What if two backlog runs overlap (cron fires while previous run is still going)?
+
+**Mitigation**: GitHub Actions `concurrency` group ensures only 1 backlog run at a time per repo with `cancel-in-progress: false`. The second run queues until the first completes.
+
+#### Worry: Multiple PRs open at the same time, each trying to create a session?
+
+**Mitigation**: Each PR workflow creates at most 1 session. With 20 concurrent PRs, that's 20 session attempts. With a concurrent session limit of 5, 15 will get rate-limited. The exponential backoff (60s → 120s → 240s) handles this. In the worst case, all 20 PRs get their session within ~7 minutes as earlier sessions complete.
+
+**Key insight from stress test**: The exponential backoff makes the system self-regulating. When sessions are scarce, workflows wait longer. As sessions free up, waiting workflows succeed. No external coordinator needed.
+
+### Stateless Pickup: How the Backlog Workflow Resumes
+
+The backlog workflow must be fully stateless — each run reads the current state from GitHub APIs and a stored cursor, processes a batch, and updates the cursor. No in-memory state survives between runs.
+
+```
+Run N:
+  1. Read cursor from GitHub issue comment (or repo variable)
+     → "processed IDs: [1,2,3,...,44], offset: 45"
+  2. Fetch open alerts on main: GET /code-scanning/alerts?state=open&per_page=100
+  3. Filter out already-processed alerts (skip IDs in cursor)
+  4. Filter out unfixable alerts (IDs in cursor's unfixable set)
+  5. Check in-progress Devin sessions from cursor
+     → For each session_id: GET /v1/session/{id}
+     → If status=finished: check if alerts are fixed, update cursor
+     → If status=running: skip these alerts (session still working)
+     → If status=failed: mark alerts as retryable, increment attempt counter
+  6. Pick next batch of unprocessed alerts (up to 5 sessions × 15 alerts)
+  7. Create Devin sessions for each batch
+  8. Update cursor: add new session IDs, advance offset, record processed IDs
+  9. Exit 0
+
+Run N+1 (6 hours later):
+  1. Read cursor → offset: 45, in_progress: [sess_abc, sess_def]
+  2. Check sess_abc: finished → alerts fixed → move to processed
+  3. Check sess_def: failed → mark alerts as retryable
+  4. Pick next batch starting from offset 45 (+ retryable alerts)
+  5. Create sessions, update cursor
+  6. Exit 0
+```
+
+**Key property**: If the workflow crashes mid-run, no data is lost. The cursor still has the state from the last successful update. The next run re-checks in-progress sessions and retries as needed.
+
+### Why Not Just Re-run Failed PR Workflows?
+
+You could argue: "if a PR workflow fails due to rate limiting, just re-run it later." This doesn't work because:
+
+1. **No automatic re-trigger**: GitHub Actions doesn't auto-retry failed workflow runs. Someone must manually click "Re-run" or push new code.
+2. **PR workflows are PR-scoped**: They only run when someone pushes to a PR branch. If the developer's code is done, they won't push again.
+3. **Backlog work is global**: Pre-existing alerts are the same across all PRs. Processing them per-PR is redundant. A single scheduled workflow handles the entire backlog efficiently.
+4. **Rate limit fairness**: If 20 PRs are open, each PR workflow competing for sessions is unfair to all developers. A scheduled backlog workflow processes alerts on its own timeline without blocking anyone.
+
+### Considerations and Worries
+
+#### Worry: Will the backlog workflow ever "catch up" with a large alert backlog?
+
+**Analysis**: If a repo has 500 pre-existing alerts and the backlog runs every 6 hours processing 75 alerts per run, it takes ~7 runs (42 hours) to process the full backlog. If Devin fixes 80% of alerts, the backlog shrinks to 100 unfixable alerts which are catalogued and never retried.
+
+**Mitigation**: For initial onboarding of a large codebase, run the backlog workflow manually multiple times or increase the session budget temporarily.
+
+#### Worry: What if new alerts accumulate faster than the backlog clears them?
+
+**Analysis**: New alerts only appear when code is merged to main. The backlog workflow runs on a schedule. If the team merges 10 new alerts/day and the backlog clears 75/run (4 runs/day = 300/day), the backlog shrinks rapidly.
+
+**Mitigation**: Monitor the backlog size over time. If it's growing, increase the cron frequency or session budget. The cursor tracks total backlog size for this purpose.
+
+#### Worry: The cursor stored in a GitHub issue comment could be overwritten by concurrent edits.
+
+**Mitigation**: The `concurrency` group ensures only 1 backlog run at a time. Additionally, the cursor update uses a compare-and-set pattern: read the current cursor, validate it matches expectations, then write the updated cursor. If a mismatch is detected, the run aborts and the next scheduled run retries.
+
+#### Worry: A long-running Devin session blocks the backlog from making progress.
+
+**Analysis**: Devin sessions have a `max_acu_limit` (default: 10). Sessions time out after ~30 minutes. If a session is stuck, the next backlog run detects it as `status=failed` or `status=timed_out` and retries the alerts.
+
+**Mitigation**: The cursor tracks session creation timestamps. If a session has been "in progress" for >1 hour, it's assumed failed and its alerts are marked for retry.
+
+#### Worry: Fixes pushed by the backlog workflow conflict with ongoing PR work.
+
+**Analysis**: The backlog fixes code on `main`. PRs branch off main. If a backlog fix is merged to main while a PR is open, the PR may need to rebase to pick up the fix. This is standard git workflow — no different from any other team member merging code to main.
+
+**Mitigation**: The backlog PR should be reviewed and merged during low-activity windows (e.g., overnight). The PR comment includes a note: "This PR contains automated security fixes. Review before merging to avoid conflicts with in-flight PRs."
+
+#### Worry: PR workflow shows "N pre-existing alerts on main" but doesn't fix them. Developer thinks the tool is broken.
+
+**Mitigation**: The PR comment explicitly says: "These alerts exist on main and are handled separately by the scheduled backlog workflow. See [backlog PR #N] for progress." This sets expectations and provides a link to track progress.
+
+### Migration Path from Current Architecture
+
+The split can be implemented incrementally:
+
+1. **Phase 1** (low risk): In the current `devin-security-review.yml`, remove the pre-existing session creation step. Keep the pre-existing alert counting and display in the PR comment. This immediately fixes the PR-blocking and session-explosion problems.
+
+2. **Phase 2**: Create `devin-security-backlog.yml` as a new workflow with `schedule` trigger. Implement the cursor-based stateless pickup. Test on a small backlog.
+
+3. **Phase 3**: Add the concurrency reservation logic (backlog checks active sessions before creating more). Connect the PR comment to the backlog PR via cross-links.
+
+### Summary: Before vs After
+
+| Dimension | Current (single workflow) | Split (PR + Backlog) |
+|-----------|--------------------------|----------------------|
+| PR workflow duration | Minutes (creates 20+ sessions) | Seconds (creates 0-1 sessions) |
+| Sessions per PR | Up to 21 (1 new + 20 pre-existing) | 1 (new-in-PR only) |
+| 20 concurrent PRs | 400+ session attempts, massive 429s | 20 session attempts, manageable |
+| Backlog progress | Only when PRs are pushed | Continuous (scheduled) |
+| Redundant work | Each PR processes same pre-existing alerts | Backlog processed once, globally |
+| PR exit code | Can fail due to pre-existing batch issues | Fails ONLY for new-in-PR issues |
+| Rate limit impact | PR blocked while retrying pre-existing | PR never blocked; backlog retries on own schedule |
+| Developer experience | "Why is my PR workflow running for 10 minutes?" | "My PR check passed in 30 seconds" |
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
@@ -639,9 +906,13 @@ Pre-existing batch failures are logged but never affect the PR's pass/fail statu
 - **CodeQL only**: The pipeline is specific to CodeQL. Other SAST tools (Semgrep, Snyk Code) would require adapter logic.
 - **Async only**: The workflow does not wait for Devin to finish — it fires sessions and exits. Monitoring session completion requires checking session URLs manually or building a callback webhook.
 - **Single repo**: Designed for a single repository. Multi-repo orchestration would need a separate dispatcher.
+- **Single-trigger architecture**: Both PR-scoped and pre-existing alert processing happen in the same workflow, causing PR blocking and session explosion under concurrent load (see Split-Trigger Architecture section for the redesign).
 
 ### Planned Improvements
 
+- **Split-trigger architecture**: Separate PR workflow (new-in-PR only) from scheduled backlog workflow (pre-existing only) — see design above
+- **Cursor-based stateless pickup**: Backlog workflow resumes from where it left off using a GitHub-stored cursor
+- **Session reservation**: Backlog workflow checks active session count and reserves slots for PR workflows
 - **Alert deduplication**: Skip alerts that were already fixed in a previous Devin session
 - **Custom CodeQL query packs**: Support for organization-specific security rules
 - **Fix approval workflow**: Optional human review gate before Devin pushes fix commits
