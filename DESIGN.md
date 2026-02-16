@@ -811,6 +811,56 @@ The Devin API is designed around **1 session = 1 scoped task**. This is confirme
 
 **Cost control**: The `max_acu_limit` parameter caps compute per session. With playbooks, we standardize the prompt so each session is efficient. Smart batching (grouping related alerts) ensures each session does meaningful work rather than context-switching between unrelated files.
 
+### Batch Session Creation (Advanced Mode)
+
+The orchestrator creates Devin sessions **up-front** for all batches in a wave before dispatching child workflows. This is the "batch session creation" pattern — instead of each child workflow creating its own session sequentially, the orchestrator creates N sessions in rapid succession, then dispatches N children with pre-created session IDs. All sessions in a wave start working simultaneously.
+
+```
+WITHOUT batch mode (sequential):                WITH batch mode (parallel):
+                                                 
+  Orchestrator                                    Orchestrator
+     │                                               │
+     ├─ dispatch child 1                              ├─ create session 1 ─┐
+     │    └─ child creates session → Devin starts     ├─ create session 2 ─┤ (all created
+     │       (wait ~5s)                               ├─ create session 3 ─┤  within seconds)
+     ├─ dispatch child 2                              ├─ create session 4 ─┤
+     │    └─ child creates session → Devin starts     ├─ create session 5 ─┘
+     │       (wait ~5s)                               │
+     ├─ dispatch child 3                              ├─ dispatch child 1 (session_id=S1)
+     │    └─ child creates session → Devin starts     ├─ dispatch child 2 (session_id=S2)
+     │       ...                                      ├─ dispatch child 3 (session_id=S3)
+     │                                                ├─ dispatch child 4 (session_id=S4)
+  Sessions start 5-25s apart                          ├─ dispatch child 5 (session_id=S5)
+  (sequential delay)                                  │
+                                                   All 5 sessions already working
+                                                   when children start polling
+```
+
+**How it works:**
+
+1. **Orchestrator creates sessions**: For each batch in the wave, the orchestrator calls `POST /v1/sessions` with the full prompt (including CodeQL config, alert details, branch name). The API returns a `session_id` and `url` immediately — Devin starts working in the background.
+
+2. **Orchestrator dispatches children with session IDs**: The child workflow (`devin-security-batch.yml`) receives `session_id` and `session_url` as `workflow_dispatch` inputs. When a pre-created session ID is present, the child skips session creation entirely and goes straight to polling.
+
+3. **Graceful fallback**: If session creation fails (e.g., rate limit 429), the child is dispatched without a session ID. The child then creates the session itself (standalone mode). This ensures the system never gets stuck — it degrades gracefully from batch mode to standalone mode.
+
+| Mode | Who Creates Session | When | Advantage |
+|------|-------------------|------|-----------|
+| **Batch** (default) | Orchestrator | Up-front, before dispatch | All sessions start simultaneously; true parallelization |
+| **Standalone** (fallback) | Child workflow | After dispatch | Works when orchestrator can't create session (rate limit, API error) |
+
+**Why this matters for production:**
+- With 5 concurrent slots and 10-min sessions, batch mode saves ~25s per wave (5 sessions × 5s sequential delay). Over 7 waves (35 batches), that's ~3 minutes of wall-clock time saved.
+- More importantly, all 5 sessions in a wave start working at the same moment. In sequential mode, session 5 starts ~25s after session 1, meaning it finishes ~25s later — pushing the entire wave completion time out.
+- The graceful fallback means batch mode never causes failures. If the Devin API is overloaded, individual children seamlessly fall back to creating their own sessions.
+
+**Edge case — rate limit during batch creation:**
+If the orchestrator hits a 429 (concurrent session limit) while creating session 3 of 5, it:
+1. Dispatches children 1-2 with pre-created sessions (batch mode)
+2. Dispatches child 3 without a session ID (standalone fallback)
+3. Child 3 creates its own session with exponential backoff
+4. No sessions are wasted, no children are blocked
+
 ### Sub-Workflow Fan-Out Architecture
 
 The backlog workflow uses a **two-tier architecture**: an orchestrator workflow dispatches independent child workflows, one per batch.

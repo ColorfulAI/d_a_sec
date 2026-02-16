@@ -534,13 +534,116 @@ jobs:
           BATCH_EOF
 
       # ----------------------------------------------------------------
-      # STEP 6: Dispatch child workflows and manage rolling window
-      # This is the core orchestrator loop. It:
-      #   - Dispatches up to MAX_CONCURRENT children
-      #   - Polls for completion every POLL_INTERVAL seconds
-      #   - Backfills freed slots with pending batches
-      #   - Updates cursor as batches complete
-      #   - Exits when all batches are dispatched + completed
+      # STEP 5b: Parse CodeQL configuration (for batch session prompts)
+      # The orchestrator needs the repo's CodeQL config to build
+      # session prompts when creating sessions in batch mode.
+      # ----------------------------------------------------------------
+      - name: Parse CodeQL configuration
+        id: codeql-config
+        if: steps.batch-alerts.outputs.batch_count != '0'
+        run: |
+          python3 -u << 'CONFIG_EOF'
+          import yaml, json, os, glob
+
+          gh_out = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+
+          codeql_file = None
+          for pattern in [".github/workflows/codeql*.yml", ".github/workflows/codeql*.yaml",
+                          ".github/workflows/code-scanning*.yml", ".github/workflows/code-scanning*.yaml"]:
+              matches = glob.glob(pattern)
+              if matches:
+                  codeql_file = matches[0]
+                  break
+
+          if not codeql_file:
+              print("No CodeQL workflow found — using defaults")
+              with open(gh_out, "a") as f:
+                  f.write("languages=python\n")
+                  f.write("query_suite=security-and-quality\n")
+                  f.write("threat_models=remote,local\n")
+                  f.write("codeql_config_source=defaults\n")
+              raise SystemExit(0)
+
+          print(f"Found CodeQL workflow: {codeql_file}")
+
+          with open(codeql_file) as f:
+              workflow = yaml.safe_load(f)
+
+          languages = set()
+          for job_name, job in workflow.get("jobs", {}).items():
+              matrix = job.get("strategy", {}).get("matrix", {})
+              for item in matrix.get("include", []):
+                  if "language" in item:
+                      languages.add(item["language"])
+              lang_list = matrix.get("language", [])
+              if isinstance(lang_list, list):
+                  languages.update(lang_list)
+              elif isinstance(lang_list, str):
+                  languages.add(lang_list)
+              for step in job.get("steps", []):
+                  uses = step.get("uses", "")
+                  if "codeql-action/init" in uses:
+                      with_block = step.get("with", {})
+                      langs_str = with_block.get("languages", "")
+                      if langs_str and ("$" + "{{") not in str(langs_str):
+                          for lang in str(langs_str).split(","):
+                              languages.add(lang.strip())
+
+          query_suite = ""
+          threat_models = set()
+          for job_name, job in workflow.get("jobs", {}).items():
+              for step in job.get("steps", []):
+                  uses = step.get("uses", "")
+                  if "codeql-action/init" in uses:
+                      with_block = step.get("with", {})
+                      queries = with_block.get("queries", "")
+                      if queries:
+                          query_suite = str(queries)
+                      config_str = with_block.get("config", "")
+                      if config_str:
+                          try:
+                              config = yaml.safe_load(str(config_str))
+                              if isinstance(config, dict):
+                                  for tm in config.get("threat-models", []):
+                                      threat_models.add(str(tm))
+                          except Exception as e:
+                              print(f"  Warning: could not parse config block: {e}")
+
+          if not languages:
+              languages = {"python"}
+          if not query_suite:
+              query_suite = "security-and-quality"
+          if not threat_models:
+              threat_models = {"remote", "local"}
+
+          languages_str = ",".join(sorted(languages))
+          threat_models_str = ",".join(sorted(threat_models))
+
+          print(f"  Languages: {languages_str}")
+          print(f"  Query suite: {query_suite}")
+          print(f"  Threat models: {threat_models_str}")
+
+          with open(gh_out, "a") as f:
+              f.write(f"languages={languages_str}\n")
+              f.write(f"query_suite={query_suite}\n")
+              f.write(f"threat_models={threat_models_str}\n")
+              f.write(f"codeql_config_source={codeql_file}\n")
+          CONFIG_EOF
+
+      # ----------------------------------------------------------------
+      # STEP 6: Batch-create Devin sessions and dispatch child workflows
+      #
+      # BATCH MODE: The orchestrator creates Devin sessions up-front for
+      # all batches in the current wave. This means all sessions in a wave
+      # start working simultaneously, rather than waiting for each child
+      # workflow to create its own session sequentially.
+      #
+      # Flow: create N sessions (batch) → dispatch N children with session_ids
+      #       → poll children → when child completes, backfill next batch
+      #
+      # This is the "batch session creation" pattern recommended by Devin's
+      # Advanced Mode. Each session gets its own child workflow for isolation
+      # (polling, CodeQL verification, PR creation, artifact upload).
       # ----------------------------------------------------------------
       - name: Dispatch and manage child workflows
         id: orchestrate
@@ -550,6 +653,10 @@ jobs:
           DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
           ISSUE_NUM: ${{ steps.tracking-issue.outputs.issue_number }}
           CURSOR_COMMENT_ID: ${{ steps.read-cursor.outputs.cursor_comment_id }}
+          CODEQL_LANGUAGES: ${{ steps.codeql-config.outputs.languages }}
+          CODEQL_QUERY_SUITE: ${{ steps.codeql-config.outputs.query_suite }}
+          CODEQL_THREAT_MODELS: ${{ steps.codeql-config.outputs.threat_models }}
+          CODEQL_CONFIG_SOURCE: ${{ steps.codeql-config.outputs.codeql_config_source }}
           PYTHONUNBUFFERED: "1"
         run: |
           python3 << 'ORCHESTRATE_EOF'
@@ -667,18 +774,179 @@ jobs:
 
           dispatch_ref = os.environ.get("DISPATCH_REF", "main")
 
-          def dispatch_child(batch):
+          # CodeQL config for building Devin session prompts
+          codeql_languages = os.environ.get("CODEQL_LANGUAGES", "python")
+          codeql_query_suite = os.environ.get("CODEQL_QUERY_SUITE", "security-and-quality")
+          codeql_threat_models = os.environ.get("CODEQL_THREAT_MODELS", "remote,local")
+          codeql_config_source = os.environ.get("CODEQL_CONFIG_SOURCE", "defaults")
+
+          def fetch_alert_details(alert_ids):
+              """Fetch alert details from CodeQL API for prompt building."""
+              details = []
+              summary_lines = []
+              for aid in alert_ids:
+                  try:
+                      url = f"https://api.github.com/repos/{repo}/code-scanning/alerts/{aid}"
+                      result, status = gh_api("GET", url)
+                      if status == 200:
+                          loc = result.get("most_recent_instance", {}).get("location", {})
+                          rule = result.get("rule", {})
+                          detail = {
+                              "number": aid,
+                              "rule_id": rule.get("id", "unknown"),
+                              "severity": rule.get("security_severity_level", "unknown"),
+                              "description": rule.get("description", ""),
+                              "file": loc.get("path", ""),
+                              "start_line": loc.get("start_line", 0),
+                              "end_line": loc.get("end_line", 0),
+                              "message": result.get("most_recent_instance", {}).get("message", {}).get("text", "")
+                          }
+                          details.append(detail)
+                          summary_lines.append(
+                              f"- Alert #{aid}: [{detail['rule_id']}] {detail['severity']} in {detail['file']}:{detail['start_line']} — {detail['message'][:120]}"
+                          )
+                  except Exception as e:
+                      print(f"    Warning: Could not fetch alert #{aid}: {e}")
+                      summary_lines.append(f"- Alert #{aid}: (details unavailable)")
+                  time.sleep(0.3)
+              return details, "\n".join(summary_lines)
+
+          def build_session_prompt(batch, alert_details_json, alert_summary):
+              """Build the Devin session prompt with CodeQL config."""
+              import textwrap
+              primary_lang = codeql_languages.split(",")[0]
+              query_pack = f"codeql/{primary_lang}-queries:codeql-suites/{primary_lang}-{codeql_query_suite}.qls"
+              threat_display = " AND ".join(codeql_threat_models.split(","))
+              threat_flags = ""
+              for tm in codeql_threat_models.split(","):
+                  if tm.strip() != "remote":
+                      threat_flags += f" --threat-model={tm.strip()}"
+
+              sarif_check = (
+                  "python3 -c \"import json; sarif=json.load(open('/tmp/results.sarif')); "
+                  "results=[r for run in sarif['runs'] for r in run.get('results',[])]; "
+                  "file_alerts=[r for r in results if any("
+                  "loc.get('physicalLocation',{}).get('artifactLocation',{}).get('uri','').endswith('FILE') "
+                  "for loc in r.get('locations',[]))]; "
+                  "print(f'Found {len(file_alerts)} alerts in FILE'); "
+                  "[print(f'  - {r[\\\"ruleId\\\"]}:{r.get(\\\"message\\\",{}).get(\\\"text\\\",\\\"\\\")[:80]}') for r in file_alerts]; "
+                  "exit(1 if file_alerts else 0)\""
+              )
+
+              prompt = textwrap.dedent(f"""\
+                  CRITICAL OPERATING MODE: You are running inside an UNATTENDED CI/CD pipeline with NO human operator. You MUST NOT use block_on_user=true, you MUST NOT ask questions, you MUST NOT wait for confirmation, you MUST NOT request approval. If you encounter ANY uncertainty, make your best judgment and continue. If you get stuck, skip the current alert and move to the next one. NEVER stop working to wait for input.
+
+                  You are a security engineer fixing pre-existing CodeQL vulnerabilities in repository {repo}.
+
+                  This is Batch #{batch['batch_id']} of an automated backlog sweep. Fix these alerts on a new branch.
+
+                  Alerts to fix:
+
+                  {alert_summary}
+
+                  Detailed alert information:
+                  {alert_details_json}
+
+                  Instructions:
+                  1. Clone the repository: https://github.com/{repo}.git
+                  2. Create and checkout branch '{batch['branch_name']}' from main
+                  3. For each alert, read the surrounding code and understand the full context
+                  4. Fix each alert ONE AT A TIME. For each alert:
+                     a. Apply a minimal, focused fix following the codebase's existing conventions
+                     b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved.
+                        IMPORTANT: You MUST use the EXACT same CodeQL configuration as the repo's CI.
+                        This repo's CI config (parsed from {codeql_config_source}) uses:
+                          - languages: {codeql_languages}
+                          - queries: {codeql_query_suite}
+                          - threat-models: {threat_display}
+                        Your verification commands:
+                        - Download and extract CodeQL CLI (only once, reuse for all alerts):
+                          wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -qo codeql-linux64.zip
+                        - Create a fresh database (MUST use --overwrite since DB may exist from prior alert):
+                          ./codeql/codeql database create /tmp/codeql-db --language={primary_lang} --source-root=. --overwrite
+                        - Run analysis with the EXACT same query suite and threat models as CI:
+                          ./codeql/codeql database analyze /tmp/codeql-db {query_pack} --format=sarif-latest --output=/tmp/results.sarif --download{threat_flags}
+                        - Parse the SARIF output to check for ANY alerts in the file you modified:
+                          {sarif_check}
+                          (Replace FILE with the actual file path for each alert)
+                     c. If ANY alert (old or new) still appears in the file after your fix, revise your approach and re-run CodeQL (max 2 attempts total)
+                     d. If after 2 attempts alerts persist, SKIP this alert entirely — do NOT commit a broken fix. Note it as unfixable and move on immediately.
+                     e. If the file is clean (CodeQL reports zero alerts for it), commit with message: fix: [rule_id] description (file:line)
+                  5. Conventions to follow:
+                     - If the project uses an ORM, use parameterized queries via the ORM
+                     - If there are existing sanitization utilities, reuse them
+                     - Do not introduce new dependencies unless absolutely necessary
+                  6. If the repository has tests, run them to ensure no regressions
+                  7. Push all commit(s) to branch '{batch['branch_name']}'
+                  8. After processing ALL alerts, finish your session immediately. Do not wait.
+
+                  IMPORTANT RULES — VIOLATION WILL BREAK THE PIPELINE:
+                  - NEVER use block_on_user=true. NEVER ask questions. NEVER wait for input. This is fully automated.
+                  - If you are unsure about ANYTHING, make your best judgment and continue. Do not stop.
+                  - Each security issue MUST be a separate commit
+                  - Do NOT just suppress or ignore alerts — fix the root cause
+                  - Keep fixes minimal and surgical — do not refactor unrelated code
+                  - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it immediately
+                  - Your fixes will be verified by the pipeline using the EXACT same CodeQL config as CI. If your fix introduces new alerts or does not resolve the target, the PR will be flagged.
+                  - When done with all alerts, push your branch and end the session. Do not block.""")
+              return prompt
+
+          def create_devin_session(batch):
+              """Create a Devin session for a batch via v1 API. Returns (session_id, session_url) or (None, None)."""
+              print(f"  Creating Devin session for Batch {batch['batch_id']}...")
+              details, summary = fetch_alert_details(batch["alert_ids"])
+              details_json = json.dumps(details, indent=2)
+              prompt = build_session_prompt(batch, details_json, summary)
+              prompt_json = json.dumps(prompt)
+
+              try:
+                  req = urllib.request.Request(
+                      "https://api.devin.ai/v1/sessions",
+                      data=json.dumps({"prompt": prompt, "max_acu_limit": 10}).encode(),
+                      headers={
+                          "Authorization": f"Bearer {devin_key}",
+                          "Content-Type": "application/json"
+                      },
+                      method="POST"
+                  )
+                  resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+                  data = json.loads(resp.read())
+                  session_id = data.get("session_id", "")
+                  session_url = data.get("url", "")
+                  if not session_url and session_id:
+                      session_url = f"https://app.devin.ai/sessions/{session_id}"
+                  if session_id:
+                      print(f"    Session created: {session_url}")
+                      return session_id, session_url
+                  else:
+                      print(f"    Session creation returned no session_id")
+                      return None, None
+              except urllib.error.HTTPError as e:
+                  status_code = e.code
+                  body = e.read().decode()[:300]
+                  if status_code == 429:
+                      print(f"    Rate limited (429) — will retry later")
+                  else:
+                      print(f"    Session creation failed (HTTP {status_code}): {body}")
+                  return None, None
+              except Exception as e:
+                  print(f"    Session creation error: {e}")
+                  return None, None
+
+          def dispatch_child(batch, session_id=None, session_url=None):
+              """Dispatch child workflow, optionally with pre-created session."""
               alert_ids_str = ",".join(str(a) for a in batch["alert_ids"])
               url = f"https://api.github.com/repos/{repo}/actions/workflows/devin-security-batch.yml/dispatches"
-              data = {
-                  "ref": dispatch_ref,
-                  "inputs": {
-                      "batch_id": str(batch["batch_id"]),
-                      "alert_ids": alert_ids_str,
-                      "branch_name": batch["branch_name"],
-                      "tracking_issue": str(issue_num)
-                  }
+              inputs = {
+                  "batch_id": str(batch["batch_id"]),
+                  "alert_ids": alert_ids_str,
+                  "branch_name": batch["branch_name"],
+                  "tracking_issue": str(issue_num)
               }
+              if session_id:
+                  inputs["session_id"] = session_id
+                  inputs["session_url"] = session_url or ""
+              data = {"ref": dispatch_ref, "inputs": inputs}
               result, status = gh_api("POST", url, data)
               return status == 204
 
@@ -723,13 +991,25 @@ jobs:
               return status == 201
 
           # ============================================================
-          # MAIN ORCHESTRATOR LOOP
+          # MAIN ORCHESTRATOR LOOP — BATCH SESSION CREATION
+          #
+          # The orchestrator creates Devin sessions UP-FRONT for all
+          # batches in the current wave. This is the "batch mode" pattern:
+          # all sessions start working simultaneously instead of waiting
+          # for each child workflow to create its own session sequentially.
+          #
+          # Flow per wave:
+          #   1. Create N Devin sessions (batch creation)
+          #   2. Dispatch N child workflows with session_ids
+          #   3. Poll children until completion
+          #   4. Backfill freed slots with next batch (create session + dispatch)
           # ============================================================
           pending_batches = list(all_batches)
-          active_children = {}  # run_id -> {batch, dispatched_at, batch_id}
+          active_children = {}  # key -> {batch, dispatched_at, batch_id, session_id, ...}
           completed_batches = []
           failed_batches = []
           start_time = time.time()
+          sessions_created = 0
 
           if dry_run:
               print("\n=== DRY RUN MODE ===")
@@ -739,43 +1019,57 @@ jobs:
               exit(0)
 
           print(f"\n{'='*60}")
-          print(f"Starting orchestrator loop")
+          print(f"Starting orchestrator loop (BATCH MODE)")
           print(f"{'='*60}\n")
 
-          # Initial fill: dispatch up to max_concurrent children
-          # NOTE (Bug #14 fix): We no longer gate on check_active_devin_sessions().
-          # The Devin API session count includes sessions from ALL workflows on the
-          # account (PR reviews, other repos, etc.), which blocks dispatch even when
-          # we have capacity. Instead, we control concurrency by tracking our own
-          # active children. Child workflows handle Devin API 429 rate limits internally.
-          while len(active_children) < max_concurrent and pending_batches:
-              batch = pending_batches.pop(0)
+          def create_and_dispatch(batch):
+              """Batch mode: create Devin session first, then dispatch child with session_id."""
+              nonlocal sessions_created
               dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-              print(f"Dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
-              success = dispatch_child(batch)
+              print(f"[BATCH] Creating session + dispatching Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+
+              session_id, session_url = create_devin_session(batch)
+              if not session_id:
+                  print(f"  Session creation failed — dispatching child without session (fallback)")
+                  session_id = None
+                  session_url = None
+              else:
+                  sessions_created += 1
+
+              success = dispatch_child(batch, session_id=session_id, session_url=session_url)
 
               if success:
-                  # We need to find the workflow run ID. Wait a moment for GitHub to register it.
                   time.sleep(5)
-                  # Store with dispatch timestamp so we can find it
                   active_children[f"batch_{batch['batch_id']}"] = {
                       "batch": batch,
                       "dispatched_at": time.time(),
                       "dispatch_time_str": dispatch_time,
-                      "run_id": None,  # Will be resolved during polling
-                      "status": "dispatched"
+                      "run_id": None,
+                      "status": "dispatched",
+                      "session_id": session_id,
+                      "session_url": session_url
                   }
-                  print(f"  Dispatched successfully")
+                  mode = "BATCH" if session_id else "STANDALONE"
+                  print(f"  Dispatched successfully ({mode} mode)")
+                  return True
               else:
                   print(f"  Dispatch FAILED — will retry later")
+                  return False
+
+          # Initial fill: create sessions + dispatch up to max_concurrent children
+          print(f"=== WAVE 1: Batch-creating up to {max_concurrent} sessions ===\n")
+          while len(active_children) < max_concurrent and pending_batches:
+              batch = pending_batches.pop(0)
+              if not create_and_dispatch(batch):
                   pending_batches.insert(0, batch)
                   time.sleep(10)
+
+          print(f"\n=== Initial wave dispatched: {len(active_children)} children, {sessions_created} sessions created in batch ===\n")
 
           # Poll loop
           poll_count = 0
           while active_children or pending_batches:
-              # Safety timeout check
               elapsed = time.time() - start_time
               if elapsed > safety_timeout:
                   print(f"\n  SAFETY TIMEOUT ({safety_timeout//60} min). Saving cursor and exiting.")
@@ -784,25 +1078,13 @@ jobs:
 
               time.sleep(poll_interval)
               poll_count += 1
-              print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}) ---")
+              print(f"\n--- Poll #{poll_count} (elapsed: {int(elapsed)}s, active: {len(active_children)}, pending: {len(pending_batches)}, sessions_created: {sessions_created}) ---")
 
-              # Re-dispatch pending batches if child slots are free (Bug #13 + #14 fix)
+              # Backfill: create session + dispatch for freed slots
               if pending_batches and len(active_children) < max_concurrent:
                   batch = pending_batches.pop(0)
-                  dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                  print(f"  Re-dispatch: Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
-                  if dispatch_child(batch):
-                      time.sleep(5)
-                      active_children[f"batch_{batch['batch_id']}"] = {
-                          "batch": batch,
-                          "dispatched_at": time.time(),
-                          "dispatch_time_str": dispatch_time,
-                          "run_id": None,
-                          "status": "dispatched"
-                      }
-                      print(f"  Re-dispatched successfully")
-                  else:
-                      print(f"  Re-dispatch failed — will retry next poll")
+                  print(f"  [BACKFILL] Batch {batch['batch_id']} ({batch['alert_count']} alerts)...")
+                  if not create_and_dispatch(batch):
                       pending_batches.insert(0, batch)
 
               # Resolve run IDs for newly dispatched children
@@ -936,23 +1218,12 @@ jobs:
 
                       del active_children[key]
 
-                      # Backfill: dispatch next pending batch
-                      # NOTE (Bug #14/#17 fix): Use child-count concurrency, not Devin session count.
-                      # check_active_devin_sessions() includes ALL sessions on the account,
-                      # which blocks backfill when external sessions are present.
+                      # Backfill: create session + dispatch next pending batch (batch mode)
                       if pending_batches and len(active_children) < max_concurrent:
                               next_batch = pending_batches.pop(0)
-                              dispatch_time = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                              print(f"  Backfill: Dispatching Batch {next_batch['batch_id']}...")
-                              if dispatch_child(next_batch):
-                                  time.sleep(5)
-                                  active_children[f"batch_{next_batch['batch_id']}"] = {
-                                      "batch": next_batch,
-                                      "dispatched_at": time.time(),
-                                      "dispatch_time_str": dispatch_time,
-                                      "run_id": None,
-                                      "status": "dispatched"
-                                  }
+                              print(f"  [BACKFILL] Batch {next_batch['batch_id']}...")
+                              if not create_and_dispatch(next_batch):
+                                  pending_batches.insert(0, next_batch)
 
                       # Update cursor after each completion (streaming)
                       update_cursor(cursor)
@@ -987,8 +1258,10 @@ jobs:
           unfixable_ids = cursor.get("unfixable_alert_ids", [])
           attempted_ids = cursor.get("attempted_alert_ids", [])
           print(f"\n{'='*60}")
-          print(f"Orchestrator complete")
+          print(f"Orchestrator complete (BATCH MODE)")
           print(f"{'='*60}")
+          print(f"  Mode: Batch session creation (sessions created up-front by orchestrator)")
+          print(f"  Sessions created in batch: {sessions_created}")
           print(f"  Total time: {total_time}s ({total_time//60} min)")
           print(f"  Batches completed: {len(completed_batches)}")
           print(f"  Batches failed: {len(failed_batches)}")
