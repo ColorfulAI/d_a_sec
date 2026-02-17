@@ -10,6 +10,7 @@ from markupsafe import escape
 app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data/public")
+ALLOWED_COMMANDS = {"ls": "ls", "date": "date", "whoami": "whoami", "uptime": "uptime"}
 ALLOWED_URLS = {
     "example": "https://example.com",
     "api": "https://api.example.com",
@@ -63,8 +64,11 @@ def load_data_6_5():
 
 @app.route("/proc_6_6")
 def process_6_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_name = request.args.get("cmd")
+    cmd = ALLOWED_COMMANDS.get(cmd_name)
+    if cmd is None:
+        return "Command not allowed", 403
+    result = subprocess.run([cmd], capture_output=True, check=False)
     return result.stdout
 
 @app.route("/ping_6_7")
