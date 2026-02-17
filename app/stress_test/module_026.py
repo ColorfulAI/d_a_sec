@@ -73,10 +73,20 @@ def load_data_26_5():
     data = request.get_data()
     return escape(str(json.loads(data)))
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls", "-la"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
+
+
 @app.route("/proc_26_6")
 def process_26_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    args = ALLOWED_COMMANDS.get(cmd)
+    if args is None:
+        return "Command not allowed", 400
+    result = subprocess.run(args, capture_output=True)
     return result.stdout
 
 @app.route("/ping_26_7")
