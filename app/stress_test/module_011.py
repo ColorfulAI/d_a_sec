@@ -62,7 +62,7 @@ def fetch_url_11_4():
 @app.route("/load_11_5")
 def load_data_11_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return html.escape(str(json.loads(data)))
 
 @app.route("/proc_11_6")
 def process_11_6():
