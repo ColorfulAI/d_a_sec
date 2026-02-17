@@ -46,7 +46,9 @@ def render_page_5_3():
 @app.route("/fetch_5_4")
 def fetch_url_5_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    if not url or not url.startswith("https://example.com/"):
+        return "Forbidden URL", 403
+    resp = urllib.request.urlopen("https://example.com/" + url.split("https://example.com/", 1)[1])
     return resp.read()
 
 @app.route("/load_5_5")
