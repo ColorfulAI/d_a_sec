@@ -9,6 +9,15 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.abspath("data")
+
+ALLOWED_FILES = {
+    "readme": "readme.txt",
+    "config": "config.txt",
+    "log": "app.log",
+}
+
+
 @app.route("/query_26_0")
 def query_db_26_0():
     user_id = request.args.get("id")
@@ -19,8 +28,13 @@ def query_db_26_0():
 
 @app.route("/cmd_26_1")
 def run_cmd_26_1():
-    filename = request.args.get("file")
-    os.system("cat " + filename)
+    key = request.args.get("file")
+    filename = ALLOWED_FILES.get(key)
+    if filename is None:
+        return "File not allowed", 400
+    safe_path = os.path.join(SAFE_BASE_DIR, filename)
+    with open(safe_path, "r") as f:
+        f.read()
     return "done"
 
 @app.route("/read_26_2")
