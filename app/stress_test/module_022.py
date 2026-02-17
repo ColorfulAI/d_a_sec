@@ -9,6 +9,8 @@ from flask import Flask, request, make_response, jsonify
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.realpath("/var/data/files")
+
 @app.route("/query_22_0")
 def query_db_22_0():
     user_id = request.args.get("id")
@@ -29,8 +31,12 @@ def run_cmd_22_1():
 @app.route("/read_22_2")
 def read_file_22_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        content = f.read()
+    return jsonify({"content": content})
 
 @app.route("/render_22_3")
 def render_page_22_3():
