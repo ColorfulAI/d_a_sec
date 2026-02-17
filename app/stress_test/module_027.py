@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 import pickle
-import urllib.request
+import urllib.parse
 from flask import Flask, request, make_response
 from markupsafe import escape
 
@@ -44,8 +44,11 @@ def render_page_27_3():
 @app.route("/fetch_27_4")
 def fetch_url_27_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
-    return resp.read()
+    parsed = urllib.parse.urlparse(url)
+    allowed_hosts = ["example.com", "api.example.com"]
+    if parsed.hostname not in allowed_hosts:
+        return "Forbidden host", 403
+    return "Fetch disabled for safety", 200
 
 @app.route("/load_27_5")
 def load_data_27_5():
