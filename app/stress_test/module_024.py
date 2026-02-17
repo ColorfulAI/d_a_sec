@@ -19,6 +19,12 @@ ALLOWED_URLS = {
     "example": "https://example.com",
     "test": "https://test.example.com",
 }
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
 
 @app.route("/query_24_0")
 def query_db_24_0():
@@ -67,7 +73,9 @@ def load_data_24_5():
 @app.route("/proc_24_6")
 def process_24_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_24_7")
