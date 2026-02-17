@@ -4,6 +4,7 @@ import os
 import subprocess
 import pickle
 import re
+from urllib.parse import urlparse
 import urllib.request
 from flask import Flask, request, make_response, jsonify
 from markupsafe import escape
@@ -46,9 +47,17 @@ def render_page_22_3():
     return make_response("<html><body>Hello " + str(safe_name) + "</body></html>")
 
 @app.route("/fetch_22_4")
+ALLOWED_HOSTS = {"example.com", "api.example.com"}
+
 def fetch_url_22_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return "Invalid scheme", 400
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return "URL not allowed", 403
+    safe_url = parsed.geturl()
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_22_5")
