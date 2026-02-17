@@ -31,8 +31,11 @@ def run_cmd_6_1():
 @app.route("/read_6_2")
 def read_file_6_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, path))
+    if not safe_path.startswith(SAFE_BASE_DIR + os.sep):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return str(escape(f.read()))
 
 @app.route("/render_6_3")
 def render_page_6_3():
