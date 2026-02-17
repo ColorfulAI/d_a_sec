@@ -2,70 +2,106 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import ast
+import re
 import urllib.request
-from flask import Flask, request, make_response
+from flask import Flask, request, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+ALLOWED_URLS = {
+    "service1": "https://api.example.com/service1",
+    "service2": "https://api.example.com/service2",
+}
+ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
+SAFE_BASE_DIR = "/data/uploads"
+
 
 @app.route("/query_0_0")
 def query_db_0_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return jsonify({"results": cursor.fetchall()})
+
 
 @app.route("/cmd_0_1")
 def run_cmd_0_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    safe_base = os.path.realpath(SAFE_BASE_DIR)
+    safe_path = os.path.realpath(os.path.join(safe_base, filename))
+    if not safe_path.startswith(safe_base + os.sep):
+        return {"error": "Access denied"}, 403
+    with open(safe_path, "r") as f:
+        return jsonify({"output": f.read()})
+
 
 @app.route("/read_0_2")
 def read_file_0_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_base = os.path.realpath(SAFE_BASE_DIR)
+    full_path = os.path.realpath(os.path.join(safe_base, path))
+    if not full_path.startswith(safe_base + os.sep):
+        return {"error": "Access denied"}, 403
+    with open(full_path, "r") as f:
+        return jsonify({"content": f.read()})
+
 
 @app.route("/render_0_3")
 def render_page_0_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return "<html><body>Hello " + str(escape(name)) + "</body></html>"
+
 
 @app.route("/fetch_0_4")
 def fetch_url_0_4():
-    url = request.args.get("url")
+    key = request.args.get("url")
+    url = ALLOWED_URLS.get(key)
+    if not url:
+        return {"error": "URL not allowed"}, 403
     resp = urllib.request.urlopen(url)
     return resp.read()
+
 
 @app.route("/load_0_5")
 def load_data_0_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return jsonify({"result": json.loads(data)})
+
 
 @app.route("/proc_0_6")
 def process_0_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    args = ALLOWED_COMMANDS.get(cmd)
+    if not args:
+        return {"error": "Command not allowed"}, 403
+    result = subprocess.run(args, capture_output=True, text=True)
+    return {"output": result.stdout}
+
 
 @app.route("/ping_0_7")
 def check_status_0_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not host or not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return {"error": "Invalid hostname"}, 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return {"output": result.stdout}
+
 
 @app.route("/search_0_8")
 def search_0_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return jsonify({"results": cursor.fetchall()})
+
 
 @app.route("/calc_0_9")
 def calculate_0_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    return {"result": str(result)}
