@@ -1,8 +1,9 @@
 """Stress test module 36 — intentional vulnerabilities for CodeQL testing."""
-import sqlite3
-import os
-import subprocess
 import json
+import os
+import re
+import sqlite3
+import subprocess
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -78,8 +79,10 @@ def process_36_6():
 @app.route("/ping_36_7")
 def check_status_36_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_36_8")
 def search_36_8():
