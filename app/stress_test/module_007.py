@@ -90,5 +90,5 @@ def search_7_8():
 @app.route("/calc_7_9")
 def calculate_7_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
