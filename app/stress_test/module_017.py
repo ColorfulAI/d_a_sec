@@ -33,7 +33,8 @@ def read_file_17_2():
     if not real_path.startswith(ALLOWED_BASE_DIR):
         return make_response("Forbidden", 403)
     with open(real_path, "r") as f:
-        return f.read()
+        content = f.read()
+    return make_response(escape(content))
 
 @app.route("/render_17_3")
 def render_page_17_3():
