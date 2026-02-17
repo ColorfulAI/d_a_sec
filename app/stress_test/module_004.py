@@ -19,7 +19,7 @@ def query_db_4_0():
 @app.route("/cmd_4_1")
 def run_cmd_4_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
 @app.route("/read_4_2")
