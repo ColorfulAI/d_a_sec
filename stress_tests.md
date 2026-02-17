@@ -13,7 +13,7 @@ Comprehensive stress test results for the Devin Security Review backlog workflow
 | ST-3 | [Optimized 50/batch Run](#st-3-optimized-50batch-run) | 722 alerts, 15 batches | 60% faster, rate limit still present | Validated #59-#60 |
 | ST-4 | [Concurrent Session Limit Validation](#st-4-concurrent-session-limit-validation) | 6 API sessions | Hard limit = 5, zombie sessions discovered | Bug #62 |
 | ST-5 | [75 alerts/batch with Session Termination](#st-5-75-alertsbatch-with-session-termination) | 722 alerts, 11 batches | 73 min total (78% faster than baseline) | Bugs #63, #64 |
-| ST-6 | [100 alerts/batch Maximum Throughput](#st-6-100-alertsbatch-maximum-throughput) | 722 alerts, ~8 batches | In progress | TBD |
+| ST-6 | [100 alerts/batch Maximum Throughput](#st-6-100-alertsbatch-maximum-throughput) | 722 alerts, 8 batches | **37 min total (89% faster than baseline)** | None (all fixes validated) |
 
 ---
 
@@ -305,12 +305,56 @@ Before this run could succeed, two additional bugs were discovered and fixed:
 
 ### Results
 
-**Status**: In progress. Results will be updated upon completion.
+| Metric | Value |
+|--------|-------|
+| **Total wall time** | **37 minutes** |
+| Orchestrator status | Completed (success) |
+| Batches completed | 8/8 (100%) |
+| Batches failed | 0 |
+| Sessions created | 8 |
+| Alerts attempted | 722 |
+| Alerts unfixable | 0 |
+| PRs created | 8 ([#268](https://github.com/ColorfulAI/d_a_sec/pull/268)-[#276](https://github.com/ColorfulAI/d_a_sec/pull/276)) |
+| **Improvement vs baseline** | **89% faster (37 min vs 336 min)** |
+| **Improvement vs 75/batch** | **49% faster (37 min vs 73 min)** |
 
-Early observations (20 minutes in):
-- 5 sessions created successfully (filled all concurrent slots)
-- Sessions completing in ~15 min (similar to 75/batch)
-- Prompt truncation activating for all batches (100 alerts -> summary-only prompt)
+### Session Timeline
+
+| Session | Created | Status | Duration | Notes |
+|---------|---------|--------|----------|-------|
+| 1 (4b4ed90f) | 22:56:47 | finished | ~17 min | Wave 1 |
+| 2 (0383c22c) | 22:57:54 | finished | ~16 min | Wave 1 |
+| 3 (36eae09d) | 22:59:02 | finished | ~12 min | Wave 1 |
+| 4 (ea693e96) | 23:00:10 | finished | ~15 min | Wave 1 |
+| 5 (d8ab33d9) | 23:01:22 | finished | ~14 min | Wave 1 |
+| 6 (1d8267c8) | 23:12:44 | finished | ~15 min | Wave 2 (backfill) |
+| 7 (2b1cf47e) | 23:14:56 | finished | ~18 min | Wave 2 (backfill) |
+| 8 (27861716) | 23:15:30 | finished | ~13 min | Wave 2 (backfill) |
+
+### Inter-Wave Gap Analysis
+
+| Transition | Gap | ST-5 (75/batch) Gap | Improvement |
+|------------|-----|---------------------|-------------|
+| Wave 1 -> Wave 2 | **~1 min** (23:11 -> 23:12) | ~1 min | Same (session termination working) |
+| No Wave 3 needed | N/A | ~22 min (rate limit) | **Eliminated entirely** |
+
+### Key Findings
+
+1. **37 minutes = 89% faster than baseline**: This is the best result across all stress tests. Fewer batches (8 vs 11) meant only 2 waves instead of 3, eliminating the ~22 min rate limit gap that ST-5 experienced.
+
+2. **No rate limit gap**: With only 8 sessions total, the Devin API never hit the per-account request rate limit that throttled session 11 in ST-5. The threshold appears to be ~10 session creations in rapid succession.
+
+3. **All 722 alerts covered in 8 batches**: Each batch contained ~98 alerts (except batch 8 with 36). Prompt truncation activated for all batches (100 alerts always exceeds 30k chars), using summary-only mode. Devin handled this successfully.
+
+4. **100% batch success rate**: 8/8 batches completed, zero failures. Same reliability as ST-5.
+
+5. **Session duration unchanged**: Average ~15 min per session, regardless of batch size (75 vs 100 alerts). This confirms Devin's internal processing time is not linearly proportional to alert count — it's dominated by repo cloning, CodeQL analysis, and git operations.
+
+### Design Impact
+- **100 alerts/batch is the new recommended batch size** for accounts with 5 concurrent sessions and 700+ alert backlogs
+- Fewer total sessions = fewer rate limit windows = dramatically faster completion
+- The summary-only prompt (from Bug #63 fix) is sufficient — Devin reads source files directly
+- For backlogs under 500 alerts, 75/batch is equivalent (both fit in 1-2 waves)
 
 ---
 
@@ -335,7 +379,7 @@ Based on stress test results for an account with 5 concurrent session limit:
 
 | Parameter | Recommended | Rationale |
 |-----------|------------|-----------|
-| `alerts_per_batch` | 75 | Sweet spot: few enough batches to minimize rate limiting, large enough that prompt truncation rarely activates |
+| `alerts_per_batch` | 100 | Best throughput: 8 batches for 722 alerts, 2 waves, 37 min. Prompt truncation uses summary-only mode which Devin handles well. |
 | `max_concurrent` | 5 | Use all available concurrent slots |
 | `poll_interval` | 60s | Balance between responsiveness and API pressure |
 | `max_child_runtime` | 3600s | 60 min safety timeout per batch session |
@@ -348,7 +392,8 @@ Based on stress test results for an account with 5 concurrent session limit:
 | 200 alerts | 3 | 1 | ~15 min | Single wave |
 | 375 alerts | 5 | 1 | ~15 min | Exactly fills 5 slots |
 | 500 alerts | 7 | 2 | ~35 min | 1 rate limit gap (~5 min) |
-| 722 alerts | 11 | 3 | ~73 min | Validated (ST-5) |
+| 722 alerts (75/batch) | 11 | 3 | ~73 min | Validated (ST-5) |
+| 722 alerts (100/batch) | 8 | 2 | **~37 min** | **Validated (ST-6)** |
 | 1,000 alerts | 14 | 3 | ~90 min | Estimated |
 | 5,000 alerts | 67 | 14 | ~5-6 hours | Multiple rate limit gaps |
 
@@ -391,7 +436,9 @@ ST-5 (75/batch with termination)
   -> Wave 1->2 gap reduced from 7-48 min to ~1 min
 
 ST-6 (100/batch maximum throughput)
-  -> In progress, testing upper bound of batch sizing
+  -> 37 min (89% faster than baseline, 49% faster than ST-5)
+  -> Fewer batches = fewer waves = no rate limit gap
+  -> 100 alerts/batch is the new optimal configuration
 ```
 
 ### Enterprise Readiness Assessment
@@ -406,5 +453,5 @@ ST-6 (100/batch maximum throughput)
 | Cursor-based resumability | PASS | Stateless pickup between runs |
 | Unfixable alert classification | PASS | 215 alerts marked for human review |
 | Streaming PR creation | PASS | PRs created as batches complete |
-| Sub-75-minute completion at 700+ alerts | PASS | ST-5: 73 minutes |
+| Sub-75-minute completion at 700+ alerts | PASS | ST-5: 73 min, ST-6: **37 min** |
 | Configurable batch sizing | PASS | Tested 15, 50, 75, 100 alerts/batch |
