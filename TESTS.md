@@ -1945,3 +1945,64 @@ Trigger backlog workflow with `alerts_per_batch=6`.
 **Production scenario**: The same Fortune 500 company runs the orchestrator. Wave 1's 5 sessions complete, but the Devin API takes 5-10 minutes to release the session slots. Without Bug #60 fix: the orchestrator enters a loop of (retry 210s → re-queue → poll 60s → retry 210s) for each pending batch, burning an entire GitHub Actions runner for hours. With the fix: after 2 failed attempts (~420s), it backs off and retries each poll cycle (60s), eventually succeeding when slots free up.
 
 **Worry**: The escape hatch resets each poll cycle. If the API is down for an extended period (e.g., Devin outage), the orchestrator still retries every 60s but each retry only burns ~420s (2 failures × 210s) instead of the full 270s per batch. The safety timeout (5.5 hours) provides the final backstop.
+
+---
+
+### TC-BL-BATCH-22: Inter-Wave Rate Limit Cooldown (Bug #61)
+
+**Setup**: Seed 500+ CodeQL alerts across many files (enough to require 10+ batches). Trigger the orchestrator with `max_batches=0` (unlimited) and `max_concurrent=5`. Let wave 1 (5 children) complete naturally. Observe how long the orchestrator takes to dispatch wave 2 children.
+
+**Why we test this**: The Devin API enforces a rate limit that is NOT based on concurrent sessions. Even with 0 active sessions, the API can return 429 for extended periods (~30-60 minutes) after a burst of session creation + polling activity from wave 1. This was discovered during the 722-alert stress test where wave 2 was blocked for 48 minutes despite all 5 slots being free.
+
+**Expected behavior**:
+1. Wave 1 dispatches 5 children (fills all slots)
+2. All 5 children complete successfully (~10-15 min)
+3. Orchestrator attempts to backfill all 5 freed slots
+4. Devin API returns 429 on session creation attempts
+5. Bug #60 escape hatch kicks in — after 2 consecutive failures, backfill breaks out
+6. Orchestrator continues polling every 60s, retrying backfill each cycle
+7. Eventually (30-60 min later), rate limit clears and wave 2 dispatches
+
+**What we check for**:
+1. The orchestrator does NOT crash or hang during the rate limit window
+2. Bug #60 escape hatch prevents infinite retry loops (backfill breaks after 2 failures per poll cycle)
+3. The orchestrator correctly resumes dispatching once the rate limit clears
+4. Bug #59 fix works: when rate limit clears, multiple children dispatch in rapid succession (not 1 per 60s)
+
+**Validates**: Bug #61 documentation — confirms the rate limit is external to our system and our mitigation (Bug #60 escape) handles it gracefully.
+
+**Production scenario**: A Fortune 500 company triggers a nightly cron that processes their 500-alert backlog. Wave 1 (5 batches) completes in 15 minutes. The orchestrator then hits the Devin API rate limit and stalls for 30-60 minutes before wave 2 can start. Total processing time for 34 batches: ~4-5 hours instead of the ideal ~70 minutes. The orchestrator is functional but throughput is constrained by external rate limits.
+
+**Worry**: Without Bug #60's escape hatch, the orchestrator would burn ~210s per failed session creation attempt (3 retries with exponential backoff). With 5 free slots and the `while` loop (Bug #59 fix), it would attempt 5 creations per poll cycle, each burning 210s = 1050s per cycle. The escape hatch limits this to 2 × 210s = 420s per cycle, then backs off to the next 60s poll. But the fundamental problem remains: the Devin API rate limit adds 30-60 minutes of dead time between waves, and we cannot control this from our side.
+
+---
+
+### TC-BL-BATCH-23: 500+ Alert Full Backlog Stress Test
+
+**Setup**: Seed 700+ CodeQL alerts across 50+ files (e.g., create stress_test_01.py through stress_test_50.py, each with ~14 intentional vulnerabilities using Flask taint sources). Wait for CodeQL to detect all alerts. Trigger the orchestrator with `max_batches=0`, `max_concurrent=5`, `reset_cursor=true`.
+
+**Why we test this**: This is the ultimate production-readiness test. A Fortune 500 company may accumulate hundreds of CodeQL alerts across their codebase. The orchestrator must process the entire backlog without crashing, losing track of batches, or creating duplicate sessions.
+
+**Expected behavior**:
+1. Orchestrator fetches all 700+ alerts (paginated, 100 per page)
+2. Groups them into ~50 batches (all alerts per file in same batch)
+3. Dispatches wave 1 (5 children), polls for completion
+4. As children complete, backfills slots with new batches
+5. Continues through waves until all batches are dispatched and completed
+6. Each child creates a fix PR for its batch of alerts
+7. Cursor comment on the tracking issue is updated with processed alert IDs
+
+**What we check for**:
+1. All children complete with success (no failures due to orchestrator bugs)
+2. Each completed child creates a fix PR
+3. No duplicate sessions or duplicate PRs
+4. Backfill correctly fills freed slots (Bug #59 fix)
+5. Consecutive failure escape works during rate limit windows (Bug #60 fix)
+6. Orchestrator handles the 48-minute rate limit gap gracefully (Bug #61)
+7. Total batches dispatched matches expected count
+
+**Validates**: End-to-end orchestrator behavior at scale with real Devin sessions processing real CodeQL alerts.
+
+**Production scenario**: Enterprise security team runs the orchestrator for the first time on a legacy codebase with 700+ accumulated vulnerabilities. The orchestrator must systematically work through the entire backlog, creating fix PRs that the team can review and merge.
+
+**Worry**: At this scale, many things can go wrong: GitHub API pagination bugs, session creation rate limits, child workflow timeouts, orchestrator safety timeout (5.5 hours), memory issues from tracking hundreds of alert IDs, cursor comment size limits, and GitHub Actions concurrency limits. Each of these failure modes needs to be handled gracefully.
