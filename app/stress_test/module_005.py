@@ -11,6 +11,8 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.abspath("/var/data")
+
 @app.route("/query_5_0")
 def query_db_5_0():
     user_id = request.args.get("id")
@@ -30,7 +32,10 @@ def run_cmd_5_1():
 @app.route("/read_5_2")
 def read_file_5_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
+    safe_path = os.path.abspath(os.path.join(SAFE_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
         return f.read()
 
 @app.route("/render_5_3")
