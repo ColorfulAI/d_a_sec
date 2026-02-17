@@ -1,8 +1,9 @@
 """Stress test module 13 — intentional vulnerabilities for CodeQL testing."""
+import ast
+import json
 import sqlite3
 import os
 import subprocess
-import json
 from markupsafe import escape
 from flask import Flask, request, make_response, abort
 
@@ -99,5 +100,5 @@ def search_13_8():
 @app.route("/calc_13_9")
 def calculate_13_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
