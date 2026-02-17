@@ -800,8 +800,16 @@ jobs:
                   time.sleep(0.3)
               return details, "\n".join(summary_lines)
 
+          PROMPT_CHAR_LIMIT = 29000
+
           def build_session_prompt(batch, alert_details_json, alert_summary):
-              """Build the Devin session prompt with CodeQL config."""
+              """Build the Devin session prompt with CodeQL config.
+              Bug #63 fix: Devin API has a 30,000 character prompt limit.
+              With large batches (70+ alerts), the full alert_details_json can
+              exceed this. We progressively truncate: first try compact JSON
+              (no indentation), then drop full details entirely and use only
+              the summary. The summary alone provides enough context (rule_id,
+              severity, file, line, truncated message) for Devin to work."""
               import textwrap
               # Bug #47 fix: filter out 'actions' (scans YAML only) when real code languages exist
               code_langs = [l for l in codeql_languages.split(",") if l != "actions"]
@@ -824,62 +832,75 @@ jobs:
                   "exit(1 if file_alerts else 0)\""
               )
 
-              prompt = textwrap.dedent(f"""\
-                  CRITICAL OPERATING MODE: You are running inside an UNATTENDED CI/CD pipeline with NO human operator. You MUST NOT use block_on_user=true, you MUST NOT ask questions, you MUST NOT wait for confirmation, you MUST NOT request approval. If you encounter ANY uncertainty, make your best judgment and continue. If you get stuck, skip the current alert and move to the next one. NEVER stop working to wait for input.
+              def _render_prompt(details_section):
+                  return textwrap.dedent(f"""\
+                      CRITICAL OPERATING MODE: You are running inside an UNATTENDED CI/CD pipeline with NO human operator. You MUST NOT use block_on_user=true, you MUST NOT ask questions, you MUST NOT wait for confirmation, you MUST NOT request approval. If you encounter ANY uncertainty, make your best judgment and continue. If you get stuck, skip the current alert and move to the next one. NEVER stop working to wait for input.
 
-                  You are a security engineer fixing pre-existing CodeQL vulnerabilities in repository {repo}.
+                      You are a security engineer fixing pre-existing CodeQL vulnerabilities in repository {repo}.
 
-                  This is Batch #{batch['batch_id']} of an automated backlog sweep. Fix these alerts on a new branch.
+                      This is Batch #{batch['batch_id']} of an automated backlog sweep. Fix these alerts on a new branch.
 
-                  Alerts to fix:
+                      Alerts to fix:
 
-                  {alert_summary}
+                      {alert_summary}
 
-                  Detailed alert information:
-                  {alert_details_json}
+                      {details_section}
 
-                  Instructions:
-                  1. Clone the repository: https://github.com/{repo}.git
-                  2. Create and checkout branch '{batch['branch_name']}' from main
-                  3. For each alert, read the surrounding code and understand the full context
-                  4. Fix each alert ONE AT A TIME. For each alert:
-                     a. Apply a minimal, focused fix following the codebase's existing conventions
-                     b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved.
-                        IMPORTANT: You MUST use the EXACT same CodeQL configuration as the repo's CI.
-                        This repo's CI config (parsed from {codeql_config_source}) uses:
-                          - languages: {codeql_languages}
-                          - queries: {codeql_query_suite}
-                          - threat-models: {threat_display}
-                        Your verification commands:
-                        - Download and extract CodeQL CLI (only once, reuse for all alerts):
-                          wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -qo codeql-linux64.zip
-                        - Create a fresh database (MUST use --overwrite since DB may exist from prior alert):
-                          ./codeql/codeql database create /tmp/codeql-db --language={primary_lang} --source-root=. --overwrite
-                        - Run analysis with the EXACT same query suite and threat models as CI:
-                          ./codeql/codeql database analyze /tmp/codeql-db {query_pack} --format=sarif-latest --output=/tmp/results.sarif --download{threat_flags}
-                        - Parse the SARIF output to check for ANY alerts in the file you modified:
-                          {sarif_check}
-                          (Replace FILE with the actual file path for each alert)
-                     c. If ANY alert (old or new) still appears in the file after your fix, revise your approach and re-run CodeQL (max 2 attempts total)
-                     d. If after 2 attempts alerts persist, SKIP this alert entirely — do NOT commit a broken fix. Note it as unfixable and move on immediately.
-                     e. If the file is clean (CodeQL reports zero alerts for it), commit with message: fix: [rule_id] description (file:line)
-                  5. Conventions to follow:
-                     - If the project uses an ORM, use parameterized queries via the ORM
-                     - If there are existing sanitization utilities, reuse them
-                     - Do not introduce new dependencies unless absolutely necessary
-                  6. If the repository has tests, run them to ensure no regressions
-                  7. Push all commit(s) to branch '{batch['branch_name']}'
-                  8. After processing ALL alerts, finish your session immediately. Do not wait.
+                      Instructions:
+                      1. Clone the repository: https://github.com/{repo}.git
+                      2. Create and checkout branch '{batch['branch_name']}' from main
+                      3. For each alert, read the surrounding code and understand the full context
+                      4. Fix each alert ONE AT A TIME. For each alert:
+                         a. Apply a minimal, focused fix following the codebase's existing conventions
+                         b. VERIFY the fix locally by running CodeQL CLI to confirm the alert is resolved.
+                            IMPORTANT: You MUST use the EXACT same CodeQL configuration as the repo's CI.
+                            This repo's CI config (parsed from {codeql_config_source}) uses:
+                              - languages: {codeql_languages}
+                              - queries: {codeql_query_suite}
+                              - threat-models: {threat_display}
+                            Your verification commands:
+                            - Download and extract CodeQL CLI (only once, reuse for all alerts):
+                              wget -q https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip && unzip -qo codeql-linux64.zip
+                            - Create a fresh database (MUST use --overwrite since DB may exist from prior alert):
+                              ./codeql/codeql database create /tmp/codeql-db --language={primary_lang} --source-root=. --overwrite
+                            - Run analysis with the EXACT same query suite and threat models as CI:
+                              ./codeql/codeql database analyze /tmp/codeql-db {query_pack} --format=sarif-latest --output=/tmp/results.sarif --download{threat_flags}
+                            - Parse the SARIF output to check for ANY alerts in the file you modified:
+                              {sarif_check}
+                              (Replace FILE with the actual file path for each alert)
+                         c. If ANY alert (old or new) still appears in the file after your fix, revise your approach and re-run CodeQL (max 2 attempts total)
+                         d. If after 2 attempts alerts persist, SKIP this alert entirely — do NOT commit a broken fix. Note it as unfixable and move on immediately.
+                         e. If the file is clean (CodeQL reports zero alerts for it), commit with message: fix: [rule_id] description (file:line)
+                      5. Conventions to follow:
+                         - If the project uses an ORM, use parameterized queries via the ORM
+                         - If there are existing sanitization utilities, reuse them
+                         - Do not introduce new dependencies unless absolutely necessary
+                      6. If the repository has tests, run them to ensure no regressions
+                      7. Push all commit(s) to branch '{batch['branch_name']}'
+                      8. After processing ALL alerts, finish your session immediately. Do not wait.
 
-                  IMPORTANT RULES — VIOLATION WILL BREAK THE PIPELINE:
-                  - NEVER use block_on_user=true. NEVER ask questions. NEVER wait for input. This is fully automated.
-                  - If you are unsure about ANYTHING, make your best judgment and continue. Do not stop.
-                  - Each security issue MUST be a separate commit
-                  - Do NOT just suppress or ignore alerts — fix the root cause
-                  - Keep fixes minimal and surgical — do not refactor unrelated code
-                  - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it immediately
-                  - Your fixes will be verified by the pipeline using the EXACT same CodeQL config as CI. If your fix introduces new alerts or does not resolve the target, the PR will be flagged.
-                  - When done with all alerts, push your branch and end the session. Do not block.""")
+                      IMPORTANT RULES — VIOLATION WILL BREAK THE PIPELINE:
+                      - NEVER use block_on_user=true. NEVER ask questions. NEVER wait for input. This is fully automated.
+                      - If you are unsure about ANYTHING, make your best judgment and continue. Do not stop.
+                      - Each security issue MUST be a separate commit
+                      - Do NOT just suppress or ignore alerts — fix the root cause
+                      - Keep fixes minimal and surgical — do not refactor unrelated code
+                      - If an alert cannot be fixed after 2 CodeQL verification attempts, SKIP it immediately
+                      - Your fixes will be verified by the pipeline using the EXACT same CodeQL config as CI. If your fix introduces new alerts or does not resolve the target, the PR will be flagged.
+                      - When done with all alerts, push your branch and end the session. Do not block.""")
+
+              prompt = _render_prompt(f"Detailed alert information:\n{alert_details_json}")
+              if len(prompt) <= PROMPT_CHAR_LIMIT:
+                  return prompt
+
+              compact_json = json.dumps(json.loads(alert_details_json), separators=(',', ':'))
+              prompt = _render_prompt(f"Detailed alert information (compact):\n{compact_json}")
+              if len(prompt) <= PROMPT_CHAR_LIMIT:
+                  print(f"    Prompt truncated: compact JSON ({len(prompt)} chars)")
+                  return prompt
+
+              prompt = _render_prompt("(Detailed alert JSON omitted — too large. Use the alert summary above and read each file directly to understand the vulnerabilities.)")
+              print(f"    Prompt truncated: details dropped ({len(prompt)} chars, {batch['alert_count']} alerts)")
               return prompt
 
           def create_devin_session(batch):
@@ -891,6 +912,8 @@ jobs:
               details, summary = fetch_alert_details(batch["alert_ids"])
               details_json = json.dumps(details, indent=2)
               prompt = build_session_prompt(batch, details_json, summary)
+
+              print(f"    Prompt size: {len(prompt)} chars (limit: {PROMPT_CHAR_LIMIT})")
 
               max_retries = 3
               retry_wait = 30
@@ -920,6 +943,9 @@ jobs:
                   except urllib.error.HTTPError as e:
                       status_code = e.code
                       body = e.read().decode()[:300]
+                      if status_code == 400:
+                          print(f"    Session creation rejected (HTTP 400): {body}")
+                          return None, None
                       if status_code == 429 and attempt < max_retries:
                           print(f"    Rate limited (429) — retry {attempt}/{max_retries} in {retry_wait}s...")
                           time.sleep(retry_wait)

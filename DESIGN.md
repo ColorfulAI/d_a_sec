@@ -1820,6 +1820,22 @@ With 48 remaining batches and a 60s poll interval, dispatch alone would take 48+
 - 722 alerts at 50/batch = 15 batches, 5 concurrent = ~45 min total (down from 5.5 hours)
 - For 5,000+ alerts: reduces from ~17 hours to ~3 hours with 5 concurrent sessions
 
+### Bug #63: Prompt Exceeds 30,000 Character Limit for Large Batches
+
+**Problem discovered**: When `alerts_per_batch` is set to 75, the orchestrator creates batches with 70 alerts. The session prompt includes the full `alert_details_json` (all alert metadata as pretty-printed JSON), which at 70 alerts exceeds the Devin API's 30,000 character prompt limit. Every session creation attempt returns HTTP 400: `"Prompt is too long. Must be less than 30000 characters."` The orchestrator retried indefinitely (the 400 was not distinguished from transient errors in the retry logic), causing the entire run to stall.
+
+**Root cause**: The prompt size grows linearly with batch size:
+- Fixed template text: ~3,000 chars
+- Alert summary: ~150 chars/alert
+- Alert details JSON (pretty-printed): ~300-500 chars/alert
+- At 70 alerts: ~3,000 + 10,500 + 24,500 = **~38,000 chars** (exceeds 30k limit)
+
+**Fix (Bug #63)**:
+1. **Progressive prompt truncation**: The `build_session_prompt()` function now checks prompt length against a 29,000-char limit (1k safety margin). If exceeded, it first tries compact JSON (no indentation). If still too large, it drops the full JSON entirely and instructs Devin to read the files directly — the alert summary (rule_id, severity, file, line) provides enough context.
+2. **No retry on HTTP 400**: Added early-exit for HTTP 400 errors in `create_devin_session()`. Previously, 400 responses fell through to the generic error handler and the batch was re-queued indefinitely (same prompt = same 400 = infinite loop).
+
+**Impact**: Enables batches of 75-200+ alerts per session without hitting the prompt size limit. The summary-only prompt is sufficient because Devin can read the actual source files to understand the full context of each vulnerability.
+
 ---
 
 ## Limitations and Future Work
