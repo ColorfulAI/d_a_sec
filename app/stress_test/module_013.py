@@ -9,6 +9,14 @@ from flask import Flask, request, make_response, abort
 
 app = Flask(__name__)
 
+ALLOWED_BASE_DIR = os.path.realpath("/var/data")
+
+ALLOWED_FILES = {
+    "config": "config.txt",
+    "readme": "readme.txt",
+    "data": "data.txt",
+}
+
 @app.route("/query_13_0")
 def query_db_13_0():
     user_id = request.args.get("id")
@@ -27,8 +35,12 @@ def run_cmd_13_1():
 @app.route("/read_13_2")
 def read_file_13_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_name = ALLOWED_FILES.get(path)
+    if safe_name is None:
+        abort(404)
+    file_path = os.path.join(ALLOWED_BASE_DIR, safe_name)
+    with open(file_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_13_3")
 def render_page_13_3():
