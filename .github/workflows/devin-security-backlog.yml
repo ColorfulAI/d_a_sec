@@ -4,7 +4,7 @@
 # It uses a sub-workflow fan-out pattern:
 #   1. Fetches all open CodeQL alerts on main (paginated)
 #   2. Reads cursor from tracking issue (skip already-processed alerts)
-#   3. Groups remaining alerts into batches (15 per batch, grouped by file)
+#   3. Groups remaining alerts into batches (configurable, default 15, grouped by file)
 #   4. Dispatches child workflows (devin-security-batch.yml), one per batch
 #   5. Polls child workflow statuses (rolling window of max 3 active)
 #   6. As each child completes, updates cursor
@@ -59,6 +59,11 @@ on:
         required: false
         type: string
         default: ""
+      alerts_per_batch:
+        description: "Number of alerts per batch (default: 15). Larger values = fewer batches = fewer waves = fewer rate limit gaps."
+        required: false
+        type: string
+        default: "15"
 
 permissions:
   contents: write
@@ -79,7 +84,7 @@ jobs:
       MAX_BATCHES: ${{ github.event.inputs.max_batches || '0' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       RESET_CURSOR: ${{ github.event.inputs.reset_cursor || 'false' }}
-      ALERTS_PER_BATCH: 15
+      ALERTS_PER_BATCH: ${{ github.event.inputs.alerts_per_batch || '15' }}
       POLL_INTERVAL: 60
       MAX_CHILD_RUNTIME: 3600
       SAFETY_TIMEOUT: 19800
@@ -893,7 +898,7 @@ jobs:
                   try:
                       req = urllib.request.Request(
                           "https://api.devin.ai/v1/sessions",
-                          data=json.dumps({"prompt": prompt, "max_acu_limit": 10}).encode(),
+                          data=json.dumps({"prompt": prompt, "max_acu_limit": 20}).encode(),
                           headers={
                               "Authorization": f"Bearer {devin_key}",
                               "Content-Type": "application/json"
