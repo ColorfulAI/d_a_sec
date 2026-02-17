@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import pickle
+from urllib.parse import urlparse
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -10,6 +11,10 @@ from markupsafe import escape
 app = Flask(__name__)
 
 ALLOWED_BASE_DIR = os.path.realpath("/var/data/files")
+ALLOWED_HOSTS = {
+    "example.com": "https://example.com",
+    "api.example.com": "https://api.example.com",
+}
 
 @app.route("/query_12_0")
 def query_db_12_0():
@@ -42,7 +47,15 @@ def render_page_12_3():
 @app.route("/fetch_12_4")
 def fetch_url_12_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return "Invalid scheme", 400
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return "Forbidden host", 403
+    safe_url = ALLOWED_HOSTS.get(parsed.hostname)
+    if safe_url is None:
+        return "Unknown host", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_12_5")
