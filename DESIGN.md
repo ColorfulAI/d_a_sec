@@ -1789,6 +1789,32 @@ With 48 remaining batches and a 60s poll interval, dispatch alone would take 48+
 
 ---
 
+### Bug #61: Devin API 429 Rate Limit Blocks Wave 2+ Dispatch (Not a Concurrent Session Limit)
+
+**Problem discovered**: During the 722-alert stress test (orchestrator run #22079950757), wave 1 dispatched 5 children successfully and all 5 completed within ~15 minutes. The orchestrator then attempted to backfill all 5 freed slots for wave 2. Every session creation attempt returned HTTP 429 (Too Many Requests) from the Devin API. This persisted for **~48 minutes** despite having **0 active sessions** (verified via `GET /v1/sessions` which returned an empty list).
+
+**Key observation**: This is NOT a concurrent session limit. The Devin API confirmed 0 active sessions during the entire 48-minute blockage. The 429 is a separate rate limit — likely a per-account requests-per-minute or rolling-window limit that counts all API calls (session creation, polling, etc.) regardless of how many sessions are currently active.
+
+**Impact**: For a Fortune 500 backlog of 500+ alerts, the inter-wave gap adds ~30-60 minutes of dead time between each wave of 5 batches. A 34-batch backlog that should take ~70 minutes (7 waves × 10 min each) instead takes ~4-5 hours due to rate limit cooldown between waves. The orchestrator is functional (Bug #60's escape hatch prevents infinite retry loops), but throughput is severely limited by the external rate limit.
+
+**Evidence from stress test**:
+- Wave 1 completed at ~23:17 UTC (all 5 children done)
+- Wave 2 first successful dispatch at ~23:47 UTC (48-minute gap)
+- During the gap, orchestrator hit 429 on every backfill attempt, correctly escaped after 2 consecutive failures per poll cycle (Bug #60 fix working)
+- Once the rate limit cleared, 4 children dispatched within 28 seconds (Bug #59 fix working — `while` loop filling all free slots)
+
+**Root cause**: External to our system — the Devin API enforces a rate limit that is not solely based on concurrent sessions. Likely a rolling-window request rate limit (e.g., X requests per hour per account).
+
+**Mitigation (current)**: Bug #60's consecutive failure escape prevents the orchestrator from wasting time on retries. It backs off to 60s poll intervals and retries on each cycle until the rate limit clears. This is the best we can do without Devin API cooperation.
+
+**Recommended improvements**:
+1. **Read `Retry-After` header**: If the Devin API returns a `Retry-After` header with the 429, use that value instead of fixed 60s poll intervals
+2. **Exponential backoff between waves**: After 2 consecutive backfill failures, increase the poll interval (e.g., 60s → 120s → 240s) to reduce unnecessary API calls during rate limit windows
+3. **Pre-flight rate limit check**: Before attempting session creation, call a lightweight API endpoint to check remaining rate limit quota
+4. **Configurable wave delay**: Add a `wave_delay_seconds` input parameter that inserts a deliberate pause between waves to avoid hitting rate limits entirely (e.g., 300s between waves)
+
+---
+
 ## Limitations and Future Work
 
 ### Current Limitations
