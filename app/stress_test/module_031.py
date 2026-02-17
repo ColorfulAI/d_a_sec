@@ -15,7 +15,7 @@ def query_db_31_0():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return str(cursor.fetchall())
+    return html.escape(str(cursor.fetchall()))
 
 @app.route("/cmd_31_1")
 def run_cmd_31_1():
