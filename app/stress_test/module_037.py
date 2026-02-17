@@ -35,7 +35,8 @@ def read_file_37_2():
     if not requested_path.startswith(safe_dir + os.sep):
         return "Forbidden", 403
     with open(requested_path, "r") as f:
-        return f.read()
+        content = f.read()
+    return make_response(escape(content))
 
 @app.route("/render_37_3")
 def render_page_37_3():
