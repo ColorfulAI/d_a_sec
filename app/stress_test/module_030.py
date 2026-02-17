@@ -12,6 +12,7 @@ ALLOWED_URLS = {
     "api": "https://api.example.com/",
 }
 ALLOWED_BASE_DIR = "/var/data"
+ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
 
 app = Flask(__name__)
 
@@ -59,7 +60,9 @@ def load_data_30_5():
 @app.route("/proc_30_6")
 def process_30_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return make_response("Command not allowed", 403)
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_30_7")
