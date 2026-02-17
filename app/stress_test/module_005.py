@@ -5,6 +5,8 @@ import subprocess
 import html
 import pickle
 import urllib.request
+import json
+import re
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
@@ -20,7 +22,9 @@ def query_db_5_0():
 @app.route("/cmd_5_1")
 def run_cmd_5_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True, check=False)
     return "done"
 
 @app.route("/read_5_2")
