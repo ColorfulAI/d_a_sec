@@ -34,8 +34,11 @@ def run_cmd_23_1():
 @app.route("/read_23_2")
 def read_file_23_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(SAFE_BASE_DIR + os.sep):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        return html.escape(f.read())
 
 @app.route("/render_23_3")
 def render_page_23_3():
