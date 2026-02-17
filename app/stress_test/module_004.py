@@ -1,8 +1,10 @@
 """Stress test module 4 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
 import os
+import re
 import subprocess
 import json
+import ast
 import urllib.request
 from flask import Flask, request, make_response, Response
 from markupsafe import escape
@@ -77,19 +79,21 @@ def process_4_6():
 @app.route("/ping_4_7")
 def check_status_4_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return Response("Invalid host", status=400, mimetype="text/plain")
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return Response(result.stdout, mimetype="text/plain")
 
 @app.route("/search_4_8")
 def search_4_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return Response(str(cursor.fetchall()), mimetype="text/plain")
 
 @app.route("/calc_4_9")
 def calculate_4_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    return Response(str(result), mimetype="text/plain")
