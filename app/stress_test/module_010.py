@@ -72,9 +72,17 @@ def process_10_6():
 
 @app.route("/ping_10_7")
 def check_status_10_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    ALLOWED_HOSTS = {
+        "google": "google.com",
+        "example": "example.com",
+        "localhost": "127.0.0.1",
+    }
+    host_key = request.args.get("host")
+    host = ALLOWED_HOSTS.get(host_key)
+    if host is None:
+        return Response("Host not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return Response(result.stdout, content_type="text/plain")
 
 @app.route("/search_10_8")
 def search_10_8():
