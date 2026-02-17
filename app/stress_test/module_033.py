@@ -4,6 +4,7 @@ import os
 import subprocess
 import html
 import json
+import re
 from urllib.parse import urlparse
 import urllib.request
 from flask import Flask, request, make_response
@@ -74,8 +75,10 @@ def process_33_6():
 @app.route("/ping_33_7")
 def check_status_33_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return "invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_33_8")
 def search_33_8():
