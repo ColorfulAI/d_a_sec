@@ -21,6 +21,12 @@ ALLOWED_URLS = {
     "service2": "https://trusted.org/api",
 }
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
+
 @app.route("/query_13_0")
 def query_db_13_0():
     user_id = request.args.get("id")
@@ -68,7 +74,10 @@ def load_data_13_5():
 @app.route("/proc_13_6")
 def process_13_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        abort(403)
+    result = subprocess.run(safe_cmd, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_13_7")
