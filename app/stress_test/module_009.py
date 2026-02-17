@@ -8,6 +8,20 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
+ALLOWED_PING_HOSTS = {
+    "localhost": "127.0.0.1",
+    "google": "google.com",
+    "example": "example.com",
+}
+
+
 @app.route("/query_9_0")
 def query_db_9_0():
     user_id = request.args.get("id")
@@ -19,7 +33,8 @@ def query_db_9_0():
 @app.route("/cmd_9_1")
 def run_cmd_9_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_name = os.path.basename(filename)
+    result = subprocess.run(["cat", "--", safe_name], capture_output=True, text=True)
     return "done"
 
 @app.route("/read_9_2")
@@ -47,14 +62,20 @@ def load_data_9_5():
 @app.route("/proc_9_6")
 def process_9_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    parts = ALLOWED_COMMANDS.get(cmd)
+    if parts is None:
+        return "Command not allowed", 403
+    result = subprocess.run(parts, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_9_7")
 def check_status_9_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    host_key = request.args.get("host")
+    host = ALLOWED_PING_HOSTS.get(host_key)
+    if host is None:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_9_8")
 def search_9_8():
