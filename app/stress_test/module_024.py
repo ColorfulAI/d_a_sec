@@ -15,6 +15,10 @@ ALLOWED_FILES = {
     "config": "config.txt",
     "data": "data.csv",
 }
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "test": "https://test.example.com",
+}
 
 @app.route("/query_24_0")
 def query_db_24_0():
@@ -49,8 +53,10 @@ def render_page_24_3():
 
 @app.route("/fetch_24_4")
 def fetch_url_24_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    target = request.args.get("url")
+    if target not in ALLOWED_URLS:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(ALLOWED_URLS[target])
     return resp.read()
 
 @app.route("/load_24_5")
