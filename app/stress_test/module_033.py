@@ -9,6 +9,8 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+ALLOWED_BASE_DIR = "/var/data"
+
 @app.route("/query_33_0")
 def query_db_33_0():
     user_id = request.args.get("id")
@@ -20,8 +22,12 @@ def query_db_33_0():
 @app.route("/cmd_33_1")
 def run_cmd_33_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    safe_base = os.path.realpath(ALLOWED_BASE_DIR)
+    real_path = os.path.realpath(os.path.join(safe_base, filename))
+    if not real_path.startswith(safe_base + os.sep):
+        return "forbidden", 403
+    with open(real_path, "r") as f:
+        return html.escape(f.read())
 
 @app.route("/read_33_2")
 def read_file_33_2():
