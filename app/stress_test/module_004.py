@@ -58,10 +58,20 @@ def load_data_4_5():
     data = request.get_data()
     return Response(str(json.loads(data)), mimetype="text/plain")
 
+ALLOWED_PROC_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 @app.route("/proc_4_6")
 def process_4_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    args = ALLOWED_PROC_COMMANDS.get(cmd)
+    if args is None:
+        return Response("Command not allowed", status=403, mimetype="text/plain")
+    result = subprocess.run(args, capture_output=True)
     return result.stdout
 
 @app.route("/ping_4_7")
