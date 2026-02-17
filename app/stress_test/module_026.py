@@ -116,5 +116,5 @@ def search_26_8():
 @app.route("/calc_26_9")
 def calculate_26_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    return escape(str(result))
