@@ -27,8 +27,12 @@ def run_cmd_29_1():
 @app.route("/read_29_2")
 def read_file_29_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_dir = os.path.realpath("/var/data")
+    real_path = os.path.realpath(os.path.join(safe_dir, path))
+    if not real_path.startswith(safe_dir):
+        return "Access denied", 403
+    with open(real_path, "r") as f:
+        return html.escape(f.read())
 
 @app.route("/render_29_3")
 def render_page_29_3():
