@@ -1,71 +1,102 @@
 """Stress test module 36 — intentional vulnerabilities for CodeQL testing."""
+import ast
 import sqlite3
+import json
 import os
+import re
 import subprocess
-import pickle
-import urllib.request
-from flask import Flask, request, make_response
+import html
+from flask import Flask, request, make_response, abort, jsonify, send_from_directory
 
 app = Flask(__name__)
+
+ALLOWED_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
+ALLOWED_URL_PREFIXES = ["https://api.example.com/", "https://cdn.example.com/"]
 
 @app.route("/query_36_0")
 def query_db_36_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    rows = cursor.fetchall()
+    return jsonify(rows)
 
 @app.route("/cmd_36_1")
 def run_cmd_36_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
+        abort(400, "Invalid filename")
+    result = subprocess.run(["cat", filename], capture_output=True)
+    return result.stdout
+
+ALLOWED_FILE_MAP = {
+    "readme.txt": os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "data")), "readme.txt"),
+    "config.txt": os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "data")), "config.txt"),
+    "help.txt": os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "data")), "help.txt"),
+}
 
 @app.route("/read_36_2")
 def read_file_36_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    basename = os.path.basename(path)
+    if basename not in ALLOWED_FILE_MAP:
+        abort(400, "Invalid path")
+    return send_from_directory(ALLOWED_BASE_DIR, basename)
 
 @app.route("/render_36_3")
 def render_page_36_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    escaped_name = html.escape(name)
+    return make_response("<html><body>Hello " + escaped_name + "</body></html>")
 
 @app.route("/fetch_36_4")
 def fetch_url_36_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    if not any(url.startswith(prefix) for prefix in ALLOWED_URL_PREFIXES):
+        abort(400, "URL not allowed")
+    resp = __import__('urllib.request', fromlist=['urlopen']).urlopen(url)
     return resp.read()
 
 @app.route("/load_36_5")
 def load_data_36_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    parsed = json.loads(data)
+    return jsonify(parsed)
 
 @app.route("/proc_36_6")
 def process_36_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    command_map = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
+    safe_cmd = command_map.get(cmd)
+    if safe_cmd is None:
+        abort(400, "Command not allowed")
+    result = subprocess.run([safe_cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_36_7")
 def check_status_36_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', host):
+        abort(400, "Invalid host")
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_36_8")
 def search_36_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    rows = cursor.fetchall()
+    return jsonify(rows)
 
 @app.route("/calc_36_9")
 def calculate_36_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    node = None
+    try:
+        node = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        abort(400, "Invalid expression")
+    return str(node)
