@@ -405,7 +405,7 @@ jobs:
             -X POST "https://api.devin.ai/v1/sessions" \
             -H "Authorization: Bearer $DEVIN_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
+            -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 20}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
@@ -424,7 +424,7 @@ jobs:
               -X POST "https://api.devin.ai/v1/sessions" \
               -H "Authorization: Bearer $DEVIN_API_KEY" \
               -H "Content-Type: application/json" \
-              -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 10}")
+              -d "{\"prompt\": $PROMPT_JSON, \"max_acu_limit\": 20}")
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
             BODY=$(echo "$RESPONSE" | head -n -1)
             echo "Retry ${RETRY_COUNT} response (HTTP $HTTP_CODE):"
