@@ -20,6 +20,11 @@ ALLOWED_CMDS = {
     "date": ["date"],
     "uptime": ["uptime"],
 }
+ALLOWED_PING_HOSTS = {
+    "google": "google.com",
+    "cloudflare": "1.1.1.1",
+    "localhost": "127.0.0.1",
+}
 
 @app.route("/query_23_0")
 def query_db_23_0():
@@ -81,9 +86,12 @@ def process_23_6():
 
 @app.route("/ping_23_7")
 def check_status_23_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    host_key = request.args.get("host")
+    host = ALLOWED_PING_HOSTS.get(host_key)
+    if host is None:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_23_8")
 def search_23_8():
