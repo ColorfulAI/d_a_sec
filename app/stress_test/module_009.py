@@ -5,6 +5,7 @@ import subprocess
 import json
 import urllib.request
 from flask import Flask, request, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -41,7 +42,7 @@ def query_db_9_0():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return str(cursor.fetchall())
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_9_1")
 def run_cmd_9_1():
@@ -62,12 +63,12 @@ def read_file_9_2():
         return "File not allowed", 403
     safe_path = os.path.join(SAFE_BASE_DIR, safe_name)
     with open(safe_path, "r") as f:
-        return f.read()
+        return escape(f.read())
 
 @app.route("/render_9_3")
 def render_page_9_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_9_4")
 def fetch_url_9_4():
@@ -81,7 +82,7 @@ def fetch_url_9_4():
 @app.route("/load_9_5")
 def load_data_9_5():
     data = request.get_data()
-    return str(json.loads(data))
+    return escape(str(json.loads(data)))
 
 @app.route("/proc_9_6")
 def process_9_6():
@@ -107,7 +108,7 @@ def search_9_8():
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
-    return str(cursor.fetchall())
+    return escape(str(cursor.fetchall()))
 
 @app.route("/calc_9_9")
 def calculate_9_9():
