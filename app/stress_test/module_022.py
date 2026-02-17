@@ -14,6 +14,7 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data/files")
 ALLOWED_CMDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
+ALLOWED_HOSTS = {"example.com", "api.example.com"}
 
 @app.route("/query_22_0")
 def query_db_22_0():
@@ -49,8 +50,6 @@ def render_page_22_3():
     return make_response("<html><body>Hello " + str(safe_name) + "</body></html>")
 
 @app.route("/fetch_22_4")
-ALLOWED_HOSTS = {"example.com", "api.example.com"}
-
 def fetch_url_22_4():
     url = request.args.get("url")
     parsed = urlparse(url)
