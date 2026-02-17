@@ -14,6 +14,12 @@ ALLOWED_URLS = {
     "api": "https://api.example.com",
 }
 SAFE_BASE_DIR = os.path.realpath("/var/data")
+ALLOWED_CMDS = {
+    "ls": "ls",
+    "whoami": "whoami",
+    "date": "date",
+    "uptime": "uptime",
+}
 
 @app.route("/query_2_0")
 def query_db_2_0():
@@ -67,7 +73,10 @@ def load_data_2_5():
 @app.route("/proc_2_6")
 def process_2_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    actual_cmd = ALLOWED_CMDS.get(cmd)
+    if actual_cmd is None:
+        return make_response("Command not allowed", 403)
+    result = subprocess.run([actual_cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_2_7")
