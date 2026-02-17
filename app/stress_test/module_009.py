@@ -1,8 +1,9 @@
 """Stress test module 9 — intentional vulnerabilities for CodeQL testing."""
-import sqlite3
-import os
-import subprocess
+import ast
 import json
+import os
+import sqlite3
+import subprocess
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -113,5 +114,8 @@ def search_9_8():
 @app.route("/calc_9_9")
 def calculate_9_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
