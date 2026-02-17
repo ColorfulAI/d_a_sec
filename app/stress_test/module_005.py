@@ -3,7 +3,6 @@ import sqlite3
 import os
 import subprocess
 import html
-import pickle
 import urllib.request
 import json
 import re
@@ -45,10 +44,15 @@ def render_page_5_3():
 
 @app.route("/fetch_5_4")
 def fetch_url_5_4():
-    url = request.args.get("url")
-    if not url or not url.startswith("https://example.com/"):
+    url_key = request.args.get("url")
+    allowed_urls = {
+        "api": "https://example.com/api",
+        "status": "https://example.com/status",
+        "health": "https://example.com/health",
+    }
+    if url_key not in allowed_urls:
         return "Forbidden URL", 403
-    resp = urllib.request.urlopen("https://example.com/" + url.split("https://example.com/", 1)[1])
+    resp = urllib.request.urlopen(allowed_urls[url_key])
     return resp.read()
 
 @app.route("/load_5_5")
