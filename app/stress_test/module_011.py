@@ -24,7 +24,11 @@ def query_db_11_0():
 @app.route("/cmd_11_1")
 def run_cmd_11_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    allowed = {"readme": "readme.txt", "help": "help.txt", "status": "status.txt"}
+    safe_name = allowed.get(filename)
+    if safe_name is None:
+        return "File not allowed", 400
+    subprocess.run(["cat", os.path.join(SAFE_BASE_DIR, safe_name)], capture_output=True)
     return "done"
 
 @app.route("/read_11_2")
