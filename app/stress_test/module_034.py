@@ -9,6 +9,12 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+ALLOWED_CAT_FILES = {
+    "readme": "readme.txt",
+    "config": "config.txt",
+    "status": "status.txt",
+}
+
 @app.route("/query_34_0")
 def query_db_34_0():
     user_id = request.args.get("id")
@@ -20,7 +26,9 @@ def query_db_34_0():
 @app.route("/cmd_34_1")
 def run_cmd_34_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if filename not in ALLOWED_CAT_FILES:
+        return "File not allowed", 403
+    subprocess.run(["cat", ALLOWED_CAT_FILES[filename]], check=False)
     return "done"
 
 @app.route("/read_34_2")
