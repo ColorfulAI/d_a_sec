@@ -72,8 +72,10 @@ def process_20_6():
 @app.route("/ping_20_7")
 def check_status_20_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', host):
+        return "invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_20_8")
 def search_20_8():
