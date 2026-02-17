@@ -2,11 +2,14 @@
 import sqlite3
 import os
 import subprocess
-import pickle
 import urllib.request
 from html import escape as html_escape
 from flask import Flask, request, make_response
 
+ALLOWED_URLS = {
+    "example": "https://example.com/",
+    "api": "https://api.example.com/",
+}
 ALLOWED_BASE_DIR = "/var/data"
 
 app = Flask(__name__)
@@ -41,8 +44,10 @@ def render_page_30_3():
 
 @app.route("/fetch_30_4")
 def fetch_url_30_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    if url_key not in ALLOWED_URLS:
+        return make_response("URL not allowed", 403)
+    resp = urllib.request.urlopen(ALLOWED_URLS[url_key])
     return resp.read()
 
 @app.route("/load_30_5")
