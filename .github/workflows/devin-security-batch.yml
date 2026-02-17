@@ -537,6 +537,35 @@ jobs:
           echo "completed=false" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------
+      # STEP 3a: Terminate session to free concurrent slot (Bug #62 fix)
+      # CRITICAL: "blocked" and "finished" sessions still occupy concurrent
+      # session slots. Without explicit termination, zombie sessions exhaust
+      # all 5 slots, causing 7-48 min gaps between waves while waiting for
+      # Devin's auto-cleanup. This was the root cause of Bug #61.
+      # Terminating immediately frees the slot for the next batch.
+      # ----------------------------------------------------------------
+      - name: Terminate Devin session to free slot
+        id: terminate-session
+        if: always() && steps.create-session.outputs.session_created == 'true'
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          SESSION_ID: ${{ steps.create-session.outputs.session_id }}
+        run: |
+          echo "Terminating session $SESSION_ID to free concurrent slot..."
+          HTTP_CODE=$(curl -s -o /tmp/terminate_resp.json -w "%{http_code}" \
+            -X DELETE "https://api.devin.ai/v1/sessions/$SESSION_ID" \
+            -H "Authorization: Bearer $DEVIN_API_KEY")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Session $SESSION_ID terminated successfully (HTTP $HTTP_CODE) — slot freed"
+          elif [ "$HTTP_CODE" = "422" ]; then
+            echo "Session $SESSION_ID already in terminal state (HTTP $HTTP_CODE) — slot may already be free"
+          else
+            echo "::warning::Failed to terminate session $SESSION_ID (HTTP $HTTP_CODE)"
+            cat /tmp/terminate_resp.json 2>/dev/null || true
+          fi
+
+      # ----------------------------------------------------------------
       # STEP 3b: Verify fixes with CodeQL (Bug #42 fix)
       # After Devin pushes fixes, run CodeQL locally with the EXACT same
       # configuration as CI to verify fixes before creating the PR.
