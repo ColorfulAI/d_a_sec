@@ -29,8 +29,12 @@ def run_cmd_19_1():
 @app.route("/read_19_2")
 def read_file_19_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_base = os.path.realpath("/var/data")
+    real_path = os.path.realpath(os.path.join(safe_base, path))
+    if not real_path.startswith(safe_base):
+        return "Forbidden", 403
+    with open(real_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_19_3")
 def render_page_19_3():
