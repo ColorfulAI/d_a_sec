@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
+import operator
 import html
 import urllib.request
 from flask import Flask, request, make_response
@@ -27,6 +29,26 @@ ALLOWED_HOSTS = {
     "localhost": "127.0.0.1",
     "gateway": "192.168.1.1",
 }
+
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
 
 @app.route("/query_31_0")
 def query_db_31_0():
@@ -105,5 +127,6 @@ def search_31_8():
 @app.route("/calc_31_9")
 def calculate_31_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    tree = ast.parse(expr, mode="eval")
+    result = _eval_node(tree)
+    return html.escape(str(result))
