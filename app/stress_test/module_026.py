@@ -52,9 +52,19 @@ def render_page_26_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
+
 @app.route("/fetch_26_4")
 def fetch_url_26_4():
-    url = request.args.get("url")
+    import urllib.request
+    service = request.args.get("url")
+    url = ALLOWED_URLS.get(service)
+    if url is None:
+        return "Invalid service", 400
     resp = urllib.request.urlopen(url)
     return resp.read()
 
