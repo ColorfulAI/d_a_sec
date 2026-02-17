@@ -12,6 +12,13 @@ ALLOWED_URLS = {
     "status": "https://example.com/status",
 }
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 ALLOWED_FILES = {
     "readme": "/var/data/readme.txt",
     "config": "/var/data/config.txt",
@@ -64,7 +71,10 @@ def load_data_32_5():
 @app.route("/proc_32_6")
 def process_32_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    args = ALLOWED_COMMANDS.get(cmd)
+    if args is None:
+        return "Command not allowed", 403
+    result = subprocess.run(args, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_32_7")
