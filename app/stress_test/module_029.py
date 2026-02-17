@@ -39,10 +39,18 @@ def render_page_29_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + html.escape(name) + "</body></html>")
 
+ALLOWED_FETCH_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
 @app.route("/fetch_29_4")
 def fetch_url_29_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    safe_url = ALLOWED_FETCH_URLS.get(url_key)
+    if safe_url is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_29_5")
