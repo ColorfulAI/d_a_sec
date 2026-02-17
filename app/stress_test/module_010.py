@@ -58,9 +58,17 @@ def load_data_10_5():
 
 @app.route("/proc_10_6")
 def process_10_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    ALLOWED_COMMANDS = {
+        "ls": ["ls"],
+        "date": ["date"],
+        "whoami": ["whoami"],
+    }
+    cmd_key = request.args.get("cmd")
+    cmd_args = ALLOWED_COMMANDS.get(cmd_key)
+    if cmd_args is None:
+        return Response("Command not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(cmd_args, capture_output=True)
+    return Response(result.stdout, content_type="text/plain")
 
 @app.route("/ping_10_7")
 def check_status_10_7():
