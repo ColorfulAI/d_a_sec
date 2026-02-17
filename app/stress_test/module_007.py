@@ -2,7 +2,6 @@
 import sqlite3
 import os
 import subprocess
-import pickle
 import json
 import ast
 import re
