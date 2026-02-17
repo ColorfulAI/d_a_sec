@@ -9,6 +9,10 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 @app.route("/query_2_0")
@@ -46,8 +50,11 @@ def render_page_2_3():
 
 @app.route("/fetch_2_4")
 def fetch_url_2_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    target_url = ALLOWED_URLS.get(url_key)
+    if target_url is None:
+        return make_response("URL not allowed", 403)
+    resp = urllib.request.urlopen(target_url)
     return resp.read()
 
 @app.route("/load_2_5")
