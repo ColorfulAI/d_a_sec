@@ -26,8 +26,12 @@ def run_cmd_10_1():
 @app.route("/read_10_2")
 def read_file_10_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_base = os.path.realpath(os.path.join(os.path.dirname(__file__), "data"))
+    real_path = os.path.normpath(os.path.join(safe_base, path))
+    if not real_path.startswith(safe_base):
+        return Response("Access denied", status=403, content_type="text/plain")
+    with open(real_path, "r") as f:
+        return Response(escape(f.read()), content_type="text/plain")
 
 @app.route("/render_10_3")
 def render_page_10_3():
