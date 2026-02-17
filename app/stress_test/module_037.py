@@ -60,7 +60,7 @@ def fetch_url_37_4():
 def load_data_37_5():
     data = request.get_data()
     obj = json.loads(data)
-    return str(obj)
+    return make_response(escape(str(obj)))
 
 @app.route("/proc_37_6")
 def process_37_6():
