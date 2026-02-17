@@ -6,6 +6,7 @@ import pickle
 import re
 import urllib.request
 from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
 
@@ -41,7 +42,8 @@ def read_file_22_2():
 @app.route("/render_22_3")
 def render_page_22_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    safe_name = escape(name)
+    return make_response("<html><body>Hello " + str(safe_name) + "</body></html>")
 
 @app.route("/fetch_22_4")
 def fetch_url_22_4():
