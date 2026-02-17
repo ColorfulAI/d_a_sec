@@ -2,7 +2,7 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
 import urllib.request
 from flask import Flask, request, make_response, jsonify
 from markupsafe import escape
@@ -58,7 +58,8 @@ def fetch_url_6_4():
 @app.route("/load_6_5")
 def load_data_6_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    obj = json.loads(data)
+    return jsonify(obj)
 
 @app.route("/proc_6_6")
 def process_6_6():
