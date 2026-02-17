@@ -46,8 +46,14 @@ def render_page_21_3():
 
 @app.route("/fetch_21_4")
 def fetch_url_21_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    allowed_urls = {
+        "status": "https://api.example.com/status",
+        "health": "https://api.example.com/health",
+    }
+    if key not in allowed_urls:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(allowed_urls[key])
     return resp.read()
 
 @app.route("/load_21_5")
