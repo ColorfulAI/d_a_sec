@@ -1,5 +1,7 @@
 """Stress test module 36 — intentional vulnerabilities for CodeQL testing."""
+import ast
 import json
+import operator
 import os
 import re
 import sqlite3
@@ -20,6 +22,27 @@ ALLOWED_COMMANDS = {
     "date": ["date"],
     "whoami": ["whoami"],
 }
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in SAFE_OPS:
+        return SAFE_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval_expr(expr_str):
+    tree = ast.parse(expr_str, mode='eval')
+    return _eval_node(tree.body)
 
 @app.route("/query_36_0")
 def query_db_36_0():
@@ -95,5 +118,8 @@ def search_36_8():
 @app.route("/calc_36_9")
 def calculate_36_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        result = safe_eval_expr(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
