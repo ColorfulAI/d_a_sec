@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import subprocess
+import ast
 import json
 import re
 import urllib.request
@@ -87,5 +88,7 @@ def search_19_8():
 @app.route("/calc_19_9")
 def calculate_19_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    if not re.match(r'^[0-9+\-*/().\s]+$', expr):
+        return "Invalid expression", 400
+    result = ast.literal_eval(expr)
     return str(result)
