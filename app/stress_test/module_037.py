@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
+import operator
 import re
 import urllib.request
 from flask import Flask, request, make_response
@@ -88,8 +90,31 @@ def search_37_8():
     result = cursor.fetchall()
     return make_response(escape(str(result)))
 
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval(expr):
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree.body)
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        return _SAFE_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
 @app.route("/calc_37_9")
 def calculate_37_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = _safe_eval(expr)
     return str(result)
