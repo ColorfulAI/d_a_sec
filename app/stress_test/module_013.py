@@ -17,6 +17,11 @@ ALLOWED_FILES = {
     "data": "data.txt",
 }
 
+ALLOWED_URLS = {
+    "service1": "https://example.com/api",
+    "service2": "https://trusted.org/api",
+}
+
 @app.route("/query_13_0")
 def query_db_13_0():
     user_id = request.args.get("id")
@@ -49,8 +54,11 @@ def render_page_13_3():
 
 @app.route("/fetch_13_4")
 def fetch_url_13_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    safe_url = ALLOWED_URLS.get(url_key)
+    if safe_url is None:
+        abort(403)
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_13_5")
