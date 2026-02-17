@@ -22,11 +22,16 @@ def run_cmd_4_1():
     subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
+ALLOWED_BASE_DIR = os.path.realpath("/srv/data")
+
 @app.route("/read_4_2")
 def read_file_4_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(ALLOWED_BASE_DIR):
+        return Response("Forbidden", status=403, mimetype="text/plain")
+    with open(real_path, "r") as f:
+        return Response(f.read(), mimetype="text/plain")
 
 @app.route("/render_4_3")
 def render_page_4_3():
