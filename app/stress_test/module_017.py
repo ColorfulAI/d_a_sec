@@ -41,10 +41,15 @@ def render_page_17_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+FETCH_TARGETS = {"example": "http://example.com", "api": "http://api.example.com"}
+
 @app.route("/fetch_17_4")
 def fetch_url_17_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    service = request.args.get("url")
+    target = FETCH_TARGETS.get(service)
+    if target is None:
+        return make_response("Service not found", 404)
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_17_5")
