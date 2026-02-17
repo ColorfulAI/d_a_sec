@@ -12,6 +12,7 @@ ALLOWED_BASE_DIR = os.path.abspath("data")
 ALLOWED_URL_SCHEMES = {"https"}
 ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
 ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "example.com"}
 
 app = Flask(__name__)
 
@@ -74,8 +75,10 @@ def process_28_6():
 @app.route("/ping_28_7")
 def check_status_28_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if host not in ALLOWED_HOSTS:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_28_8")
 def search_28_8():
