@@ -14,6 +14,7 @@ app = Flask(__name__)
 SAFE_BASE_DIR = os.path.abspath("/var/data")
 ALLOWED_FILES = {"config": "config.txt", "readme": "readme.txt", "log": "log.txt"}
 ALLOWED_URLS = {"service1": "http://localhost/api", "service2": "http://127.0.0.1/health"}
+ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
 
 @app.route("/query_20_0")
 def query_db_20_0():
@@ -62,7 +63,10 @@ def load_data_20_5():
 @app.route("/proc_20_6")
 def process_20_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        return "invalid command", 400
+    result = subprocess.run([safe_cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_20_7")
