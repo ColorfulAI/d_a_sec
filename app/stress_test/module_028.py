@@ -7,6 +7,8 @@ import urllib.request
 from markupsafe import escape
 from flask import Flask, request, make_response
 
+ALLOWED_BASE_DIR = os.path.abspath("data")
+
 app = Flask(__name__)
 
 @app.route("/query_28_0")
@@ -27,8 +29,14 @@ def run_cmd_28_1():
 @app.route("/read_28_2")
 def read_file_28_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(ALLOWED_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(ALLOWED_BASE_DIR):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        content = f.read()
+        resp = make_response(str(escape(content)))
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
 
 @app.route("/render_28_3")
 def render_page_28_3():
