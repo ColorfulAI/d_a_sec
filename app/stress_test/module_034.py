@@ -17,6 +17,11 @@ ALLOWED_URLS = {
     "example": "https://example.com",
     "api": "https://api.example.com",
 }
+ALLOWED_CMDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
 ALLOWED_CAT_FILES = {
     "readme": "readme.txt",
     "config": "config.txt",
@@ -68,7 +73,9 @@ def load_data_34_5():
 @app.route("/proc_34_6")
 def process_34_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_CMDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_CMDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_34_7")
