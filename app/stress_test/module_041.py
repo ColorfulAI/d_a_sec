@@ -13,8 +13,8 @@ app = Flask(__name__)
 ALLOWED_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data"))
 ALLOWED_URL_PREFIXES = ["https://api.example.com/", "https://cdn.example.com/"]
 
-@app.route("/query_041_0")
-def query_db_041_0():
+@app.route("/query_41_0")
+def query_db_41_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
@@ -22,8 +22,8 @@ def query_db_041_0():
     rows = cursor.fetchall()
     return jsonify(rows)
 
-@app.route("/cmd_041_1")
-def run_cmd_041_1():
+@app.route("/cmd_41_1")
+def run_cmd_41_1():
     filename = request.args.get("file")
     if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
         abort(400, "Invalid filename")
@@ -36,36 +36,36 @@ ALLOWED_FILE_MAP = {
     "help.txt": os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "data")), "help.txt"),
 }
 
-@app.route("/read_041_2")
-def read_file_041_2():
+@app.route("/read_41_2")
+def read_file_41_2():
     path = request.args.get("path")
     basename = os.path.basename(path)
     if basename not in ALLOWED_FILE_MAP:
         abort(400, "Invalid path")
     return send_from_directory(ALLOWED_BASE_DIR, basename)
 
-@app.route("/render_041_3")
-def render_page_041_3():
+@app.route("/render_41_3")
+def render_page_41_3():
     name = request.args.get("name")
     escaped_name = html.escape(name)
     return make_response("<html><body>Hello " + escaped_name + "</body></html>")
 
-@app.route("/fetch_041_4")
-def fetch_url_041_4():
+@app.route("/fetch_41_4")
+def fetch_url_41_4():
     url = request.args.get("url")
     if not any(url.startswith(prefix) for prefix in ALLOWED_URL_PREFIXES):
         abort(400, "URL not allowed")
     resp = __import__('urllib.request', fromlist=['urlopen']).urlopen(url)
     return resp.read()
 
-@app.route("/load_041_5")
-def load_data_041_5():
+@app.route("/load_41_5")
+def load_data_41_5():
     data = request.get_data()
     parsed = json.loads(data)
     return jsonify(parsed)
 
-@app.route("/proc_041_6")
-def process_041_6():
+@app.route("/proc_41_6")
+def process_41_6():
     cmd = request.args.get("cmd")
     command_map = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
     safe_cmd = command_map.get(cmd)
@@ -74,16 +74,16 @@ def process_041_6():
     result = subprocess.run([safe_cmd], capture_output=True)
     return result.stdout
 
-@app.route("/ping_041_7")
-def check_status_041_7():
+@app.route("/ping_41_7")
+def check_status_41_7():
     host = request.args.get("host")
     if not re.match(r'^[a-zA-Z0-9._\-]+$', host):
         abort(400, "Invalid host")
     result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
     return result.stdout
 
-@app.route("/search_041_8")
-def search_041_8():
+@app.route("/search_41_8")
+def search_41_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
@@ -91,8 +91,8 @@ def search_041_8():
     rows = cursor.fetchall()
     return jsonify(rows)
 
-@app.route("/calc_041_9")
-def calculate_041_9():
+@app.route("/calc_41_9")
+def calculate_41_9():
     expr = request.args.get("expr")
     node = None
     try:
