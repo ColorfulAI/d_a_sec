@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
 import urllib.request
 from urllib.parse import urlparse
 from markupsafe import escape
@@ -91,5 +92,5 @@ def search_28_8():
 @app.route("/calc_28_9")
 def calculate_28_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    return str(escape(str(result)))
