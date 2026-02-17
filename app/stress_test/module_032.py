@@ -7,6 +7,11 @@ import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
+ALLOWED_FILES = {
+    "readme": "/var/data/readme.txt",
+    "config": "/var/data/config.txt",
+}
+
 app = Flask(__name__)
 
 @app.route("/query_32_0")
@@ -25,9 +30,12 @@ def run_cmd_32_1():
 
 @app.route("/read_32_2")
 def read_file_32_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    path_key = request.args.get("path")
+    real_path = ALLOWED_FILES.get(path_key)
+    if real_path is None:
+        return "File not allowed", 403
+    with open(real_path, "r") as f:
+        return str(escape(f.read()))
 
 @app.route("/render_32_3")
 def render_page_32_3():
