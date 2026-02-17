@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
 import re
 from urllib.parse import urlparse
 import urllib.request
@@ -94,5 +95,5 @@ def search_22_8():
 @app.route("/calc_22_9")
 def calculate_22_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
