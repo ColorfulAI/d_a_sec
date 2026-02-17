@@ -40,9 +40,16 @@ def render_page_10_3():
 
 @app.route("/fetch_10_4")
 def fetch_url_10_4():
-    url = request.args.get("url")
+    ALLOWED_URLS = {
+        "example": "https://example.com/",
+        "api": "https://api.example.com/",
+    }
+    url_key = request.args.get("url")
+    url = ALLOWED_URLS.get(url_key)
+    if url is None:
+        return Response("URL not allowed", status=403, content_type="text/plain")
     resp = urllib.request.urlopen(url)
-    return resp.read()
+    return Response(resp.read(), content_type="text/plain")
 
 @app.route("/load_10_5")
 def load_data_10_5():
