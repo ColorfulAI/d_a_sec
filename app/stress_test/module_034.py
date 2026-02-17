@@ -9,6 +9,10 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+ALLOWED_READ_PATHS = {
+    "log": "/var/data/log.txt",
+    "config": "/var/data/config.txt",
+}
 ALLOWED_CAT_FILES = {
     "readme": "readme.txt",
     "config": "config.txt",
@@ -34,7 +38,9 @@ def run_cmd_34_1():
 @app.route("/read_34_2")
 def read_file_34_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
+    if path not in ALLOWED_READ_PATHS:
+        return "Access denied", 403
+    with open(ALLOWED_READ_PATHS[path], "r") as f:
         return f.read()
 
 @app.route("/render_34_3")
