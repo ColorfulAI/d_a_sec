@@ -38,7 +38,7 @@ def read_file_31_2():
     if not safe_path.startswith(base + os.sep):
         return "Access denied", 403
     with open(safe_path, "r") as f:
-        return f.read()
+        return html.escape(f.read())
 
 @app.route("/render_31_3")
 def render_page_31_3():
