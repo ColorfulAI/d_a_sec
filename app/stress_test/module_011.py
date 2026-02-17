@@ -51,7 +51,11 @@ def render_page_11_3():
 
 @app.route("/fetch_11_4")
 def fetch_url_11_4():
-    url = request.args.get("url")
+    url_key = request.args.get("url")
+    allowed_urls = {"example": "https://example.com", "api": "https://api.example.com"}
+    url = allowed_urls.get(url_key)
+    if url is None:
+        return "URL not allowed", 400
     resp = urllib.request.urlopen(url)
     return resp.read()
 
