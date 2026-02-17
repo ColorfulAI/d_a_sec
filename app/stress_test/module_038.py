@@ -12,6 +12,7 @@ app = Flask(__name__)
 ALLOWED_BASE_DIR = os.path.abspath(".")
 ALLOWED_FILES = {"readme": "readme.txt", "config": "config.txt", "data": "data.csv"}
 ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
+ALLOWED_COMMANDS = {"ls": ["ls"], "pwd": ["pwd"], "whoami": ["whoami"]}
 
 @app.route("/query_38_0")
 def query_db_38_0():
@@ -58,7 +59,9 @@ def load_data_38_5():
 @app.route("/proc_38_6")
 def process_38_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_38_7")
