@@ -23,6 +23,11 @@ ALLOWED_COMMANDS = {
     "uptime": ["uptime"],
 }
 
+ALLOWED_HOSTS = {
+    "localhost": "127.0.0.1",
+    "gateway": "192.168.1.1",
+}
+
 @app.route("/query_31_0")
 def query_db_31_0():
     user_id = request.args.get("id")
@@ -83,8 +88,11 @@ def process_31_6():
 @app.route("/ping_31_7")
 def check_status_31_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    safe_host = ALLOWED_HOSTS.get(host)
+    if safe_host is None:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", safe_host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_31_8")
 def search_31_8():
