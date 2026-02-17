@@ -47,8 +47,14 @@ def render_page_7_3():
 
 @app.route("/fetch_7_4")
 def fetch_url_7_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    target = request.args.get("url")
+    host_map = {h: h for h in ALLOWED_HOSTS}
+    parsed = urlparse(target)
+    safe_host = host_map.get(parsed.hostname)
+    if safe_host is None:
+        return "URL not allowed", 403
+    safe_url = "https://" + safe_host + "/"
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_7_5")
