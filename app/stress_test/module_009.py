@@ -13,7 +13,7 @@ def query_db_9_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     return str(cursor.fetchall())
 
 @app.route("/cmd_9_1")
@@ -61,7 +61,7 @@ def search_9_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
     return str(cursor.fetchall())
 
 @app.route("/calc_9_9")
