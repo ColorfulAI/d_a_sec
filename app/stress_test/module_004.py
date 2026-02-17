@@ -39,10 +39,18 @@ def render_page_4_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+ALLOWED_URL_TARGETS = {
+    "example": "https://example.com/api",
+    "status": "https://api.example.com/status",
+}
+
 @app.route("/fetch_4_4")
 def fetch_url_4_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    target = ALLOWED_URL_TARGETS.get(url)
+    if target is None:
+        return Response("Forbidden URL", status=403, mimetype="text/plain")
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_4_5")
