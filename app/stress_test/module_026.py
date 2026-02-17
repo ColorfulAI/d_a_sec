@@ -89,11 +89,21 @@ def process_26_6():
     result = subprocess.run(args, capture_output=True)
     return result.stdout
 
+ALLOWED_HOSTS = {
+    "localhost": "localhost",
+    "google": "google.com",
+    "dns": "8.8.8.8",
+}
+
+
 @app.route("/ping_26_7")
 def check_status_26_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    key = request.args.get("host")
+    host = ALLOWED_HOSTS.get(key)
+    if host is None:
+        return "Host not allowed", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_26_8")
 def search_26_8():
