@@ -1,4 +1,5 @@
 """Stress test module 27 — intentional vulnerabilities for CodeQL testing."""
+import ast
 import sqlite3
 import os
 import re
@@ -84,5 +85,14 @@ def search_27_8():
 @app.route("/calc_27_9")
 def calculate_27_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        tree = ast.parse(expr, mode='eval')
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                                    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+                                    ast.USub, ast.UAdd)):
+                return "Invalid expression", 400
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
