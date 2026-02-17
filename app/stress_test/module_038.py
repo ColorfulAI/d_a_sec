@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
 import re
 import urllib.request
 from markupsafe import escape
@@ -84,5 +85,8 @@ def search_38_8():
 @app.route("/calc_38_9")
 def calculate_38_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
