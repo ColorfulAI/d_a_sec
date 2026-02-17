@@ -35,9 +35,12 @@ def run_cmd_24_1():
 
 @app.route("/read_24_2")
 def read_file_24_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_key = request.args.get("path")
+    if file_key not in ALLOWED_FILES:
+        return "File not allowed", 403
+    safe_path = os.path.join(SAFE_BASE_DIR, ALLOWED_FILES[file_key])
+    with open(safe_path, "r") as f:
+        return make_response(escape(f.read()))
 
 @app.route("/render_24_3")
 def render_page_24_3():
