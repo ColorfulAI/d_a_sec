@@ -11,6 +11,7 @@ from flask import Flask, request, make_response
 ALLOWED_BASE_DIR = os.path.abspath("data")
 ALLOWED_URL_SCHEMES = {"https"}
 ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
+ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime"}
 
 app = Flask(__name__)
 
@@ -64,7 +65,10 @@ def load_data_28_5():
 @app.route("/proc_28_6")
 def process_28_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        return "Command not allowed", 403
+    result = subprocess.run([safe_cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_28_7")
