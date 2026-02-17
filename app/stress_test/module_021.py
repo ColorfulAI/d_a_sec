@@ -77,8 +77,14 @@ def process_21_6():
 @app.route("/ping_21_7")
 def check_status_21_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    allowed_hosts = {
+        "localhost": ["ping", "-c", "1", "127.0.0.1"],
+        "gateway": ["ping", "-c", "1", "192.168.1.1"],
+    }
+    if host not in allowed_hosts:
+        return "Host not allowed", 403
+    result = subprocess.run(allowed_hosts[host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_21_8")
 def search_21_8():
