@@ -1,6 +1,7 @@
 """Stress test module 27 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
 import os
+import re
 import subprocess
 import pickle
 import urllib.request
@@ -20,7 +21,9 @@ def query_db_27_0():
 @app.route("/cmd_27_1")
 def run_cmd_27_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
 @app.route("/read_27_2")
