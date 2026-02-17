@@ -21,6 +21,11 @@ ALLOWED_PING_HOSTS = {
     "example": "example.com",
 }
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
 SAFE_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "public"))
 
 ALLOWED_FILES = {
@@ -66,8 +71,11 @@ def render_page_9_3():
 
 @app.route("/fetch_9_4")
 def fetch_url_9_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    target = ALLOWED_URLS.get(url_key)
+    if target is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_9_5")
