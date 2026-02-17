@@ -15,6 +15,11 @@ ALLOWED_COMMANDS = {
     "date": ["date"],
     "uptime": ["uptime"],
 }
+ALLOWED_PING_HOSTS = {
+    "localhost": "localhost",
+    "127.0.0.1": "127.0.0.1",
+    "example.com": "example.com",
+}
 ALLOWED_URL_MAP = {
     "example": "https://example.com",
     "api": "https://api.example.com",
@@ -77,8 +82,11 @@ def process_25_6():
 @app.route("/ping_25_7")
 def check_status_25_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    safe_host = ALLOWED_PING_HOSTS.get(host)
+    if safe_host is None:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", safe_host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_25_8")
 def search_25_8():
