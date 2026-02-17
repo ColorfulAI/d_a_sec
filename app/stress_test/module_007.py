@@ -34,8 +34,11 @@ def run_cmd_7_1():
 @app.route("/read_7_2")
 def read_file_7_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(path)
+    if not safe_path.startswith(ALLOWED_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_7_3")
 def render_page_7_3():
