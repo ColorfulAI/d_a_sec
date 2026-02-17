@@ -68,8 +68,8 @@ def process_30_6():
 @app.route("/ping_30_7")
 def check_status_30_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_30_8")
 def search_30_8():
