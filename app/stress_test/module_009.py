@@ -21,6 +21,14 @@ ALLOWED_PING_HOSTS = {
     "example": "example.com",
 }
 
+SAFE_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "public"))
+
+ALLOWED_FILES = {
+    "readme": "readme.txt",
+    "config": "config.json",
+    "log": "app.log",
+}
+
 
 @app.route("/query_9_0")
 def query_db_9_0():
@@ -33,14 +41,22 @@ def query_db_9_0():
 @app.route("/cmd_9_1")
 def run_cmd_9_1():
     filename = request.args.get("file")
-    safe_name = os.path.basename(filename)
-    result = subprocess.run(["cat", "--", safe_name], capture_output=True, text=True)
+    safe_name = ALLOWED_FILES.get(filename)
+    if safe_name is None:
+        return "File not allowed", 403
+    safe_path = os.path.join(SAFE_BASE_DIR, safe_name)
+    with open(safe_path, "r") as f:
+        f.read()
     return "done"
 
 @app.route("/read_9_2")
 def read_file_9_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
+    safe_name = ALLOWED_FILES.get(path)
+    if safe_name is None:
+        return "File not allowed", 403
+    safe_path = os.path.join(SAFE_BASE_DIR, safe_name)
+    with open(safe_path, "r") as f:
         return f.read()
 
 @app.route("/render_9_3")
