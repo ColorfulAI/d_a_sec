@@ -41,7 +41,7 @@ def read_file_34_2():
     if path not in ALLOWED_READ_PATHS:
         return "Access denied", 403
     with open(ALLOWED_READ_PATHS[path], "r") as f:
-        return f.read()
+        return escape(f.read())
 
 @app.route("/render_34_3")
 def render_page_34_3():
