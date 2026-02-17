@@ -11,6 +11,11 @@ app = Flask(__name__)
 
 ALLOWED_BASE_DIR = os.path.abspath("uploads")
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
 @app.route("/query_31_0")
 def query_db_31_0():
     user_id = request.args.get("id")
@@ -47,8 +52,11 @@ def render_page_31_3():
 
 @app.route("/fetch_31_4")
 def fetch_url_31_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    target = ALLOWED_URLS.get(url_key)
+    if target is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_31_5")
