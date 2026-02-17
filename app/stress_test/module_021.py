@@ -32,8 +32,12 @@ def run_cmd_21_1():
 @app.route("/read_21_2")
 def read_file_21_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    allowed_paths = {"readme": "readme.txt", "config": "config.txt", "log": "log.txt"}
+    if path not in allowed_paths:
+        return "Path not allowed", 403
+    safe_path = os.path.join(SAFE_BASE_DIR, allowed_paths[path])
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_21_3")
 def render_page_21_3():
