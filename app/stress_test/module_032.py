@@ -7,6 +7,11 @@ import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "status": "https://example.com/status",
+}
+
 ALLOWED_FILES = {
     "readme": "/var/data/readme.txt",
     "config": "/var/data/config.txt",
@@ -44,7 +49,10 @@ def render_page_32_3():
 
 @app.route("/fetch_32_4")
 def fetch_url_32_4():
-    url = request.args.get("url")
+    url_key = request.args.get("url")
+    url = ALLOWED_URLS.get(url_key)
+    if url is None:
+        return "URL not allowed", 400
     resp = urllib.request.urlopen(url)
     return resp.read()
 
