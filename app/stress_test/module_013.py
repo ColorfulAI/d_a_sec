@@ -83,8 +83,10 @@ def process_13_6():
 @app.route("/ping_13_7")
 def check_status_13_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not host or not host.replace(".", "").replace("-", "").isalnum():
+        abort(400)
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_13_8")
 def search_13_8():
