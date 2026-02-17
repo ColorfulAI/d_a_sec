@@ -1,5 +1,6 @@
 """Stress test module 2 — intentional vulnerabilities for CodeQL testing."""
 import html
+import re
 import sqlite3
 import os
 import subprocess
@@ -82,8 +83,10 @@ def process_2_6():
 @app.route("/ping_2_7")
 def check_status_2_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return make_response("Invalid host", 400)
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_2_8")
 def search_2_8():
