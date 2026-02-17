@@ -1836,6 +1836,16 @@ With 48 remaining batches and a 60s poll interval, dispatch alone would take 48+
 
 **Impact**: Enables batches of 75-200+ alerts per session without hitting the prompt size limit. The summary-only prompt is sufficient because Devin can read the actual source files to understand the full context of each vulnerability.
 
+### Bug #64: Alert Fetch Crashes on Non-JSON API Response at High Page Counts
+
+**Problem discovered**: When fetching 700+ CodeQL alerts (8+ pages of 100), the GitHub API occasionally returns a non-JSON response (rate limit HTML, 5xx error) on later pages. The `jq` command crashes with `parse error: Invalid numeric literal at line 1, column 10`, failing the entire orchestrator run before any batches are created.
+
+**Root cause**: The alert fetch loop passed raw API responses to `jq` without validating they were valid JSON. GitHub's REST API can return HTML error pages on rate limits or transient server errors, especially on later pages of paginated results where the request takes longer.
+
+**Fix (Bug #64)**: Added retry-with-backoff around each page fetch. Each page gets 3 attempts with 10/20/30s delays. The response is validated with `jq empty` before processing. If all retries fail, the orchestrator gracefully falls back to using the alerts fetched so far (rather than crashing). Also added a 1s sleep between pages to reduce API pressure.
+
+**Impact**: Enables reliable fetching of 700+ alerts across 8+ pages without crashes. The graceful degradation means even partial fetches produce useful work instead of total failure.
+
 ---
 
 ## Limitations and Future Work

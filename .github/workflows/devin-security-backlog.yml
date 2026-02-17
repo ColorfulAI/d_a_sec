@@ -145,17 +145,36 @@ jobs:
           TOTAL_FETCHED=0
 
           while true; do
-            RESP=$(curl -s -L \
-              -H "Authorization: token $GH_PAT" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100&page=$PAGE")
+            # Bug #64 fix: retry with backoff if API returns non-JSON (rate limit HTML, 5xx, etc.)
+            FETCH_OK=false
+            for ATTEMPT in 1 2 3; do
+              RESP=$(curl -s -L -w "\n__HTTP_CODE__%{http_code}" \
+                -H "Authorization: token $GH_PAT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/code-scanning/alerts?ref=refs/heads/main&state=open&per_page=100&page=$PAGE")
+              HTTP_CODE=$(echo "$RESP" | tail -1 | sed 's/__HTTP_CODE__//')
+              BODY=$(echo "$RESP" | sed '$d')
 
-            PAGE_COUNT=$(echo "$RESP" | jq 'if type == "array" then length else 0 end')
+              if echo "$BODY" | jq empty 2>/dev/null; then
+                FETCH_OK=true
+                break
+              else
+                echo "Page $PAGE attempt $ATTEMPT: non-JSON response (HTTP $HTTP_CODE), retrying in $((ATTEMPT * 10))s..."
+                sleep $((ATTEMPT * 10))
+              fi
+            done
+
+            if [ "$FETCH_OK" != "true" ]; then
+              echo "::warning::Page $PAGE: failed to get valid JSON after 3 retries (HTTP $HTTP_CODE). Using $TOTAL_FETCHED alerts fetched so far."
+              break
+            fi
+
+            PAGE_COUNT=$(echo "$BODY" | jq 'if type == "array" then length else 0 end')
             if [ "$PAGE_COUNT" -eq 0 ] || [ "$PAGE_COUNT" = "null" ]; then
               break
             fi
 
-            echo "$RESP" > /tmp/alerts_page.json
+            echo "$BODY" > /tmp/alerts_page.json
             jq -s '.[0] + .[1]' /tmp/all_alerts.json /tmp/alerts_page.json > /tmp/alerts_merged.json
             mv /tmp/alerts_merged.json /tmp/all_alerts.json
             TOTAL_FETCHED=$((TOTAL_FETCHED + PAGE_COUNT))
@@ -166,6 +185,7 @@ jobs:
               break
             fi
             PAGE=$((PAGE + 1))
+            sleep 1
           done
 
           echo "Total open alerts on main: $TOTAL_FETCHED"
