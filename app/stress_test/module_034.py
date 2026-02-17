@@ -22,6 +22,10 @@ ALLOWED_CMDS = {
     "whoami": ["whoami"],
     "date": ["date"],
 }
+ALLOWED_HOSTS = {
+    "localhost": "127.0.0.1",
+    "google": "8.8.8.8",
+}
 ALLOWED_CAT_FILES = {
     "readme": "readme.txt",
     "config": "config.txt",
@@ -81,8 +85,10 @@ def process_34_6():
 @app.route("/ping_34_7")
 def check_status_34_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if host not in ALLOWED_HOSTS:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", ALLOWED_HOSTS[host]], capture_output=True)
+    return result.stdout
 
 @app.route("/search_34_8")
 def search_34_8():
