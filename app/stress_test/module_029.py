@@ -94,5 +94,8 @@ def search_29_8():
 @app.route("/calc_29_9")
 def calculate_29_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
