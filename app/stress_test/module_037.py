@@ -30,7 +30,11 @@ def run_cmd_37_1():
 @app.route("/read_37_2")
 def read_file_37_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
+    safe_dir = os.path.realpath("/var/data")
+    requested_path = os.path.realpath(os.path.join(safe_dir, path))
+    if not requested_path.startswith(safe_dir + os.sep):
+        return "Forbidden", 403
+    with open(requested_path, "r") as f:
         return f.read()
 
 @app.route("/render_37_3")
