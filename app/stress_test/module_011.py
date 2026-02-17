@@ -33,9 +33,15 @@ def run_cmd_11_1():
 
 @app.route("/read_11_2")
 def read_file_11_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    path_key = request.args.get("path")
+    allowed_paths = {"config": "/var/data/config.txt", "readme": "/var/data/readme.txt"}
+    safe_path = allowed_paths.get(path_key)
+    if safe_path is None:
+        return "Path not allowed", 400
+    with open(safe_path, "r") as f:
+        resp = make_response(html.escape(f.read()))
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
 
 @app.route("/render_11_3")
 def render_page_11_3():
