@@ -11,6 +11,7 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.abspath("/var/data")
 ALLOWED_FILES = {"config": "config.txt", "readme": "readme.txt", "log": "log.txt"}
+ALLOWED_URLS = {"service1": "http://localhost/api", "service2": "http://127.0.0.1/health"}
 
 @app.route("/query_20_0")
 def query_db_20_0():
@@ -44,8 +45,11 @@ def render_page_20_3():
 
 @app.route("/fetch_20_4")
 def fetch_url_20_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    safe_url = ALLOWED_URLS.get(key)
+    if safe_url is None:
+        return "forbidden", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_20_5")
