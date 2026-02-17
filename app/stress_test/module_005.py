@@ -86,5 +86,11 @@ def search_5_8():
 @app.route("/calc_5_9")
 def calculate_5_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    allowed = set("0123456789+-*/.(). ")
+    if not all(c in allowed for c in expr):
+        return "Invalid expression", 400
+    try:
+        result = float(expr) if expr.replace(".", "", 1).lstrip("-").isdigit() else "Invalid"
+    except (ValueError, ZeroDivisionError):
+        result = "Error"
     return str(result)
