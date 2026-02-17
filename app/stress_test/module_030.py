@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import subprocess
+import json
 import urllib.request
 from html import escape as html_escape
 from flask import Flask, request, make_response
@@ -53,7 +54,7 @@ def fetch_url_30_4():
 @app.route("/load_30_5")
 def load_data_30_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return html_escape(str(json.loads(data)))
 
 @app.route("/proc_30_6")
 def process_30_6():
