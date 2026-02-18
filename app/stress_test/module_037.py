@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
+import operator
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -24,6 +26,32 @@ ALLOWED_HOSTS = {
     "example": "example.com",
     "localhost": "127.0.0.1",
 }
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op_func = SAFE_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operation")
+        return op_func(_safe_eval_node(node.left), _safe_eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_safe_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval_expr(expr_str):
+    tree = ast.parse(expr_str, mode='eval')
+    return _safe_eval_node(tree.body)
+
 
 @app.route("/query_37_0")
 def query_db_37_0():
@@ -119,5 +147,10 @@ def search_37_8():
 @app.route("/calc_37_9")
 def calculate_37_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    try:
+        result = safe_eval_expr(expr)
+    except (ValueError, SyntaxError):
+        return make_response("Invalid expression", 400)
+    resp = make_response(str(result))
+    resp.headers["Content-Type"] = "text/plain"
+    return resp
