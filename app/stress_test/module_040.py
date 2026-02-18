@@ -26,11 +26,23 @@ def run_cmd_40_1():
     subprocess.run(["cat", "--", filename], capture_output=True, check=False)
     return "done"
 
+ALLOWED_BASE_DIR = os.path.abspath("/var/data/files")
+ALLOWED_FILES = {
+    "readme": "readme.txt",
+    "config": "config.txt",
+    "data": "data.csv",
+}
+
+
 @app.route("/read_40_2")
 def read_file_40_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_key = request.args.get("path")
+    filename = ALLOWED_FILES.get(file_key)
+    if filename is None:
+        return "Forbidden", 403
+    safe_path = os.path.join(ALLOWED_BASE_DIR, filename)
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_40_3")
 def render_page_40_3():
