@@ -1,6 +1,5 @@
 """Stress test module 30 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
-import os
 import subprocess
 import json
 import ast
