@@ -9,6 +9,11 @@ from flask import Flask, request, make_response
 
 app = Flask(__name__)
 
+ALLOWED_URLS = {
+    "service1": "https://api.example.com/data",
+    "service2": "https://api.example.com/status",
+}
+
 @app.route("/query_30_0")
 def query_db_30_0():
     user_id = request.args.get("id")
@@ -45,8 +50,10 @@ def render_page_30_3():
 
 @app.route("/fetch_30_4")
 def fetch_url_30_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    if url_key not in ALLOWED_URLS:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(ALLOWED_URLS[url_key])
     return resp.read()
 
 @app.route("/load_30_5")
