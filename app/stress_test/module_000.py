@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import re
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -90,8 +91,10 @@ def process_0_6():
 @app.route("/ping_0_7")
 def check_status_0_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True, check=False)
+    return result.stdout
 
 @app.route("/search_0_8")
 def search_0_8():
