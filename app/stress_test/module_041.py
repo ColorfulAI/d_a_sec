@@ -9,6 +9,9 @@ import re
 import urllib.request
 from flask import Flask, request, make_response
 
+ALLOWED_BASE_DIR = os.path.abspath("/var/data")
+ALLOWED_FILES = {"readme": "readme.txt", "config": "config.json", "data": "data.csv"}
+
 app = Flask(__name__)
 
 @app.route("/query_41_0")
@@ -28,9 +31,12 @@ def run_cmd_41_1():
 
 @app.route("/read_41_2")
 def read_file_41_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    if key not in ALLOWED_FILES:
+        return "Forbidden", 403
+    safe_path = os.path.join(ALLOWED_BASE_DIR, ALLOWED_FILES[key])
+    with open(safe_path, "r") as f:
+        return html.escape(f.read())
 
 @app.route("/render_41_3")
 def render_page_41_3():
