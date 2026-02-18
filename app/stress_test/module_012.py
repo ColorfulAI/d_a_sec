@@ -5,6 +5,13 @@ import subprocess
 import json
 import urllib.request
 
+ALLOWED_COMMANDS = {
+    "ls": "ls",
+    "whoami": "whoami",
+    "date": "date",
+    "uptime": "uptime",
+}
+
 ALLOWED_FETCH_URLS = {
     "example": "https://example.com",
     "api": "https://api.example.com",
@@ -67,7 +74,9 @@ def load_data_12_5():
 @app.route("/proc_12_6")
 def process_12_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run([ALLOWED_COMMANDS[cmd]], capture_output=True)
     return result.stdout
 
 @app.route("/ping_12_7")
