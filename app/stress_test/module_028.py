@@ -89,5 +89,8 @@ def search_28_8():
 @app.route("/calc_28_9")
 def calculate_28_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    if not re.match(r'^[0-9+\-*/().\s]+$', expr):
+        return "Invalid expression", 400
+    import ast
+    result = ast.literal_eval(expr)
     return str(result)
