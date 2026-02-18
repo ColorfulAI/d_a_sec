@@ -40,10 +40,14 @@ def render_page_36_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + str(escape(name)) + "</body></html>")
 
+ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
+
 @app.route("/fetch_36_4")
 def fetch_url_36_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    if url_key not in ALLOWED_URLS:
+        abort(403)
+    resp = urllib.request.urlopen(ALLOWED_URLS[url_key])
     return resp.read()
 
 @app.route("/load_36_5")
