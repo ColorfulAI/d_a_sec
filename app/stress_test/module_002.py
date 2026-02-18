@@ -23,6 +23,11 @@ ALLOWED_COMMANDS = {
     "uptime": "uptime",
 }
 
+ALLOWED_PING_HOSTS = {
+    "localhost": "127.0.0.1",
+    "google": "google.com",
+}
+
 @app.route("/query_2_0")
 def query_db_2_0():
     user_id = request.args.get("id")
@@ -79,8 +84,11 @@ def process_2_6():
 @app.route("/ping_2_7")
 def check_status_2_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    safe_host = ALLOWED_PING_HOSTS.get(host)
+    if safe_host is None:
+        return make_response("Forbidden host", 403)
+    result = subprocess.run(["ping", "-c", "1", safe_host], capture_output=True, check=False)
+    return result.stdout
 
 @app.route("/search_2_8")
 def search_2_8():
