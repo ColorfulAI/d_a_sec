@@ -1,13 +1,21 @@
 import os
 import subprocess
 from flask import request, Flask, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
+    allowed_commands = {
+        "status": ["status"],
+        "health": ["health"],
+        "version": ["version"],
+    }
+    if cmd not in allowed_commands:
+        return {"error": "Command not allowed"}, 403
+    output = subprocess.run(allowed_commands[cmd], capture_output=True, text=True).stdout
     return {"output": output}
 
 @app.route("/admin/logs")
@@ -17,7 +25,7 @@ def view_logs():
         ["cat", log_file],
         text=True
     )
-    response = make_response(result)
+    response = make_response(str(escape(result)))
     response.headers["Content-Type"] = "text/html"
     return response
 
