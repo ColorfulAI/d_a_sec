@@ -60,7 +60,11 @@ def load_data_44_5():
 @app.route("/proc_44_6")
 def process_44_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    ALLOWED_COMMANDS = {"ls": ["ls"], "date": ["date"], "uptime": ["uptime"]}
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        return make_response("Invalid command", 400)
+    result = subprocess.run(safe_cmd, capture_output=True, check=False)
     return result.stdout
 
 @app.route("/ping_44_7")
