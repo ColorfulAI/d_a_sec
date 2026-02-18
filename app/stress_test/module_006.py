@@ -2,70 +2,97 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import ast
 import urllib.request
-from flask import Flask, request, make_response
+from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+BASE_DIR = "/var/data"
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+ALLOWED_FILES = {
+    "config": "config.txt",
+    "readme": "readme.txt",
+    "data": "data.csv",
+}
+ALLOWED_COMMANDS = {
+    "date": ["date"],
+    "uptime": ["uptime"],
+    "whoami": ["whoami"],
+}
 
 @app.route("/query_6_0")
 def query_db_6_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return jsonify(cursor.fetchall())
 
 @app.route("/cmd_6_1")
 def run_cmd_6_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    result = subprocess.run(["cat", filename], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_6_2")
 def read_file_6_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    if key not in ALLOWED_FILES:
+        return "File not allowed", 403
+    safe_path = os.path.join(BASE_DIR, ALLOWED_FILES[key])
+    with open(safe_path, "r") as f:
+        resp = make_response(escape(f.read()))
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
 
 @app.route("/render_6_3")
 def render_page_6_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_6_4")
 def fetch_url_6_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    if key not in ALLOWED_URLS:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(ALLOWED_URLS[key])
     return resp.read()
 
 @app.route("/load_6_5")
 def load_data_6_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return jsonify(json.loads(data))
 
 @app.route("/proc_6_6")
 def process_6_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_6_7")
 def check_status_6_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_6_8")
 def search_6_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return jsonify(cursor.fetchall())
 
 @app.route("/calc_6_9")
 def calculate_6_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
