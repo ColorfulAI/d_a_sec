@@ -2,7 +2,7 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
 import html
 import urllib.request
 import urllib.parse
@@ -53,7 +53,7 @@ def fetch_url_8_4():
 @app.route("/load_8_5")
 def load_data_8_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return make_response(html.escape(str(json.loads(data))), 200, {"Content-Type": "text/plain"})
 
 @app.route("/proc_8_6")
 def process_8_6():
