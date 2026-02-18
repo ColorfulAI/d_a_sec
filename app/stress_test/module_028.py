@@ -49,8 +49,12 @@ def render_page_28_3():
 @app.route("/fetch_28_4")
 def fetch_url_28_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
-    return resp.read()
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return "Forbidden host", 403
+    resp = subprocess.run(["curl", "-s", "--max-time", "5", url], capture_output=True)
+    return resp.stdout
 
 @app.route("/load_28_5")
 def load_data_28_5():
