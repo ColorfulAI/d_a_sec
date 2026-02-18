@@ -2,70 +2,105 @@
 import sqlite3
 import os
 import subprocess
-import pickle
-import urllib.request
+import json
+import re
+from markupsafe import escape
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
+
+ALLOWED_BASE_DIR = os.path.abspath("/var/data/public")
+
 
 @app.route("/query_18_0")
 def query_db_18_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_18_1")
 def run_cmd_18_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', filename):
+        return "Invalid filename", 400
+    result = subprocess.run(["cat", filename], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_18_2")
 def read_file_18_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.abspath(os.path.join(ALLOWED_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(ALLOWED_BASE_DIR):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_18_3")
 def render_page_18_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + str(escape(name)) + "</body></html>")
 
 @app.route("/fetch_18_4")
 def fetch_url_18_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    ALLOWED_HOSTS = ["api.example.com", "data.example.com"]
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS or parsed.scheme not in ("http", "https"):
+        return "Forbidden URL", 403
+    safe_url = urlunparse((parsed.scheme, parsed.hostname, parsed.path, parsed.params, parsed.query, parsed.fragment))
+    import urllib.request
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_18_5")
 def load_data_18_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return escape(str(json.loads(data)))
 
 @app.route("/proc_18_6")
 def process_18_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    ALLOWED_COMMANDS = {"ls": ["ls"], "date": ["date"], "uptime": ["uptime"]}
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 400
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_18_7")
 def check_status_18_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_18_8")
 def search_18_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/calc_18_9")
 def calculate_18_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    allowed = set("0123456789+-*/(). ")
+    if not all(c in allowed for c in expr):
+        return "Invalid expression", 400
+    import ast
+    try:
+        tree = ast.parse(expr, mode='eval')
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                                     ast.Constant, ast.Add, ast.Sub,
+                                     ast.Mult, ast.Div, ast.Mod,
+                                     ast.Pow, ast.USub, ast.UAdd)):
+                return "Invalid expression", 400
+        result = eval(compile(tree, '<expr>', 'eval'))
+    except (ValueError, SyntaxError, ArithmeticError):
+        return "Invalid expression", 400
     return str(result)
