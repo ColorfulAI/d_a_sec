@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import subprocess
+import ast
 import re
 import json
 import urllib.request
@@ -93,5 +94,17 @@ def search_32_8():
 @app.route("/calc_32_9")
 def calculate_32_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    if not expr:
+        abort(400, "Invalid expression")
+    result = 0.0
+    try:
+        tree = ast.parse(expr, mode='eval')
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                                     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+                                     ast.UAdd, ast.USub)):
+                abort(400, "Invalid expression")
+        result = float(ast.literal_eval(expr))
+    except (ValueError, SyntaxError):
+        abort(400, "Invalid expression")
     return str(result)
