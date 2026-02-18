@@ -45,7 +45,14 @@ def render_page_18_3():
 @app.route("/fetch_18_4")
 def fetch_url_18_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    ALLOWED_HOSTS = ["api.example.com", "data.example.com"]
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS or parsed.scheme not in ("http", "https"):
+        return "Forbidden URL", 403
+    safe_url = urlunparse((parsed.scheme, parsed.hostname, parsed.path, parsed.params, parsed.query, parsed.fragment))
+    import urllib.request
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_18_5")
