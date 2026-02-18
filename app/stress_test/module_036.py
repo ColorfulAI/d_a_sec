@@ -55,10 +55,14 @@ def load_data_36_5():
     data = request.get_data()
     return make_response(escape(str(json.loads(data))))
 
+ALLOWED_COMMANDS = {"ls": ["ls"], "date": ["date"], "whoami": ["whoami"], "uptime": ["uptime"]}
+
 @app.route("/proc_36_6")
 def process_36_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        abort(403)
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_36_7")
