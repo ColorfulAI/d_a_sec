@@ -47,7 +47,11 @@ def render_page_46_3():
 
 @app.route("/fetch_46_4")
 def fetch_url_46_4():
-    url = request.args.get("url")
+    service = request.args.get("url")
+    url_map = {"svc1": "https://example.com/api", "svc2": "https://api.example.com/data"}
+    url = url_map.get(service)
+    if url is None:
+        return "Unknown service", 400
     resp = urllib.request.urlopen(url)
     return resp.read()
 
