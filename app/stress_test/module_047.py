@@ -15,6 +15,7 @@ ALLOWED_URLS = {
     "service2": "https://api.example.com/data",
 }
 ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"], "uptime": ["uptime"]}
+ALLOWED_HOSTS = {"localhost": "localhost", "local": "127.0.0.1", "example": "example.com"}
 
 @app.route("/query_47_0")
 def query_db_47_0():
@@ -75,9 +76,12 @@ def process_47_6():
 
 @app.route("/ping_47_7")
 def check_status_47_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    host_key = request.args.get("host")
+    host = ALLOWED_HOSTS.get(host_key)
+    if host is None:
+        return "Host not allowed", 403
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_47_8")
 def search_47_8():
