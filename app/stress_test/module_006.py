@@ -5,8 +5,16 @@ import subprocess
 import pickle
 import urllib.request
 from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+BASE_DIR = "/var/data"
+ALLOWED_FILES = {
+    "config": "config.txt",
+    "readme": "readme.txt",
+    "data": "data.csv",
+}
 
 @app.route("/query_6_0")
 def query_db_6_0():
@@ -24,9 +32,14 @@ def run_cmd_6_1():
 
 @app.route("/read_6_2")
 def read_file_6_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    if key not in ALLOWED_FILES:
+        return "File not allowed", 403
+    safe_path = os.path.join(BASE_DIR, ALLOWED_FILES[key])
+    with open(safe_path, "r") as f:
+        resp = make_response(escape(f.read()))
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
 
 @app.route("/render_6_3")
 def render_page_6_3():
