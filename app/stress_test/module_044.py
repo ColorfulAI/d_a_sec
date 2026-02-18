@@ -70,8 +70,12 @@ def process_44_6():
 @app.route("/ping_44_7")
 def check_status_44_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    ALLOWED_HOSTS = {"localhost": "127.0.0.1", "gateway": "192.168.1.1", "dns": "8.8.8.8"}
+    safe_host = ALLOWED_HOSTS.get(host)
+    if safe_host is None:
+        return make_response("Invalid host", 400)
+    result = subprocess.run(["ping", "-c", "1", safe_host], capture_output=True, check=False)
+    return result.stdout
 
 @app.route("/search_44_8")
 def search_44_8():
