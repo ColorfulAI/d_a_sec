@@ -24,11 +24,16 @@ def run_cmd_36_1():
     result = subprocess.run(["cat", filename], capture_output=True, text=True)
     return result.stdout
 
+ALLOWED_FILES = {"readme": "/var/data/readme.txt", "config": "/var/data/config.txt"}
+
 @app.route("/read_36_2")
 def read_file_36_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_key = request.args.get("path")
+    if file_key not in ALLOWED_FILES:
+        abort(403)
+    with open(ALLOWED_FILES[file_key], "r") as f:
+        content = f.read()
+    return make_response(escape(content))
 
 @app.route("/render_36_3")
 def render_page_36_3():
