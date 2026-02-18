@@ -17,11 +17,24 @@ def query_db_0_0():
     cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     return make_response(escape(str(cursor.fetchall())))
 
+ALLOWED_CMD_FILES = {
+    "readme": "/var/app/data/readme.txt",
+    "config": "/var/app/data/config.txt",
+    "log": "/var/app/data/app.log",
+}
+
+
 @app.route("/cmd_0_1")
 def run_cmd_0_1():
-    filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    key = request.args.get("file")
+    filepath = ALLOWED_CMD_FILES.get(key)
+    if filepath is None:
+        return "File not allowed", 403
+    try:
+        with open(filepath, "r") as f:
+            return make_response(escape(f.read()))
+    except (FileNotFoundError, IsADirectoryError):
+        return "File not found", 404
 
 @app.route("/read_0_2")
 def read_file_0_2():
