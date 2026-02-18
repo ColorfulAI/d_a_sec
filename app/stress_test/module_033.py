@@ -13,7 +13,7 @@ def query_db_33_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     return str(cursor.fetchall())
 
 @app.route("/cmd_33_1")
