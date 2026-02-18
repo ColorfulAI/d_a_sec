@@ -11,6 +11,12 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data/public")
 
+ALLOWED_FILES = {
+    "readme": "readme.txt",
+    "config": "config.txt",
+    "data": "data.csv",
+}
+
 @app.route("/query_3_0")
 def query_db_3_0():
     user_id = request.args.get("id")
@@ -29,8 +35,11 @@ def run_cmd_3_1():
 
 @app.route("/read_3_2")
 def read_file_3_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
+    file_key = request.args.get("path")
+    filename = ALLOWED_FILES.get(file_key)
+    if filename is None:
+        return "Not found", 404
+    with open(os.path.join(SAFE_BASE_DIR, filename), "r") as f:
         return f.read()
 
 @app.route("/render_3_3")
