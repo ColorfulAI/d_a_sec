@@ -9,6 +9,8 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.realpath("/var/data")
+
 @app.route("/query_24_0")
 def query_db_24_0():
     user_id = request.args.get("id")
@@ -28,8 +30,11 @@ def run_cmd_24_1():
 @app.route("/read_24_2")
 def read_file_24_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(SAFE_BASE_DIR):
+        return Response("Access denied", status=403, content_type="text/plain")
+    with open(real_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_24_3")
 def render_page_24_3():
