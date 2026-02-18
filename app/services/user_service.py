@@ -1,6 +1,7 @@
+import re
 import sqlite3
 import subprocess
-from flask import request, Flask
+from flask import request, Flask, jsonify
 
 app = Flask(__name__)
 
@@ -9,27 +10,29 @@ def get_user():
     username = request.args.get("username", "")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE username = '" + username + "'"
-    cursor.execute(query)
+    query = "SELECT * FROM users WHERE username = ?"
+    cursor.execute(query, (username,))
     results = cursor.fetchall()
     conn.close()
-    return {"users": results}
+    return jsonify(users=results)
 
 @app.route("/api/users/search")
 def search_users():
     term = request.args.get("q", "")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE name LIKE '%" + term + "%'")
+    cursor.execute("SELECT * FROM users WHERE name LIKE ?", ("%" + term + "%",))
     results = cursor.fetchall()
     conn.close()
-    return {"results": results}
+    return jsonify(results=results)
 
 @app.route("/api/run-report")
 def run_report():
     report_name = request.args.get("report", "")
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', report_name):
+        return jsonify(error="Invalid report name"), 400
     result = subprocess.run(
-        "python generate_report.py " + report_name,
-        shell=True, capture_output=True, text=True
+        ["python", "generate_report.py", report_name],
+        capture_output=True, text=True
     )
-    return {"output": result.stdout}
+    return jsonify(output=result.stdout)
