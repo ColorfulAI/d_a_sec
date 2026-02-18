@@ -1,4 +1,5 @@
 """Stress test module 43 — intentional vulnerabilities for CodeQL testing."""
+import re
 import sqlite3
 import os
 import subprocess
@@ -20,7 +21,9 @@ def query_db_43_0():
 @app.route("/cmd_43_1")
 def run_cmd_43_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-/]+$', filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
 @app.route("/read_43_2")
