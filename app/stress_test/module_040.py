@@ -69,10 +69,21 @@ def load_data_40_5():
     data = request.get_data()
     return escape(str(json.loads(data)))
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
+
 @app.route("/proc_40_6")
 def process_40_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return "Invalid command", 400
+    result = subprocess.run(cmd_args, capture_output=True, check=False)
     return result.stdout
 
 @app.route("/ping_40_7")
