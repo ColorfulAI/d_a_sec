@@ -50,7 +50,12 @@ def render_page_16_3():
 @app.route("/fetch_16_4")
 def fetch_url_16_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urlparse(url)
+    safe_host = ALLOWED_HOSTS.get(parsed.hostname)
+    if safe_host is None:
+        return make_response("Forbidden", 403)
+    safe_url = "http://" + safe_host + "/"
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_16_5")
