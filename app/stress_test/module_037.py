@@ -9,6 +9,8 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.abspath("/var/data/files")
+
 @app.route("/query_37_0")
 def query_db_37_0():
     user_id = request.args.get("id")
@@ -23,7 +25,16 @@ def query_db_37_0():
 @app.route("/cmd_37_1")
 def run_cmd_37_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_name = os.path.basename(filename)
+    safe_path = os.path.join(SAFE_BASE_DIR, safe_name)
+    safe_path = os.path.realpath(safe_path)
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return make_response("Forbidden", 403)
+    try:
+        with open(safe_path, "r") as f:
+            f.read()
+    except (FileNotFoundError, PermissionError):
+        return make_response("File not accessible", 404)
     return "done"
 
 @app.route("/read_37_2")
