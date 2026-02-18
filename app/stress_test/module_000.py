@@ -36,11 +36,22 @@ def run_cmd_0_1():
     except (FileNotFoundError, IsADirectoryError):
         return "File not found", 404
 
+ALLOWED_READ_FILES = {
+    "readme": "/var/app/data/readme.txt",
+    "config": "/var/app/data/config.txt",
+    "log": "/var/app/data/app.log",
+}
+
+
 @app.route("/read_0_2")
 def read_file_0_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    filepath = ALLOWED_READ_FILES.get(key)
+    if filepath is None:
+        return "File not allowed", 403
+    with open(filepath, "r") as f:
+        content = f.read()
+    return make_response(escape(content))
 
 @app.route("/render_0_3")
 def render_page_0_3():
