@@ -41,10 +41,17 @@ def render_page_15_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+FETCH_URLS = {
+    "example": "https://example.com/",
+    "api": "https://api.example.com/",
+}
+
 @app.route("/fetch_15_4")
 def fetch_url_15_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    if key not in FETCH_URLS:
+        return "Forbidden URL", 403
+    resp = urllib.request.urlopen(FETCH_URLS[key])
     return resp.read()
 
 @app.route("/load_15_5")
