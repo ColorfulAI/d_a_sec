@@ -4,6 +4,7 @@ import os
 import subprocess
 import pickle
 import re
+import html
 import urllib.request
 from flask import Flask, request, make_response, Response
 
@@ -39,7 +40,8 @@ def read_file_24_2():
 @app.route("/render_24_3")
 def render_page_24_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    safe_name = html.escape(name)
+    return Response("<html><body>Hello " + safe_name + "</body></html>", content_type="text/html")
 
 @app.route("/fetch_24_4")
 def fetch_url_24_4():
