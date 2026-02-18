@@ -4,6 +4,7 @@ import os
 import subprocess
 import pickle
 import urllib.request
+from markupsafe import escape
 from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
@@ -39,7 +40,7 @@ def read_file_39_2():
 @app.route("/render_39_3")
 def render_page_39_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_39_4")
 def fetch_url_39_4():
