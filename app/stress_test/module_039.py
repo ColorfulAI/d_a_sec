@@ -2,70 +2,129 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import ast
+import operator
 import urllib.request
-from flask import Flask, request, make_response
+from markupsafe import escape
+from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
+
+SAFE_BASE_DIR = os.path.abspath("/var/data/public")
+
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "date": ["date"],
+    "whoami": ["whoami"],
+    "uptime": ["uptime"],
+}
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        op_func = SAFE_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operation")
+        return op_func(left, right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval_expr(expr):
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree.body)
+
 
 @app.route("/query_39_0")
 def query_db_39_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return Response(str(cursor.fetchall()), content_type="text/plain")
 
 @app.route("/cmd_39_1")
 def run_cmd_39_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not filename or not all(c.isalnum() or c in "._-" for c in filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True, check=False)
     return "done"
 
 @app.route("/read_39_2")
 def read_file_39_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.normpath(os.path.join(SAFE_BASE_DIR, path))
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return "Forbidden", 403
+    with open(safe_path, "r") as f:
+        content = f.read()
+    return Response(content, content_type="text/plain")
 
 @app.route("/render_39_3")
 def render_page_39_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_39_4")
 def fetch_url_39_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    target_url = ALLOWED_URLS.get(key)
+    if target_url is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(target_url)
     return resp.read()
 
 @app.route("/load_39_5")
 def load_data_39_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return Response(str(json.loads(data)), content_type="text/plain")
 
 @app.route("/proc_39_6")
 def process_39_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    key = request.args.get("cmd")
+    cmd_list = ALLOWED_COMMANDS.get(key)
+    if cmd_list is None:
+        return "Command not allowed", 400
+    result = subprocess.run(cmd_list, capture_output=True)
     return result.stdout
 
 @app.route("/ping_39_7")
 def check_status_39_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not host or not all(c.isalnum() or c in ".-" for c in host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_39_8")
 def search_39_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return Response(str(cursor.fetchall()), content_type="text/plain")
 
 @app.route("/calc_39_9")
 def calculate_39_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_expr(expr)
     return str(result)
