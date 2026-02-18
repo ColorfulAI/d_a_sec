@@ -5,6 +5,8 @@ import subprocess
 import json
 import html
 import re
+import ast
+import operator
 import urllib.request
 import urllib.parse
 from flask import Flask, request, make_response
@@ -19,6 +21,31 @@ ALLOWED_COMMANDS = {
 }
 
 app = Flask(__name__)
+
+
+def safe_eval_math(expr):
+    """Safely evaluate a mathematical expression."""
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        raise ValueError("Unsupported expression")
+
+    tree = ast.parse(expr, mode='eval')
+    return _eval(tree)
+
 
 @app.route("/query_8_0")
 def query_db_8_0():
@@ -91,5 +118,5 @@ def search_8_8():
 @app.route("/calc_8_9")
 def calculate_8_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_math(expr)
     return str(result)
