@@ -4,12 +4,15 @@ import os
 import subprocess
 import pickle
 import urllib.request
+from urllib.parse import urlparse
 from flask import Flask, request, make_response, Response
 from markupsafe import escape
 
 app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data")
+
+ALLOWED_HOSTS = {"example.com", "api.example.com"}
 
 @app.route("/query_11_0")
 def query_db_11_0():
@@ -42,7 +45,11 @@ def render_page_11_3():
 @app.route("/fetch_11_4")
 def fetch_url_11_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_HOSTS:
+        return Response("Host not allowed", status=400, content_type="text/plain")
+    safe_url = parsed.scheme + "://" + parsed.hostname + parsed.path
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_11_5")
