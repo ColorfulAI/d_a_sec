@@ -19,6 +19,11 @@ ALLOWED_FILES = {
     "readme": "readme.txt",
     "data": "data.csv",
 }
+ALLOWED_COMMANDS = {
+    "date": ["date"],
+    "uptime": ["uptime"],
+    "whoami": ["whoami"],
+}
 
 @app.route("/query_6_0")
 def query_db_6_0():
@@ -66,7 +71,9 @@ def load_data_6_5():
 @app.route("/proc_6_6")
 def process_6_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_6_7")
