@@ -9,6 +9,8 @@ from markupsafe import escape
 
 app = Flask(__name__)
 
+ALLOWED_BASE_DIR = os.path.realpath("/var/data")
+
 @app.route("/query_47_0")
 def query_db_47_0():
     user_id = request.args.get("id")
@@ -20,8 +22,12 @@ def query_db_47_0():
 @app.route("/cmd_47_1")
 def run_cmd_47_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    safe_name = os.path.basename(filename)
+    safe_path = os.path.realpath(os.path.join(ALLOWED_BASE_DIR, safe_name))
+    if not safe_path.startswith(ALLOWED_BASE_DIR + os.sep):
+        return "Access denied", 403
+    result = subprocess.run(["cat", "--", safe_path], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_47_2")
 def read_file_47_2():
