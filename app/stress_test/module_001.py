@@ -45,8 +45,12 @@ def render_page_1_3():
 
 @app.route("/fetch_1_4")
 def fetch_url_1_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    url_map = {"example": "https://example.com", "api": "https://api.example.com"}
+    target_url = url_map.get(url_key)
+    if target_url is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(target_url)
     return resp.read()
 
 @app.route("/load_1_5")
