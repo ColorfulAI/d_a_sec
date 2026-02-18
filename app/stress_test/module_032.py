@@ -67,7 +67,11 @@ def load_data_32_5():
 @app.route("/proc_32_6")
 def process_32_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    allowed_commands = {"ls": "/bin/ls", "whoami": "/usr/bin/whoami", "date": "/bin/date", "uptime": "/usr/bin/uptime"}
+    cmd_path = allowed_commands.get(cmd)
+    if not cmd_path:
+        abort(400, "Command not allowed")
+    result = subprocess.run([cmd_path], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_32_7")
