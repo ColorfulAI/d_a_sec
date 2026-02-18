@@ -4,6 +4,7 @@ import os
 import subprocess
 import json
 import urllib.request
+import ast
 from flask import Flask, request, make_response
 from markupsafe import escape
 
@@ -99,5 +100,7 @@ def search_10_8():
 @app.route("/calc_10_9")
 def calculate_10_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    resp = make_response(str(result))
+    resp.headers["Content-Type"] = "text/plain"
+    return resp
