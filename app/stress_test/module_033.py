@@ -24,10 +24,23 @@ def run_cmd_33_1():
     subprocess.run(["cat", safe_name], capture_output=True)
     return "done"
 
+ALLOWED_BASE_DIR = os.path.abspath("/var/data")
+
+ALLOWED_FILES = {
+    "config": "config.txt",
+    "readme": "readme.txt",
+    "data": "data.csv",
+}
+
+
 @app.route("/read_33_2")
 def read_file_33_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
+    file_key = request.args.get("path")
+    filename = ALLOWED_FILES.get(file_key)
+    if filename is None:
+        return make_response("File not found", 404)
+    safe_path = os.path.join(ALLOWED_BASE_DIR, filename)
+    with open(safe_path, "r") as f:
         return f.read()
 
 @app.route("/render_33_3")
