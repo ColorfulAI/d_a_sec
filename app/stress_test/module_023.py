@@ -4,6 +4,7 @@ import os
 import subprocess
 import html
 import json
+import shlex
 import urllib.request
 from urllib.parse import urlparse
 from flask import Flask, request, make_response, jsonify
@@ -61,7 +62,11 @@ def load_data_23_5():
 @app.route("/proc_23_6")
 def process_23_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    ALLOWED_CMDS = {"ls", "whoami", "date", "uptime"}
+    parts = shlex.split(cmd)
+    if not parts or parts[0] not in ALLOWED_CMDS:
+        return "Command not allowed", 403
+    result = subprocess.run(parts, capture_output=True)
     return result.stdout
 
 @app.route("/ping_23_7")
