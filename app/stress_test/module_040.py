@@ -47,7 +47,7 @@ def read_file_40_2():
 @app.route("/render_40_3")
 def render_page_40_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_40_4")
 def fetch_url_40_4():
