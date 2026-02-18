@@ -5,6 +5,7 @@ import subprocess
 import html
 import pickle
 import urllib.request
+from urllib.parse import urlparse
 from flask import Flask, request, make_response, jsonify
 
 app = Flask(__name__)
@@ -42,7 +43,14 @@ def render_page_23_3():
 @app.route("/fetch_23_4")
 def fetch_url_23_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urlparse(url)
+    if parsed.hostname == "example.com":
+        safe_url = "https://example.com/"
+    elif parsed.hostname == "api.example.com":
+        safe_url = "https://api.example.com/"
+    else:
+        return "Host not allowed", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_23_5")
