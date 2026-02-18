@@ -2,70 +2,120 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import re
+import ast
+import operator
 import urllib.request
-from flask import Flask, request, make_response
+from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def safe_calc(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op_fn = SAFE_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError("Invalid operator")
+        return op_fn(safe_calc(node.left), safe_calc(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -safe_calc(node.operand)
+    raise ValueError("Invalid expression")
 
 @app.route("/query_15_0")
 def query_db_15_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return jsonify(cursor.fetchall())
 
 @app.route("/cmd_15_1")
 def run_cmd_15_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
 @app.route("/read_15_2")
 def read_file_15_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_dir = os.path.abspath("/var/data")
+    abs_path = os.path.abspath(os.path.join(safe_dir, path))
+    if not abs_path.startswith(safe_dir):
+        return "Forbidden", 403
+    with open(abs_path, "r") as f:
+        return jsonify({"content": f.read()})
 
 @app.route("/render_15_3")
 def render_page_15_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
+
+FETCH_URLS = {
+    "example": "https://example.com/",
+    "api": "https://api.example.com/",
+}
 
 @app.route("/fetch_15_4")
 def fetch_url_15_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    if key not in FETCH_URLS:
+        return "Forbidden URL", 403
+    resp = urllib.request.urlopen(FETCH_URLS[key])
     return resp.read()
 
 @app.route("/load_15_5")
 def load_data_15_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return jsonify(json.loads(data))
 
 @app.route("/proc_15_6")
 def process_15_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd == "ls":
+        result = subprocess.run(["ls"], capture_output=True)
+    elif cmd == "whoami":
+        result = subprocess.run(["whoami"], capture_output=True)
+    elif cmd == "date":
+        result = subprocess.run(["date"], capture_output=True)
+    else:
+        return "Command not allowed", 403
     return result.stdout
 
 @app.route("/ping_15_7")
 def check_status_15_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_15_8")
 def search_15_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return jsonify(cursor.fetchall())
 
 @app.route("/calc_15_9")
 def calculate_15_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    try:
+        tree = ast.parse(expr, mode='eval')
+        result = safe_calc(tree.body)
+        return str(result)
+    except Exception:
+        return "Invalid expression", 400
