@@ -2,7 +2,7 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -57,7 +57,8 @@ def fetch_url_2_4():
 @app.route("/load_2_5")
 def load_data_2_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    parsed = json.loads(data)
+    return make_response(escape(str(parsed)), {"Content-Type": "text/plain"})
 
 @app.route("/proc_2_6")
 def process_2_6():
