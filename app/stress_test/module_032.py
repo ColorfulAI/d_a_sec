@@ -26,11 +26,22 @@ def run_cmd_32_1():
     result = subprocess.run(["cat", safe_path], capture_output=True, text=True)
     return result.stdout
 
+ALLOWED_FILES = {
+    "readme": "/var/data/readme.txt",
+    "config": "/var/data/config.txt",
+    "data": "/var/data/data.txt",
+    "status": "/var/data/status.txt",
+}
+
 @app.route("/read_32_2")
 def read_file_32_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_path = ALLOWED_FILES.get(path)
+    if not file_path:
+        abort(400, "Invalid path")
+    with open(file_path, "r") as f:
+        content = f.read()
+    return jsonify({"content": content})
 
 @app.route("/render_32_3")
 def render_page_32_3():
