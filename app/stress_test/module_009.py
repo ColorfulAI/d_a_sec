@@ -59,8 +59,11 @@ def load_data_9_5():
 
 @app.route("/proc_9_6")
 def process_9_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    key = request.args.get("cmd")
+    COMMANDS = {"ls": ["ls"], "date": ["date"], "whoami": ["whoami"]}
+    if key not in COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(COMMANDS[key], capture_output=True)
     return result.stdout
 
 @app.route("/ping_9_7")
