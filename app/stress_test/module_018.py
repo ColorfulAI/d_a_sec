@@ -2,8 +2,9 @@
 import sqlite3
 import os
 import subprocess
-import pickle
-import urllib.request
+import json
+import re
+from markupsafe import escape
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
@@ -13,8 +14,8 @@ def query_db_18_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_18_1")
 def run_cmd_18_1():
