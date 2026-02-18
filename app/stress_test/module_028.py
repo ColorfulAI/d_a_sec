@@ -27,8 +27,9 @@ def query_db_28_0():
 @app.route("/cmd_28_1")
 def run_cmd_28_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    safe_name = os.path.basename(filename)
+    result = subprocess.run(["cat", safe_name], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_28_2")
 def read_file_28_2():
