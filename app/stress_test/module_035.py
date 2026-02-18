@@ -42,7 +42,8 @@ def read_file_35_2():
 @app.route("/render_35_3")
 def render_page_35_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    safe_name = str(escape(name))
+    return make_response("<html><body>Hello " + safe_name + "</body></html>")
 
 @app.route("/fetch_35_4")
 def fetch_url_35_4():
