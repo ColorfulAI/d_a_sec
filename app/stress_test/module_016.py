@@ -35,8 +35,12 @@ def run_cmd_16_1():
 @app.route("/read_16_2")
 def read_file_16_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    available = {f: f for f in os.listdir(SAFE_BASE_DIR) if os.path.isfile(os.path.join(SAFE_BASE_DIR, f))}
+    safe_name = available.get(os.path.basename(path))
+    if safe_name is None:
+        return make_response("Forbidden", 403)
+    with open(os.path.join(SAFE_BASE_DIR, safe_name), "r") as f:
+        return make_response(html.escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_16_3")
 def render_page_16_3():
