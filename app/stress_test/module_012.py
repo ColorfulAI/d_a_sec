@@ -5,6 +5,7 @@ import subprocess
 import json
 import urllib.request
 import re
+import ast
 
 ALLOWED_COMMANDS = {
     "ls": "ls",
@@ -98,8 +99,41 @@ def search_12_8():
     resp.content_type = "text/plain"
     return resp
 
+def _safe_eval_expr(node):
+    """Safely evaluate a math expression AST node."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_expr(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval_expr(node.left)
+        right = _safe_eval_expr(node.right)
+        ops = {
+            ast.Add: lambda a, b: a + b,
+            ast.Sub: lambda a, b: a - b,
+            ast.Mult: lambda a, b: a * b,
+            ast.Div: lambda a, b: a / b,
+        }
+        op_func = ops.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operator")
+        return op_func(left, right)
+    if isinstance(node, ast.UnaryOp):
+        operand = _safe_eval_expr(node.operand)
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        raise ValueError("Unsupported operator")
+    raise ValueError("Invalid expression")
+
+
 @app.route("/calc_12_9")
 def calculate_12_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        tree = ast.parse(expr, mode="eval")
+        result = _safe_eval_expr(tree)
+    except Exception:
+        return "Invalid expression", 400
     return str(result)
