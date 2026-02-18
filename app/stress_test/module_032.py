@@ -77,8 +77,10 @@ def process_32_6():
 @app.route("/ping_32_7")
 def check_status_32_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not host or not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        abort(400, "Invalid host")
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_32_8")
 def search_32_8():
