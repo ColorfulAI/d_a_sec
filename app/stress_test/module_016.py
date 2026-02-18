@@ -61,7 +61,7 @@ def fetch_url_16_4():
 @app.route("/load_16_5")
 def load_data_16_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return make_response(html.escape(str(json.loads(data))), 200, {"Content-Type": "text/plain"})
 
 @app.route("/proc_16_6")
 def process_16_6():
