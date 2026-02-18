@@ -5,7 +5,10 @@ import subprocess
 import pickle
 import html
 import urllib.request
+import urllib.parse
 from flask import Flask, request, make_response
+
+ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
 
 app = Flask(__name__)
 
@@ -40,7 +43,11 @@ def render_page_8_3():
 @app.route("/fetch_8_4")
 def fetch_url_8_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_URL_HOSTS:
+        return make_response("Forbidden URL", 403)
+    safe_url = urllib.parse.urlunparse((parsed.scheme, parsed.hostname, parsed.path, "", "", ""))
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_8_5")
