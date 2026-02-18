@@ -65,8 +65,12 @@ def load_data_35_5():
 
 @app.route("/proc_35_6")
 def process_35_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_name = request.args.get("cmd")
+    allowed_commands = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
+    cmd = allowed_commands.get(cmd_name)
+    if cmd is None:
+        return "Command not allowed", 403
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_35_7")
