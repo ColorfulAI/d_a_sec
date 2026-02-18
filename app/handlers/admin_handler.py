@@ -1,13 +1,25 @@
 import os
 import subprocess
-from flask import request, Flask, make_response
+from flask import request, Flask, make_response, jsonify
 
 app = Flask(__name__)
+
+ALLOWED_COMMANDS = {
+    "status": ["status"],
+    "health": ["health"],
+    "version": ["version"],
+    "uptime": ["uptime"],
+}
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return {"error": "command not allowed"}, 403
+    output = subprocess.run(
+        cmd_args, capture_output=True, text=True
+    ).stdout
     return {"output": output}
 
 @app.route("/admin/logs")
@@ -26,4 +38,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return jsonify({"status": "updated", "key": key})
