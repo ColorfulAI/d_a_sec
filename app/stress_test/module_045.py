@@ -4,6 +4,8 @@ import os
 import subprocess
 import re
 import json
+import ast
+import operator
 import urllib.request
 import urllib.parse
 from flask import Flask, request, make_response
@@ -88,5 +90,23 @@ def search_45_8():
 @app.route("/calc_45_9")
 def calculate_45_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
+    def _eval_node(node):
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval_node(node.operand)
+        else:
+            raise ValueError("Unsafe expression")
+    tree = ast.parse(expr, mode='eval')
+    result = _eval_node(tree)
     return str(result)
