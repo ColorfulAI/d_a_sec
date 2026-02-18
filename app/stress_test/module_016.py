@@ -26,7 +26,10 @@ def query_db_16_0():
 @app.route("/cmd_16_1")
 def run_cmd_16_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_path = os.path.realpath(filename)
+    if not safe_path.startswith(SAFE_BASE_DIR + os.sep) and safe_path != SAFE_BASE_DIR:
+        return make_response("Forbidden", 403)
+    subprocess.run(["cat", safe_path], capture_output=True, check=False)
     return "done"
 
 @app.route("/read_16_2")
