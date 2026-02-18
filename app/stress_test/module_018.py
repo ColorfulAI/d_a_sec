@@ -1,10 +1,17 @@
 """Stress test module 18 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
 import os
+import json
+import re
+import ast
 import subprocess
-import pickle
 import urllib.request
+from html import escape
 from flask import Flask, request, make_response
+
+ALLOWED_BASE_DIR = "/var/data"
+ALLOWED_URLS = {"example": "https://example.com", "api": "https://api.example.com"}
+ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"]}
 
 app = Flask(__name__)
 
@@ -13,59 +20,74 @@ def query_db_18_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_18_1")
 def run_cmd_18_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', filename):
+        return "Invalid filename", 400
+    safe_path = os.path.realpath(os.path.join(ALLOWED_BASE_DIR, filename))
+    if not safe_path.startswith(ALLOWED_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        f.read()
     return "done"
 
 @app.route("/read_18_2")
 def read_file_18_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(ALLOWED_BASE_DIR, path))
+    if not safe_path.startswith(ALLOWED_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_18_3")
 def render_page_18_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_18_4")
 def fetch_url_18_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    if url_key not in ALLOWED_URLS:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(ALLOWED_URLS[url_key])
     return resp.read()
 
 @app.route("/load_18_5")
 def load_data_18_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return escape(str(json.loads(data)))
 
 @app.route("/proc_18_6")
 def process_18_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_18_7")
 def check_status_18_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9.\-]+$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_18_8")
 def search_18_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/calc_18_9")
 def calculate_18_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
