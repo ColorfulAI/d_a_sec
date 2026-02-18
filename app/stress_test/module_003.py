@@ -40,7 +40,7 @@ def read_file_3_2():
     if filename is None:
         return "Not found", 404
     with open(os.path.join(SAFE_BASE_DIR, filename), "r") as f:
-        return f.read()
+        return escape(f.read())
 
 @app.route("/render_3_3")
 def render_page_3_3():
