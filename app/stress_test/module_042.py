@@ -61,8 +61,12 @@ def load_data_42_5():
 @app.route("/proc_42_6")
 def process_42_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    allowed_cmds = {"ls": ["ls"], "date": ["date"], "whoami": ["whoami"], "uptime": ["uptime"]}
+    safe_cmd = allowed_cmds.get(cmd)
+    if safe_cmd is None:
+        return "Command not allowed", 403
+    result = subprocess.run(safe_cmd, capture_output=True, text=True)
+    return escape(result.stdout)
 
 @app.route("/ping_42_7")
 def check_status_42_7():
