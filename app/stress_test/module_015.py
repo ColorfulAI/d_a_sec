@@ -62,7 +62,14 @@ def load_data_15_5():
 @app.route("/proc_15_6")
 def process_15_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd == "ls":
+        result = subprocess.run(["ls"], capture_output=True)
+    elif cmd == "whoami":
+        result = subprocess.run(["whoami"], capture_output=True)
+    elif cmd == "date":
+        result = subprocess.run(["date"], capture_output=True)
+    else:
+        return "Command not allowed", 403
     return result.stdout
 
 @app.route("/ping_15_7")
