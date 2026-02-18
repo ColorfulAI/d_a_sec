@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import re
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
@@ -15,6 +16,7 @@ ALLOWED_URL_MAP = {
     "status": "https://status.example.com/check",
 }
 COMMAND_MAP = {"ls": "ls", "whoami": "whoami", "date": "date"}
+HOST_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+$')
 
 @app.route("/query_19_0")
 def query_db_19_0():
@@ -73,8 +75,10 @@ def process_19_6():
 @app.route("/ping_19_7")
 def check_status_19_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not HOST_PATTERN.match(host):
+        return make_response("Invalid host", 400)
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_19_8")
 def search_19_8():
