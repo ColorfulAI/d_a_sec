@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
+import operator
 import re
 import urllib.request
 from flask import Flask, request, make_response
@@ -23,6 +25,32 @@ ALLOWED_COMMANDS = {
     "whoami": ["whoami"],
     "uptime": ["uptime"],
 }
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op = SAFE_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("Unsupported operation")
+        return op(_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval(expr):
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree.body)
+
 
 @app.route("/query_31_0")
 def query_db_31_0():
@@ -99,5 +127,8 @@ def search_31_8():
 @app.route("/calc_31_9")
 def calculate_31_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        result = safe_eval(expr)
+    except (ValueError, SyntaxError):
+        return "Invalid expression", 400
     return str(result)
