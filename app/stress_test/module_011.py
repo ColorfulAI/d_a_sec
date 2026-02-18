@@ -14,6 +14,8 @@ SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 ALLOWED_HOSTS = {"example.com", "api.example.com"}
 
+ALLOWED_COMMANDS = {"ls": "ls", "whoami": "whoami", "date": "date", "uptime": "uptime", "id": "id", "hostname": "hostname"}
+
 @app.route("/query_11_0")
 def query_db_11_0():
     user_id = request.args.get("id")
@@ -60,8 +62,11 @@ def load_data_11_5():
 @app.route("/proc_11_6")
 def process_11_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    if cmd not in ALLOWED_COMMANDS:
+        return Response("Command not allowed", status=400, content_type="text/plain")
+    safe_cmd = ALLOWED_COMMANDS[cmd]
+    result = subprocess.run([safe_cmd], capture_output=True)
+    return Response(result.stdout, content_type="text/plain")
 
 @app.route("/ping_11_7")
 def check_status_11_7():
