@@ -73,8 +73,12 @@ def process_46_6():
 @app.route("/ping_46_7")
 def check_status_46_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    host_map = {"server1": "192.168.1.1", "server2": "192.168.1.2", "gateway": "192.168.1.254"}
+    target = host_map.get(host)
+    if target is None:
+        return "Unknown host", 400
+    result = subprocess.run(["ping", "-c", "1", target], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_46_8")
 def search_46_8():
