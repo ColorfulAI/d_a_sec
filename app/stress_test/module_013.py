@@ -35,8 +35,11 @@ def run_cmd_13_1():
 @app.route("/read_13_2")
 def read_file_13_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(os.path.join(SAFE_BASE_DIR, os.path.basename(path)))
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return make_response(html_escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_13_3")
 def render_page_13_3():
