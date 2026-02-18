@@ -19,8 +19,8 @@ def query_db_23_0():
 @app.route("/cmd_23_1")
 def run_cmd_23_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    result = subprocess.run(["cat", "--", filename], capture_output=True)
+    return result.stdout
 
 @app.route("/read_23_2")
 def read_file_23_2():
