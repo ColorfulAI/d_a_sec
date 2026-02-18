@@ -4,6 +4,8 @@ import os
 import subprocess
 import json
 import re
+import ast
+import operator
 import urllib.request
 from flask import Flask, request, make_response, jsonify
 from markupsafe import escape
@@ -89,8 +91,31 @@ def search_35_8():
     cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
     return jsonify(cursor.fetchall())
 
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+        }
+        op_func = ops.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operator")
+        return op_func(_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
 @app.route("/calc_35_9")
 def calculate_35_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    try:
+        tree = ast.parse(expr, mode="eval")
+        result = _eval_node(tree.body)
+    except Exception:
+        return "Invalid expression", 400
     return str(result)
