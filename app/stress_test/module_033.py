@@ -48,10 +48,19 @@ def render_page_33_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + str(escape(name)) + "</body></html>")
 
+ALLOWED_ENDPOINTS = {
+    "api": "https://api.example.com/data",
+    "status": "https://example.com/status",
+}
+
+
 @app.route("/fetch_33_4")
 def fetch_url_33_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    endpoint = request.args.get("url")
+    target = ALLOWED_ENDPOINTS.get(endpoint)
+    if target is None:
+        return make_response("Invalid endpoint", 400)
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_33_5")
