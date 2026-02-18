@@ -20,8 +20,10 @@ def query_db_18_0():
 @app.route("/cmd_18_1")
 def run_cmd_18_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', filename):
+        return "Invalid filename", 400
+    result = subprocess.run(["cat", filename], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_18_2")
 def read_file_18_2():
