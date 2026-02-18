@@ -2,70 +2,124 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import html
+import re
+import ast
+import operator
 import urllib.request
+import urllib.parse
 from flask import Flask, request, make_response
 
+ALLOWED_BASE_DIR = os.path.realpath("/var/data")
+
+ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
+
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "pwd": ["pwd"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
+
 app = Flask(__name__)
+
+
+def safe_eval_math(expr):
+    """Safely evaluate a mathematical expression."""
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        raise ValueError("Unsupported expression")
+
+    tree = ast.parse(expr, mode='eval')
+    return _eval(tree)
+
 
 @app.route("/query_8_0")
 def query_db_8_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return make_response(html.escape(str(cursor.fetchall())), 200, {"Content-Type": "text/plain"})
 
 @app.route("/cmd_8_1")
 def run_cmd_8_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    safe_name = os.path.basename(filename)
+    result = subprocess.run(["cat", safe_name], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_8_2")
 def read_file_8_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(ALLOWED_BASE_DIR + os.sep):
+        return make_response("Forbidden", 403)
+    with open(real_path, "r") as f:
+        return make_response(html.escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_8_3")
 def render_page_8_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + html.escape(name) + "</body></html>")
 
 @app.route("/fetch_8_4")
 def fetch_url_8_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ALLOWED_URL_HOSTS:
+        return make_response("Forbidden URL", 403)
+    safe_url = urllib.parse.urlunparse((parsed.scheme, parsed.hostname, parsed.path, "", "", ""))
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_8_5")
 def load_data_8_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return make_response(html.escape(str(json.loads(data))), 200, {"Content-Type": "text/plain"})
 
 @app.route("/proc_8_6")
 def process_8_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return make_response("Command not allowed", 403)
+    result = subprocess.run(cmd_args, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_8_7")
 def check_status_8_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+        return make_response("Invalid host", 400)
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_8_8")
 def search_8_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return make_response(html.escape(str(cursor.fetchall())), 200, {"Content-Type": "text/plain"})
 
 @app.route("/calc_8_9")
 def calculate_8_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_math(expr)
     return str(result)
