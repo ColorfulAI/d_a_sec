@@ -3,11 +3,14 @@ import sqlite3
 import os
 import subprocess
 import pickle
+import re
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_BASE_DIR = os.path.abspath("data")
 
 @app.route("/query_31_0")
 def query_db_31_0():
@@ -20,7 +23,10 @@ def query_db_31_0():
 @app.route("/cmd_31_1")
 def run_cmd_31_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_name = os.path.basename(filename)
+    if not re.match(r'^[a-zA-Z0-9._-]+$', safe_name):
+        return "Invalid filename", 400
+    subprocess.run(["cat", "--", os.path.join(SAFE_BASE_DIR, safe_name)], capture_output=True)
     return "done"
 
 @app.route("/read_31_2")
