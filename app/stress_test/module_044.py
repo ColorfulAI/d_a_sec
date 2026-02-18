@@ -35,7 +35,7 @@ def read_file_44_2():
     if safe_path is None:
         return make_response("Invalid path", 400)
     with open(safe_path, "r") as f:
-        return f.read()
+        return make_response(escape(f.read()))
 
 @app.route("/render_44_3")
 def render_page_44_3():
