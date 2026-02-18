@@ -8,6 +8,15 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.realpath("/var/data")
+
+ALLOWED_FILES = {
+    "report": os.path.join(SAFE_BASE_DIR, "report.txt"),
+    "log": os.path.join(SAFE_BASE_DIR, "log.txt"),
+    "config": os.path.join(SAFE_BASE_DIR, "config.txt"),
+}
+
+
 @app.route("/query_14_0")
 def query_db_14_0():
     user_id = request.args.get("id")
@@ -25,9 +34,12 @@ def run_cmd_14_1():
 
 @app.route("/read_14_2")
 def read_file_14_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    safe_path = ALLOWED_FILES.get(key)
+    if safe_path is None:
+        return Response("File not found", status=404, content_type="text/plain")
+    with open(safe_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_14_3")
 def render_page_14_3():
