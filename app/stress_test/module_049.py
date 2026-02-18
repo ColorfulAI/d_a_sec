@@ -12,6 +12,10 @@ app = Flask(__name__)
 
 ALLOWED_BASE_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "data"))
 
+ALLOWED_URLS = {
+    "example": "https://example.com/",
+}
+
 @app.route("/query_49_0")
 def query_db_49_0():
     user_id = request.args.get("id")
@@ -44,7 +48,10 @@ def render_page_49_3():
 
 @app.route("/fetch_49_4")
 def fetch_url_49_4():
-    url = request.args.get("url")
+    url_key = request.args.get("url")
+    url = ALLOWED_URLS.get(url_key)
+    if url is None:
+        return "URL not allowed", 403
     resp = urllib.request.urlopen(url)
     return resp.read()
 
