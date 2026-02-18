@@ -4,8 +4,11 @@ import os
 import subprocess
 import pickle
 import html
+import re
 import urllib.request
 from flask import Flask, request, make_response
+
+ALLOWED_BASE_DIR = os.path.realpath("/var/data")
 
 app = Flask(__name__)
 
@@ -20,8 +23,13 @@ def query_db_46_0():
 @app.route("/cmd_46_1")
 def run_cmd_46_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
+        return "Invalid filename", 400
+    safe_path = os.path.realpath(os.path.join(ALLOWED_BASE_DIR, filename))
+    if not safe_path.startswith(ALLOWED_BASE_DIR + os.sep):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return html.escape(f.read())
 
 @app.route("/read_46_2")
 def read_file_46_2():
