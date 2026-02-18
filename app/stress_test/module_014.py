@@ -101,8 +101,8 @@ def search_14_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return Response(str(cursor.fetchall()), content_type="text/plain")
 
 @app.route("/calc_14_9")
 def calculate_14_9():
