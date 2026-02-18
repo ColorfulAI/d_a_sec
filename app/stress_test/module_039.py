@@ -16,6 +16,13 @@ ALLOWED_URLS = {
     "api": "https://api.example.com",
 }
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "date": ["date"],
+    "whoami": ["whoami"],
+    "uptime": ["uptime"],
+}
+
 @app.route("/query_39_0")
 def query_db_39_0():
     user_id = request.args.get("id")
@@ -63,8 +70,11 @@ def load_data_39_5():
 
 @app.route("/proc_39_6")
 def process_39_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    key = request.args.get("cmd")
+    cmd_list = ALLOWED_COMMANDS.get(key)
+    if cmd_list is None:
+        return "Command not allowed", 400
+    result = subprocess.run(cmd_list, capture_output=True)
     return result.stdout
 
 @app.route("/ping_39_7")
