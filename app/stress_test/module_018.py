@@ -58,7 +58,7 @@ def fetch_url_18_4():
 @app.route("/load_18_5")
 def load_data_18_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return escape(str(json.loads(data)))
 
 @app.route("/proc_18_6")
 def process_18_6():
