@@ -10,6 +10,13 @@ from flask import Flask, request, make_response
 
 ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "pwd": ["pwd"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
+
 app = Flask(__name__)
 
 @app.route("/query_8_0")
@@ -58,7 +65,10 @@ def load_data_8_5():
 @app.route("/proc_8_6")
 def process_8_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return make_response("Command not allowed", 403)
+    result = subprocess.run(cmd_args, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_8_7")
