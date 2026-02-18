@@ -8,6 +8,11 @@ import re
 import urllib.request
 from flask import Flask, request, make_response
 
+ALLOWED_URLS = {
+    "api": "https://api.example.com/data",
+    "status": "https://status.example.com/check",
+}
+
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 app = Flask(__name__)
@@ -44,8 +49,10 @@ def render_page_38_3():
 
 @app.route("/fetch_38_4")
 def fetch_url_38_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    if url_key not in ALLOWED_URLS:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(ALLOWED_URLS[url_key])
     return resp.read()
 
 @app.route("/load_38_5")
