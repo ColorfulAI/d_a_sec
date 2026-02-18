@@ -58,9 +58,15 @@ def render_page_0_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+ALLOWED_URLS = {"api": "https://example.com/api", "data": "https://api.example.com/data"}
+
+
 @app.route("/fetch_0_4")
 def fetch_url_0_4():
-    url = request.args.get("url")
+    key = request.args.get("url")
+    url = ALLOWED_URLS.get(key)
+    if url is None:
+        return "URL not allowed", 403
     resp = urllib.request.urlopen(url)
     return resp.read()
 
