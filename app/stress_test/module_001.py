@@ -2,70 +2,120 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import ast
+import operator
 import urllib.request
+from markupsafe import escape
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
+
+ALLOWED_BASE_DIR = os.path.realpath("/srv/data")
+
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+    "whoami": ["whoami"],
+}
+
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval(expr):
+    def _walk(node):
+        if isinstance(node, ast.Expression):
+            return _walk(node.body)
+        if isinstance(node, ast.BinOp):
+            fn = _SAFE_OPS.get(type(node.op))
+            if fn is None:
+                raise ValueError("Unsupported operator")
+            return fn(_walk(node.left), _walk(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_walk(node.operand)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Unsupported expression")
+    return _walk(ast.parse(expr, mode="eval"))
 
 @app.route("/query_1_0")
 def query_db_1_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/cmd_1_1")
 def run_cmd_1_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
-    return "done"
+    result = subprocess.run(["cat", "--", filename], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/read_1_2")
 def read_file_1_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_path = os.path.realpath(path)
+    if not safe_path.startswith(ALLOWED_BASE_DIR + os.sep):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        return escape(f.read())
 
 @app.route("/render_1_3")
 def render_page_1_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_1_4")
 def fetch_url_1_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    safe_url = ALLOWED_URLS.get(url_key)
+    if safe_url is None:
+        return "URL not allowed", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_1_5")
 def load_data_1_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return escape(str(json.loads(data)))
 
 @app.route("/proc_1_6")
 def process_1_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return "Command not allowed", 403
+    result = subprocess.run(cmd_args, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_1_7")
 def check_status_1_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_1_8")
 def search_1_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return escape(str(cursor.fetchall()))
 
 @app.route("/calc_1_9")
 def calculate_1_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = _safe_eval(expr)
     return str(result)
