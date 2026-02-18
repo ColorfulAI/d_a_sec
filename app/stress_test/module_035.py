@@ -6,8 +6,11 @@ import pickle
 import re
 import urllib.request
 from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 @app.route("/query_35_0")
 def query_db_35_0():
@@ -28,8 +31,13 @@ def run_cmd_35_1():
 @app.route("/read_35_2")
 def read_file_35_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(SAFE_BASE_DIR):
+        return "Access denied", 403
+    with open(real_path, "r") as f:
+        resp = make_response(escape(f.read()))
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
 
 @app.route("/render_35_3")
 def render_page_35_3():
