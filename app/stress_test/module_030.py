@@ -23,11 +23,20 @@ def run_cmd_30_1():
     result = subprocess.run(["cat", filename], capture_output=True)
     return result.stdout
 
+ALLOWED_FILES = {
+    "readme": "/var/data/readme.txt",
+    "config": "/var/data/config.txt",
+    "data": "/var/data/data.csv",
+}
+
+
 @app.route("/read_30_2")
 def read_file_30_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    file_key = request.args.get("path")
+    if file_key not in ALLOWED_FILES:
+        return "File not allowed", 403
+    with open(ALLOWED_FILES[file_key], "r") as f:
+        return escape(f.read())
 
 @app.route("/render_30_3")
 def render_page_30_3():
