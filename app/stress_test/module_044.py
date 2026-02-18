@@ -20,7 +20,11 @@ def query_db_44_0():
 @app.route("/cmd_44_1")
 def run_cmd_44_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    ALLOWED_FILES = {"readme": "README.md", "log": "app.log", "config": "config.txt"}
+    safe_file = ALLOWED_FILES.get(filename)
+    if safe_file is None:
+        return make_response("Invalid file", 400)
+    subprocess.run(["cat", safe_file], check=False)
     return "done"
 
 @app.route("/read_44_2")
