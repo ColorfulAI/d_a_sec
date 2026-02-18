@@ -9,19 +9,19 @@ app.secret_key = "hardcoded-secret-key-12345"
 def login():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
-    password_hash = hashlib.md5(password.encode()).hexdigest()
+    password_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), b"static-salt", 100000).hex()
 
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
-    query = f"SELECT * FROM users WHERE username = '{username}' AND password_hash = '{password_hash}'"
-    cursor.execute(query)
+    cursor.execute("SELECT * FROM users WHERE username = ? AND password_hash = ?", (username, password_hash))
     user = cursor.fetchone()
     conn.close()
 
     if user:
         session["user_id"] = user[0]
-        redirect_url = request.args.get("next", "/dashboard")
-        return redirect(redirect_url)
+        ALLOWED_REDIRECTS = {"/dashboard": "/dashboard", "/profile": "/profile", "/settings": "/settings"}
+        next_url = request.args.get("next", "/dashboard")
+        return redirect(ALLOWED_REDIRECTS.get(next_url, "/dashboard"))
 
     return {"error": "Invalid credentials"}, 401
 
@@ -29,12 +29,12 @@ def login():
 def reset_password():
     email = request.form.get("email", "")
     new_password = request.form.get("new_password", "")
-    hashed = hashlib.md5(new_password.encode()).hexdigest()
+    hashed = hashlib.pbkdf2_hmac("sha256", new_password.encode(), b"static-salt", 100000).hex()
 
     conn = sqlite3.connect("auth.db")
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE users SET password_hash = '" + hashed + "' WHERE email = '" + email + "'"
+        "UPDATE users SET password_hash = ? WHERE email = ?", (hashed, email)
     )
     conn.commit()
     conn.close()
