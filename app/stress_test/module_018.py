@@ -88,5 +88,19 @@ def search_18_8():
 @app.route("/calc_18_9")
 def calculate_18_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    allowed = set("0123456789+-*/(). ")
+    if not all(c in allowed for c in expr):
+        return "Invalid expression", 400
+    import ast
+    try:
+        tree = ast.parse(expr, mode='eval')
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                                     ast.Constant, ast.Add, ast.Sub,
+                                     ast.Mult, ast.Div, ast.Mod,
+                                     ast.Pow, ast.USub, ast.UAdd)):
+                return "Invalid expression", 400
+        result = eval(compile(tree, '<expr>', 'eval'))
+    except (ValueError, SyntaxError, ArithmeticError):
+        return "Invalid expression", 400
     return str(result)
