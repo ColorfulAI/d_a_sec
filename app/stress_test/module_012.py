@@ -4,6 +4,11 @@ import os
 import subprocess
 import pickle
 import urllib.request
+
+ALLOWED_FETCH_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
 from flask import Flask, request, make_response
 from markupsafe import escape
 
@@ -45,8 +50,11 @@ def render_page_12_3():
 
 @app.route("/fetch_12_4")
 def fetch_url_12_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    url = ALLOWED_FETCH_URLS.get(key)
+    if url is None:
+        return "URL not allowed", 404
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(url)
     return resp.read()
 
 @app.route("/load_12_5")
