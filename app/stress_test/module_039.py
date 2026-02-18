@@ -3,6 +3,8 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
+import operator
 import urllib.request
 from markupsafe import escape
 from flask import Flask, request, make_response, Response
@@ -22,6 +24,34 @@ ALLOWED_COMMANDS = {
     "whoami": ["whoami"],
     "uptime": ["uptime"],
 }
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        op_func = SAFE_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError("Unsupported operation")
+        return op_func(left, right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_eval_node(node.operand)
+    raise ValueError("Unsupported expression")
+
+
+def safe_eval_expr(expr):
+    tree = ast.parse(expr, mode="eval")
+    return _eval_node(tree.body)
+
 
 @app.route("/query_39_0")
 def query_db_39_0():
@@ -96,5 +126,5 @@ def search_39_8():
 @app.route("/calc_39_9")
 def calculate_39_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_expr(expr)
     return str(result)
