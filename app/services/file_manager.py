@@ -1,24 +1,36 @@
 import os
-from flask import request, Flask, send_file
+from flask import abort, jsonify, request, Flask, send_file
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+
+UPLOAD_DIR = "/data/uploads"
+
 
 @app.route("/api/files/read")
 def read_file():
     filepath = request.args.get("path", "")
-    full_path = os.path.join("/data/uploads", filepath)
+    safe_name = secure_filename(filepath)
+    if not safe_name:
+        abort(400, description="Invalid path")
+    full_path = os.path.join(UPLOAD_DIR, safe_name)
     with open(full_path, "r") as f:
         content = f.read()
-    return {"content": content}
+    return jsonify({"content": content})
 
 @app.route("/api/files/download")
 def download_file():
     filename = request.args.get("name", "")
-    return send_file("/data/uploads/" + filename)
+    safe_name = secure_filename(filename)
+    if not safe_name:
+        abort(400, description="Invalid filename")
+    return send_file(os.path.join(UPLOAD_DIR, safe_name))
 
 @app.route("/api/files/delete", methods=["POST"])
 def delete_file():
     filepath = request.form.get("path", "")
-    target = os.path.join("/data/uploads", filepath)
-    os.remove(target)
+    safe_name = secure_filename(filepath)
+    if not safe_name:
+        abort(400, description="Invalid path")
+    os.remove(os.path.join(UPLOAD_DIR, safe_name))
     return {"status": "deleted"}
