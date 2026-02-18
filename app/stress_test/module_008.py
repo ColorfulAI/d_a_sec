@@ -27,8 +27,10 @@ def run_cmd_8_1():
 @app.route("/read_8_2")
 def read_file_8_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_name = os.path.basename(path)
+    safe_path = os.path.join("/var/data", safe_name)
+    with open(safe_path, "r") as f:
+        return make_response(html.escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_8_3")
 def render_page_8_3():
