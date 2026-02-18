@@ -11,6 +11,13 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 ALLOWED_FETCH_URLS = {
     "example": "https://example.com",
     "status": "https://status.example.com",
@@ -69,7 +76,10 @@ def load_data_14_5():
 @app.route("/proc_14_6")
 def process_14_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        return Response("Command not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(safe_cmd, capture_output=True)
     return result.stdout
 
 @app.route("/ping_14_7")
