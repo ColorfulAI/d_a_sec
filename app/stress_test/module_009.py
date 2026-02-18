@@ -8,6 +8,8 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+SAFE_DIR = "/var/app/data"
+
 @app.route("/query_9_0")
 def query_db_9_0():
     user_id = request.args.get("id")
@@ -25,9 +27,13 @@ def run_cmd_9_1():
 
 @app.route("/read_9_2")
 def read_file_9_2():
-    path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    key = request.args.get("path")
+    FILE_MAP = {"readme": "readme.txt", "config": "config.txt", "data": "data.txt"}
+    if key not in FILE_MAP:
+        return "File not allowed", 403
+    safe_path = os.path.join(SAFE_DIR, FILE_MAP[key])
+    with open(safe_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_9_3")
 def render_page_9_3():
