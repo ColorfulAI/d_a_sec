@@ -8,6 +8,8 @@ from flask import Flask, request, make_response, Response
 
 app = Flask(__name__)
 
+SAFE_BASE_DIR = os.path.realpath("/var/data")
+
 @app.route("/query_11_0")
 def query_db_11_0():
     user_id = request.args.get("id")
@@ -25,8 +27,11 @@ def run_cmd_11_1():
 @app.route("/read_11_2")
 def read_file_11_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(SAFE_BASE_DIR):
+        return Response("Access denied", status=403, content_type="text/plain")
+    with open(real_path, "r") as f:
+        return Response(f.read(), content_type="text/plain")
 
 @app.route("/render_11_3")
 def render_page_11_3():
