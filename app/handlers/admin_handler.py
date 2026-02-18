@@ -1,13 +1,18 @@
 import os
 import subprocess
 from flask import request, Flask, make_response
+from markupsafe import escape
 
 app = Flask(__name__)
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
+    allowed_commands = {"status": "status", "uptime": "uptime", "df": "df", "whoami": "whoami"}
+    safe_cmd = allowed_commands.get(cmd)
+    if safe_cmd is None:
+        return {"error": "Command not allowed"}, 403
+    output = subprocess.run([safe_cmd], capture_output=True, text=True).stdout
     return {"output": output}
 
 @app.route("/admin/logs")
@@ -26,4 +31,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return {"status": "updated", "key": str(escape(key))}
