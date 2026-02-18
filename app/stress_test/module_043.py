@@ -43,8 +43,15 @@ def render_page_43_3():
 
 @app.route("/fetch_43_4")
 def fetch_url_43_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    target = request.args.get("url")
+    url_map = {
+        "example": "https://example.com",
+        "api": "https://api.example.com",
+    }
+    safe_url = url_map.get(target)
+    if safe_url is None:
+        return "Invalid target", 403
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_43_5")
