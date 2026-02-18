@@ -41,7 +41,7 @@ def read_file_33_2():
         return make_response("File not found", 404)
     safe_path = os.path.join(ALLOWED_BASE_DIR, filename)
     with open(safe_path, "r") as f:
-        return f.read()
+        return make_response(escape(f.read()))
 
 @app.route("/render_33_3")
 def render_page_33_3():
