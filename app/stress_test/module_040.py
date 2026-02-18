@@ -49,10 +49,19 @@ def render_page_40_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
+ALLOWED_URLS = {
+    "example": "https://example.com",
+    "api": "https://api.example.com",
+}
+
+
 @app.route("/fetch_40_4")
 def fetch_url_40_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    target_url = ALLOWED_URLS.get(url_key)
+    if target_url is None:
+        return "Forbidden host", 403
+    resp = urllib.request.urlopen(target_url)
     return resp.read()
 
 @app.route("/load_40_5")
