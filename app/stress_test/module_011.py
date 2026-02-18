@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
 import urllib.request
 from urllib.parse import urlparse
 from flask import Flask, request, make_response, Response
@@ -85,5 +86,5 @@ def search_11_8():
 @app.route("/calc_11_9")
 def calculate_11_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    result = ast.literal_eval(expr)
+    return Response(str(result), content_type="text/plain")
