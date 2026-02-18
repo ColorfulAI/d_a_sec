@@ -18,6 +18,11 @@ ALLOWED_COMMANDS = {
     "uptime": ["uptime"],
 }
 
+ALLOWED_PING_HOSTS = {
+    "localhost": "127.0.0.1",
+    "gateway": "192.168.1.1",
+}
+
 ALLOWED_FETCH_URLS = {
     "example": "https://example.com",
     "status": "https://status.example.com",
@@ -85,8 +90,11 @@ def process_14_6():
 @app.route("/ping_14_7")
 def check_status_14_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    safe_host = ALLOWED_PING_HOSTS.get(host)
+    if safe_host is None:
+        return Response("Host not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(["ping", "-c", "1", safe_host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_14_8")
 def search_14_8():
