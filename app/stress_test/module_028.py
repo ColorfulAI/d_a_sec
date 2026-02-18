@@ -1,20 +1,28 @@
 """Stress test module 28 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
+import json
 import os
+import re
 import subprocess
-import pickle
-import urllib.request
-from flask import Flask, request, make_response
+from flask import Flask, request, make_response, jsonify
+from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_BASE_DIR = os.path.abspath("/var/data/public")
+
+ALLOWED_HOSTS = {"google.com", "example.com", "api.internal.local"}
+
+ALLOWED_COMMANDS = {"ls": "ls", "cat": "cat", "whoami": "whoami", "date": "date", "uptime": "uptime"}
+
 
 @app.route("/query_28_0")
 def query_db_28_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return jsonify(cursor.fetchall())
 
 @app.route("/cmd_28_1")
 def run_cmd_28_1():
