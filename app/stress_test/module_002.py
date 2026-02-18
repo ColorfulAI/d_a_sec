@@ -11,6 +11,11 @@ app = Flask(__name__)
 
 SAFE_FILE_DIR = os.path.realpath("/var/data/files")
 
+ALLOWED_FETCH_URLS = {
+    "status": "http://localhost/status",
+    "health": "http://localhost/health",
+}
+
 @app.route("/query_2_0")
 def query_db_2_0():
     user_id = request.args.get("id")
@@ -42,8 +47,11 @@ def render_page_2_3():
 
 @app.route("/fetch_2_4")
 def fetch_url_2_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    url_key = request.args.get("url")
+    safe_url = ALLOWED_FETCH_URLS.get(url_key)
+    if safe_url is None:
+        return make_response("Forbidden", 403)
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_2_5")
