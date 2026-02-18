@@ -64,7 +64,10 @@ def load_data_28_5():
 @app.route("/proc_28_6")
 def process_28_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    safe_cmd = ALLOWED_COMMANDS[cmd]
+    result = subprocess.run([safe_cmd], capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_28_7")
