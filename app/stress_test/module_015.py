@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import pickle
+import re
 import urllib.request
 from flask import Flask, request, make_response, jsonify
 
@@ -19,7 +20,9 @@ def query_db_15_0():
 @app.route("/cmd_15_1")
 def run_cmd_15_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True)
     return "done"
 
 @app.route("/read_15_2")
