@@ -3,6 +3,7 @@ import sqlite3
 import os
 import subprocess
 import json
+import re
 import urllib.request
 from html import escape as html_escape
 from flask import Flask, request, make_response, jsonify
@@ -74,8 +75,10 @@ def process_13_6():
 @app.route("/ping_13_7")
 def check_status_13_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*$', host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return make_response(result.stdout, 200, {"Content-Type": "text/plain"})
 
 @app.route("/search_13_8")
 def search_13_8():
