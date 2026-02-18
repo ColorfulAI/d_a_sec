@@ -17,6 +17,13 @@ ALLOWED_URLS = {
     "status": "https://api.internal.example.com/status",
 }
 
+COMMAND_MAP = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 @app.route("/query_24_0")
 def query_db_24_0():
     user_id = request.args.get("id")
@@ -65,8 +72,11 @@ def load_data_24_5():
 @app.route("/proc_24_6")
 def process_24_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    cmd_list = COMMAND_MAP.get(cmd)
+    if cmd_list is None:
+        return Response("Command not allowed", status=403, content_type="text/plain")
+    result = subprocess.run(cmd_list, capture_output=True, text=True)
+    return Response(result.stdout, content_type="text/plain")
 
 @app.route("/ping_24_7")
 def check_status_24_7():
