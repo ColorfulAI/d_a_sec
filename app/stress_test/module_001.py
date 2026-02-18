@@ -7,6 +7,8 @@ import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
+SAFE_BASE_DIR = os.path.realpath("/var/data")
+
 app = Flask(__name__)
 
 @app.route("/query_1_0")
@@ -20,7 +22,11 @@ def query_db_1_0():
 @app.route("/cmd_1_1")
 def run_cmd_1_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    safe_path = os.path.realpath(filename)
+    if not safe_path.startswith(SAFE_BASE_DIR):
+        return "Access denied", 403
+    with open(safe_path, "r") as f:
+        _ = f.read()
     return "done"
 
 @app.route("/read_1_2")
