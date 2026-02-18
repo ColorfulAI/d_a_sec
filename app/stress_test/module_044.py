@@ -44,7 +44,11 @@ def render_page_44_3():
 
 @app.route("/fetch_44_4")
 def fetch_url_44_4():
-    url = request.args.get("url")
+    resource = request.args.get("url")
+    ALLOWED_URLS = {"status": "https://example.com/status", "health": "https://example.com/health"}
+    url = ALLOWED_URLS.get(resource)
+    if url is None:
+        return make_response("Invalid resource", 400)
     resp = urllib.request.urlopen(url)
     return resp.read()
 
