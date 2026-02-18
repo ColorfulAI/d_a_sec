@@ -3,7 +3,7 @@ import sqlite3
 import os
 import subprocess
 import re
-import pickle
+import json
 import urllib.request
 import urllib.parse
 from flask import Flask, request, make_response
@@ -58,7 +58,7 @@ def fetch_url_45_4():
 @app.route("/load_45_5")
 def load_data_45_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return make_response(escape(str(json.loads(data))))
 
 @app.route("/proc_45_6")
 def process_45_6():
