@@ -1,13 +1,33 @@
 """Stress test module 44 — intentional vulnerabilities for CodeQL testing."""
-import sqlite3
-import os
-import subprocess
+import ast
 import json
+import operator
+import sqlite3
+import subprocess
 import urllib.request
 from flask import Flask, request, make_response
 from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval(node):
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in SAFE_OPS:
+        return SAFE_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_safe_eval(node.operand)
+    raise ValueError("Unsupported expression")
 
 @app.route("/query_44_0")
 def query_db_44_0():
@@ -88,5 +108,6 @@ def search_44_8():
 @app.route("/calc_44_9")
 def calculate_44_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    tree = ast.parse(expr, mode='eval')
+    result = _safe_eval(tree)
     return str(result)
