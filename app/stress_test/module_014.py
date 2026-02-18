@@ -11,6 +11,11 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 
+ALLOWED_FETCH_URLS = {
+    "example": "https://example.com",
+    "status": "https://status.example.com",
+}
+
 ALLOWED_FILES = {
     "report": os.path.join(SAFE_BASE_DIR, "report.txt"),
     "log": os.path.join(SAFE_BASE_DIR, "log.txt"),
@@ -49,8 +54,11 @@ def render_page_14_3():
 
 @app.route("/fetch_14_4")
 def fetch_url_14_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    key = request.args.get("url")
+    target = ALLOWED_FETCH_URLS.get(key)
+    if target is None:
+        return Response("URL not allowed", status=403, content_type="text/plain")
+    resp = urllib.request.urlopen(target)
     return resp.read()
 
 @app.route("/load_14_5")
