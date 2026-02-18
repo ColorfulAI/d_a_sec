@@ -19,6 +19,11 @@ ALLOWED_COMMANDS = {
     "date": ["date"],
     "whoami": ["whoami"],
 }
+ALLOWED_HOSTS = {
+    "google": "google.com",
+    "example": "example.com",
+    "localhost": "127.0.0.1",
+}
 
 @app.route("/query_37_0")
 def query_db_37_0():
@@ -93,9 +98,12 @@ def process_37_6():
 
 @app.route("/ping_37_7")
 def check_status_37_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    key = request.args.get("host")
+    host = ALLOWED_HOSTS.get(key)
+    if host is None:
+        return make_response("Host not allowed", 400)
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, check=False)
+    return result.stdout
 
 @app.route("/search_37_8")
 def search_37_8():
