@@ -63,7 +63,11 @@ def load_data_46_5():
 @app.route("/proc_46_6")
 def process_46_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_map = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"], "uname": ["uname"]}
+    command = cmd_map.get(cmd)
+    if command is None:
+        return "Command not allowed", 400
+    result = subprocess.run(command, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_46_7")
