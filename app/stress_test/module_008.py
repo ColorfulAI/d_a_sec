@@ -35,7 +35,7 @@ def read_file_8_2():
 @app.route("/render_8_3")
 def render_page_8_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + html.escape(name) + "</body></html>")
 
 @app.route("/fetch_8_4")
 def fetch_url_8_4():
