@@ -3,10 +3,11 @@ import sqlite3
 import os
 import subprocess
 import json
+import ast
 import re
 import html
 import urllib.request
-from flask import Flask, request, make_response, Response
+from flask import Flask, request, Response
 
 app = Flask(__name__)
 
@@ -97,5 +98,8 @@ def search_24_8():
 @app.route("/calc_24_9")
 def calculate_24_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    try:
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        return Response("Invalid expression", status=400, content_type="text/plain")
+    return Response(str(result), content_type="text/plain")
