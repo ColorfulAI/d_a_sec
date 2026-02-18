@@ -70,8 +70,8 @@ def process_4_6():
 @app.route("/ping_4_7")
 def check_status_4_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True)
+    return result.stdout
 
 @app.route("/search_4_8")
 def search_4_8():
