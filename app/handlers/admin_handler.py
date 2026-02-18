@@ -1,14 +1,16 @@
 import os
+import shlex
 import subprocess
-from flask import request, Flask, make_response
+from flask import request, Flask, jsonify, make_response
 
 app = Flask(__name__)
 
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
-    return {"output": output}
+    args = shlex.split(cmd)
+    result = subprocess.run(args, capture_output=True, text=True)
+    return {"output": result.stdout}
 
 @app.route("/admin/logs")
 def view_logs():
@@ -26,4 +28,4 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    return jsonify({"status": "updated", "key": key})
