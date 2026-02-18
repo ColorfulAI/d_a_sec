@@ -22,6 +22,13 @@ ALLOWED_URLS = {
     "health": "https://api.example.com/health",
 }
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+    "uptime": ["uptime"],
+}
+
 @app.route("/query_3_0")
 def query_db_3_0():
     user_id = request.args.get("id")
@@ -69,7 +76,10 @@ def load_data_3_5():
 @app.route("/proc_3_6")
 def process_3_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    command = ALLOWED_COMMANDS.get(cmd)
+    if command is None:
+        return "Forbidden", 403
+    result = subprocess.run(command, capture_output=True, check=False)
     return result.stdout
 
 @app.route("/ping_3_7")
