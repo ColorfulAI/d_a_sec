@@ -55,7 +55,7 @@ def fetch_url_41_4():
 @app.route("/load_41_5")
 def load_data_41_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return html.escape(str(json.loads(data)))
 
 @app.route("/proc_41_6")
 def process_41_6():
