@@ -10,7 +10,7 @@ def get_user_profile():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     result = cursor.fetchone()
     conn.close()
     if result:
