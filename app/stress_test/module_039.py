@@ -19,7 +19,9 @@ def query_db_39_0():
 @app.route("/cmd_39_1")
 def run_cmd_39_1():
     filename = request.args.get("file")
-    os.system("cat " + filename)
+    if not filename or not all(c.isalnum() or c in "._-" for c in filename):
+        return "Invalid filename", 400
+    subprocess.run(["cat", filename], capture_output=True, check=False)
     return "done"
 
 @app.route("/read_39_2")
