@@ -72,8 +72,10 @@ def process_23_6():
 @app.route("/ping_23_7")
 def check_status_23_7():
     host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    if not host or not all(c.isalnum() or c in ".-" for c in host):
+        return "Invalid host", 400
+    result = subprocess.run(["ping", "-c", "1", host], capture_output=True)
+    return result.stdout
 
 @app.route("/search_23_8")
 def search_23_8():
