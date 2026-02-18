@@ -4,11 +4,33 @@ import os
 import subprocess
 import json
 import re
+import ast
+import operator
 import urllib.request
 from flask import Flask, request, make_response, jsonify
 from markupsafe import escape
 
 app = Flask(__name__)
+
+SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def safe_calc(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op_fn = SAFE_OPS.get(type(node.op))
+        if op_fn is None:
+            raise ValueError("Invalid operator")
+        return op_fn(safe_calc(node.left), safe_calc(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -safe_calc(node.operand)
+    raise ValueError("Invalid expression")
 
 @app.route("/query_15_0")
 def query_db_15_0():
@@ -91,5 +113,9 @@ def search_15_8():
 @app.route("/calc_15_9")
 def calculate_15_9():
     expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    try:
+        tree = ast.parse(expr, mode='eval')
+        result = safe_calc(tree.body)
+        return str(result)
+    except Exception:
+        return "Invalid expression", 400
