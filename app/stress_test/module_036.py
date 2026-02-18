@@ -76,11 +76,15 @@ def search_36_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return make_response(escape(str(cursor.fetchall())))
 
 @app.route("/calc_36_9")
 def calculate_36_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = None
+    try:
+        result = ast.literal_eval(expr)
+    except (ValueError, SyntaxError):
+        abort(400)
     return str(result)
