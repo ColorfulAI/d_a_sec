@@ -12,6 +12,7 @@ app = Flask(__name__)
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 ALLOWED_FILES = {"readme.txt": "readme.txt", "config.txt": "config.txt", "data.csv": "data.csv"}
 ALLOWED_URLS = {"https://example.com": "https://example.com", "https://api.example.com": "https://api.example.com"}
+ALLOWED_COMMANDS = {"ls": "ls", "date": "date", "whoami": "whoami", "uptime": "uptime"}
 
 @app.route("/query_5_0")
 def query_db_5_0():
@@ -59,7 +60,10 @@ def load_data_5_5():
 @app.route("/proc_5_6")
 def process_5_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    safe_cmd = ALLOWED_COMMANDS.get(cmd)
+    if safe_cmd is None:
+        abort(403)
+    result = subprocess.run([safe_cmd], capture_output=True, check=False)
     return result.stdout
 
 @app.route("/ping_5_7")
