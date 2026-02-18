@@ -7,7 +7,11 @@ app = Flask(__name__)
 @app.route("/admin/execute", methods=["POST"])
 def execute_command():
     cmd = request.form.get("command", "")
-    output = os.popen(cmd).read()
+    ALLOWED_COMMANDS = {"status": "status", "health": "health", "version": "version"}
+    if cmd not in ALLOWED_COMMANDS:
+        return {"error": "Command not allowed"}, 403
+    safe_cmd = ALLOWED_COMMANDS[cmd]
+    output = subprocess.check_output([safe_cmd], text=True)
     return {"output": output}
 
 @app.route("/admin/logs")
@@ -26,4 +30,5 @@ def update_config():
     key = request.form.get("key", "")
     value = request.form.get("value", "")
     os.environ[key] = value
-    return {"status": "updated", "key": key}
+    from markupsafe import escape
+    return {"status": "updated", "key": str(escape(key))}
