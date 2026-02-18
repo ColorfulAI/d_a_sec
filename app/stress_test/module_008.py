@@ -11,6 +11,8 @@ import urllib.request
 import urllib.parse
 from flask import Flask, request, make_response
 
+ALLOWED_BASE_DIR = os.path.realpath("/var/data")
+
 ALLOWED_URL_HOSTS = {"example.com", "api.example.com"}
 
 ALLOWED_COMMANDS = {
@@ -65,9 +67,10 @@ def run_cmd_8_1():
 @app.route("/read_8_2")
 def read_file_8_2():
     path = request.args.get("path")
-    safe_name = os.path.basename(path)
-    safe_path = os.path.join("/var/data", safe_name)
-    with open(safe_path, "r") as f:
+    real_path = os.path.realpath(path)
+    if not real_path.startswith(ALLOWED_BASE_DIR + os.sep):
+        return make_response("Forbidden", 403)
+    with open(real_path, "r") as f:
         return make_response(html.escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_8_3")
