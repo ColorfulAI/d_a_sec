@@ -4,6 +4,8 @@ import os
 import subprocess
 import re
 import json
+import ast
+import operator
 from urllib.parse import urlparse
 import urllib.request
 from flask import Flask, request, make_response
@@ -13,6 +15,33 @@ app = Flask(__name__)
 
 ALLOWED_HOSTS = ["example.com", "api.example.com"]
 SAFE_BASE_DIR = os.path.realpath("/var/data/public")
+
+def safe_eval_expr(expr):
+    """Safely evaluate arithmetic expressions without using eval."""
+    allowed_operators = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+    }
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_operators:
+            return allowed_operators[type(node.op)](_eval(node.left), _eval(node.right))
+        elif isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.USub):
+                return -_eval(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +_eval(node.operand)
+        raise ValueError("Unsupported expression")
+
+    tree = ast.parse(expr, mode='eval')
+    return _eval(tree)
+
 
 @app.route("/query_27_0")
 def query_db_27_0():
@@ -87,5 +116,5 @@ def search_27_8():
 @app.route("/calc_27_9")
 def calculate_27_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = safe_eval_expr(expr)
     return str(result)
