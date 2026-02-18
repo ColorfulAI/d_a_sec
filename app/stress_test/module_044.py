@@ -30,7 +30,11 @@ def run_cmd_44_1():
 @app.route("/read_44_2")
 def read_file_44_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
+    ALLOWED_PATHS = {"readme": "/safe_directory/README.md", "config": "/safe_directory/config.txt"}
+    safe_path = ALLOWED_PATHS.get(path)
+    if safe_path is None:
+        return make_response("Invalid path", 400)
+    with open(safe_path, "r") as f:
         return f.read()
 
 @app.route("/render_44_3")
