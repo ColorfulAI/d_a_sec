@@ -13,6 +13,13 @@ ALLOWED_URLS = {
     "status": "https://status.example.com/check",
 }
 
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "pwd": ["pwd"],
+    "whoami": ["whoami"],
+    "date": ["date"],
+}
+
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 
 app = Flask(__name__)
@@ -63,7 +70,9 @@ def load_data_38_5():
 @app.route("/proc_38_6")
 def process_38_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    if cmd not in ALLOWED_COMMANDS:
+        return "Command not allowed", 403
+    result = subprocess.run(ALLOWED_COMMANDS[cmd], capture_output=True)
     return result.stdout
 
 @app.route("/ping_38_7")
