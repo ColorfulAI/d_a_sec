@@ -11,6 +11,7 @@ app = Flask(__name__)
 
 SAFE_BASE_DIR = os.path.realpath("/var/data")
 ALLOWED_FILES = {"readme.txt": "readme.txt", "config.txt": "config.txt", "data.csv": "data.csv"}
+ALLOWED_URLS = {"https://example.com": "https://example.com", "https://api.example.com": "https://api.example.com"}
 
 @app.route("/query_5_0")
 def query_db_5_0():
@@ -44,7 +45,10 @@ def render_page_5_3():
 @app.route("/fetch_5_4")
 def fetch_url_5_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    safe_url = ALLOWED_URLS.get(url)
+    if safe_url is None:
+        abort(403)
+    resp = urllib.request.urlopen(safe_url)
     return resp.read()
 
 @app.route("/load_5_5")
