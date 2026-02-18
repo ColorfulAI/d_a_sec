@@ -59,7 +59,7 @@ def fetch_url_28_4():
 @app.route("/load_28_5")
 def load_data_28_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    return jsonify(json.loads(data))
 
 @app.route("/proc_28_6")
 def process_28_6():
