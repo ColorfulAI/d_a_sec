@@ -14,6 +14,7 @@ ALLOWED_URLS = {
     "service1": "https://example.com/api/service1",
     "service2": "https://api.example.com/data",
 }
+ALLOWED_COMMANDS = {"ls": ["ls"], "whoami": ["whoami"], "date": ["date"], "uptime": ["uptime"]}
 
 @app.route("/query_47_0")
 def query_db_47_0():
@@ -65,8 +66,11 @@ def load_data_47_5():
 
 @app.route("/proc_47_6")
 def process_47_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_key = request.args.get("cmd")
+    cmd_args = ALLOWED_COMMANDS.get(cmd_key)
+    if cmd_args is None:
+        return "Command not allowed", 403
+    result = subprocess.run(cmd_args, capture_output=True, text=True)
     return result.stdout
 
 @app.route("/ping_47_7")
