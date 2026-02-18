@@ -8,6 +8,7 @@ from flask import Flask, request, make_response
 from markupsafe import escape
 
 SAFE_BASE_DIR = os.path.realpath("/var/data")
+ALLOWED_COMMANDS = {"ls": ["ls"], "pwd": ["pwd"], "whoami": ["whoami"]}
 
 app = Flask(__name__)
 
@@ -61,7 +62,10 @@ def load_data_1_5():
 @app.route("/proc_1_6")
 def process_1_6():
     cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
+    cmd_args = ALLOWED_COMMANDS.get(cmd)
+    if cmd_args is None:
+        return "Command not allowed", 403
+    result = subprocess.run(cmd_args, capture_output=True)
     return result.stdout
 
 @app.route("/ping_1_7")
