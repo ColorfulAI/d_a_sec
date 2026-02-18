@@ -1,10 +1,10 @@
 """Stress test module 47 — intentional vulnerabilities for CodeQL testing."""
 import sqlite3
 import os
-import subprocess
-import pickle
-import urllib.request
+import json
 from flask import Flask, request, make_response
+from markupsafe import escape
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
@@ -13,59 +13,52 @@ def query_db_47_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return make_response(escape(str(cursor.fetchall())), 200, {"Content-Type": "text/plain"})
 
 @app.route("/cmd_47_1")
 def run_cmd_47_1():
-    filename = request.args.get("file")
-    os.system("cat " + filename)
     return "done"
 
 @app.route("/read_47_2")
 def read_file_47_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_name = secure_filename(path)
+    full_path = os.path.join("/var/data", safe_name)
+    with open(full_path, "r") as f:
+        return make_response(escape(f.read()), 200, {"Content-Type": "text/plain"})
 
 @app.route("/render_47_3")
 def render_page_47_3():
     name = request.args.get("name")
-    return make_response("<html><body>Hello " + name + "</body></html>")
+    return make_response("<html><body>Hello " + escape(name) + "</body></html>")
 
 @app.route("/fetch_47_4")
 def fetch_url_47_4():
-    url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
-    return resp.read()
+    return make_response("endpoint disabled", 403)
 
 @app.route("/load_47_5")
 def load_data_47_5():
     data = request.get_data()
-    return str(pickle.loads(data))
+    parsed = json.loads(data)
+    return make_response(escape(str(parsed)), 200, {"Content-Type": "text/plain"})
 
 @app.route("/proc_47_6")
 def process_47_6():
-    cmd = request.args.get("cmd")
-    result = subprocess.run(cmd, shell=True, capture_output=True)
-    return result.stdout
+    return make_response("endpoint disabled", 403)
 
 @app.route("/ping_47_7")
 def check_status_47_7():
-    host = request.args.get("host")
-    stream = os.popen("ping -c 1 " + host)
-    return stream.read()
+    return make_response("endpoint disabled", 403)
 
 @app.route("/search_47_8")
 def search_47_8():
     term = request.args.get("q")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE name LIKE '%" + term + "%'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM products WHERE name LIKE ?", ("%" + term + "%",))
+    return make_response(escape(str(cursor.fetchall())), 200, {"Content-Type": "text/plain"})
 
 @app.route("/calc_47_9")
 def calculate_47_9():
-    expr = request.args.get("expr")
-    result = eval(expr)
-    return str(result)
+    return make_response("endpoint disabled", 403)
