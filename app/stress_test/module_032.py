@@ -49,10 +49,14 @@ def render_page_32_3():
     name = request.args.get("name")
     return make_response("<html><body>Hello " + str(escape(name)) + "</body></html>")
 
+ALLOWED_URL_PREFIXES = ("https://api.example.com/", "https://cdn.example.com/")
+
 @app.route("/fetch_32_4")
 def fetch_url_32_4():
     url = request.args.get("url")
-    resp = urllib.request.urlopen(url)
+    if not url or not any(url.startswith(prefix) for prefix in ALLOWED_URL_PREFIXES):
+        abort(400, "URL not allowed")
+    resp = __import__("urllib.request", fromlist=["urlopen"]).urlopen(url)
     return resp.read()
 
 @app.route("/load_32_5")
