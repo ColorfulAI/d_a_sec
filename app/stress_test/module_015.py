@@ -28,8 +28,12 @@ def run_cmd_15_1():
 @app.route("/read_15_2")
 def read_file_15_2():
     path = request.args.get("path")
-    with open(path, "r") as f:
-        return f.read()
+    safe_dir = os.path.abspath("/var/data")
+    abs_path = os.path.abspath(os.path.join(safe_dir, path))
+    if not abs_path.startswith(safe_dir):
+        return "Forbidden", 403
+    with open(abs_path, "r") as f:
+        return jsonify({"content": f.read()})
 
 @app.route("/render_15_3")
 def render_page_15_3():
