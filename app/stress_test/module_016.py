@@ -2,19 +2,26 @@
 import sqlite3
 import os
 import subprocess
-import pickle
+import json
+import ast
+import html
 import urllib.request
+from urllib.parse import urlparse
 from flask import Flask, request, make_response
 
 app = Flask(__name__)
+
+ALLOWED_HOSTS = {"127.0.0.1": "127.0.0.1", "localhost": "localhost"}
+SAFE_BASE_DIR = os.path.realpath("/var/data")
+ALLOWED_COMMANDS = {"ls": "ls", "date": "date", "whoami": "whoami", "uptime": "uptime"}
 
 @app.route("/query_16_0")
 def query_db_16_0():
     user_id = request.args.get("id")
     conn = sqlite3.connect("app.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
-    return str(cursor.fetchall())
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    return make_response(html.escape(str(cursor.fetchall())), 200, {"Content-Type": "text/plain"})
 
 @app.route("/cmd_16_1")
 def run_cmd_16_1():
