@@ -89,5 +89,5 @@ def search_16_8():
 @app.route("/calc_16_9")
 def calculate_16_9():
     expr = request.args.get("expr")
-    result = eval(expr)
+    result = ast.literal_eval(expr)
     return str(result)
